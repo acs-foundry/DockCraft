@@ -199,7 +199,7 @@ pub fn detect_interactions(receptor: &Molecule3D, ligand: &Molecule3D) -> Vec<In
                     rec_residue: res_tag.clone(),
                     distance_a: d,
                     angle_deg: None,
-                    energy_kcal: -2.6 * ((4.2 - d) / 1.6).clamp(0.25, 1.0),
+                    energy_kcal: -3.4 * ((4.2 - d) / 1.6).clamp(0.25, 1.0),
                 });
             } else if ((la.h_donor && ra.h_acceptor) || (la.h_acceptor && ra.h_donor))
                 && (2.2..=3.6).contains(&d)
@@ -212,7 +212,7 @@ pub fn detect_interactions(receptor: &Molecule3D, ligand: &Molecule3D) -> Vec<In
                     rec_residue: res_tag.clone(),
                     distance_a: d,
                     angle_deg: None,
-                    energy_kcal: -1.85 * ideal,
+                    energy_kcal: -2.95 * ideal,
                 });
             }
 
@@ -362,7 +362,7 @@ pub fn score_pose_hyde(
         // Desolvation penalty: polar groups pay significantly to leave water; hydrophobic pay 0 (net gain below).
         let desolv_kcal = if is_polar {
             let charge_boost = if la.formal_charge != 0 { 1.45 } else { 1.0 };
-            0.055 * dsasa * charge_boost
+            0.028 * dsasa * charge_boost
         } else {
             0.0
         };
