@@ -1,0 +1,845 @@
+#![forbid(unsafe_code)]
+
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
+
+use dock_engine::{DockingConfig, ScoringFunction, dock_ligand};
+use dock_pipeline::{
+    DEFAULT_MAX_FILE_BYTES, PathSandbox, build_chymera_export, build_molcraft_export,
+    campaign_report_to_csv, load_ligand_library_bytes, run_screening_campaign,
+};
+use hyde_scorer::{SubstituentPreset, mutate_and_minimize_in_pocket, score_pose_hyde};
+use pocket_detect::{GridBox, PocketDetectConfig, detect_pockets};
+use serde_json::{Value, json};
+use struct_core::{
+    Molecule3D, parse_mmcif, parse_mol2, parse_pdb, parse_pdbqt, parse_sdf_3d_with_limit,
+    parse_smiles_to_3d, prepare_receptor, write_pdb, write_sdf_3d,
+};
+
+pub const MAX_MCP_MESSAGE_BYTES: usize = 1_048_576;
+pub const MAX_TCP_CONCURRENT: usize = 32;
+pub const MAX_MCP_LIBRARY_RECORDS: usize = 1000;
+
+#[derive(Default)]
+pub struct SessionState {
+    pub initialized: bool,
+}
+
+fn json_err(id: Value, code: i64, message: impl Into<String>) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {
+            "code": code,
+            "message": message.into()
+        }
+    })
+}
+
+fn json_ok(id: Value, result: Value) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": result
+    })
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+fn parse_receptor_by_path(
+    path: &Path,
+    content: &str,
+    strip_waters: bool,
+) -> Result<Molecule3D, String> {
+    let ext = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("pdb")
+        .to_ascii_lowercase();
+    let mut mol = match ext.as_str() {
+        "cif" | "mmcif" => parse_mmcif(content, strip_waters),
+        "pdbqt" => parse_pdbqt(content),
+        "mol2" => parse_mol2(content),
+        _ => parse_pdb(content, strip_waters),
+    }
+    .map_err(|e| format!("failed to parse receptor '{}': {e}", path.display()))?;
+    prepare_receptor(&mut mol, strip_waters);
+    Ok(mol)
+}
+
+fn parse_single_ligand(sandbox: &PathSandbox, val: &Value) -> Result<Molecule3D, String> {
+    if let Some(smi) = val.get("ligand_smiles").and_then(|v| v.as_str()) {
+        return parse_smiles_to_3d(smi, Some("ligand")).map_err(|e| e.to_string());
+    }
+    let path_str = val
+        .get("ligand_path")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing 'ligand_path' or 'ligand_smiles'".to_string())?;
+    let path = Path::new(path_str);
+    let text = sandbox.read_string(path).map_err(|e| e.to_string())?;
+    let ext = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("sdf")
+        .to_ascii_lowercase();
+    let mut mol = match ext.as_str() {
+        "mol2" => parse_mol2(&text).map_err(|e| e.to_string())?,
+        "pdbqt" => parse_pdbqt(&text).map_err(|e| e.to_string())?,
+        "pdb" => parse_pdb(&text, false).map_err(|e| e.to_string())?,
+        _ => {
+            let mut list = parse_sdf_3d_with_limit(&text, 1);
+            list.pop()
+                .ok_or_else(|| "empty SDF".to_string())?
+                .map_err(|e| e.to_string())?
+        }
+    };
+    struct_core::perceive_all(&mut mol);
+    Ok(mol)
+}
+
+fn tool_definitions() -> Value {
+    json!([
+        {
+            "name": "detect_pockets",
+            "description": "Detects druggable binding pockets in a receptor inside read_root and ranks them by druggability score, volume, and SASA.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["receptor_path"],
+                "properties": {
+                    "receptor_path": { "type": "string" },
+                    "strip_waters": { "type": "boolean" },
+                    "max_pockets": { "type": "integer", "minimum": 1, "maximum": 20 }
+                }
+            },
+            "outputSchema": {
+                "type": "object",
+                "required": ["pocket_count", "pockets"],
+                "properties": {
+                    "pocket_count": { "type": "integer" },
+                    "pockets": { "type": "array" }
+                }
+            }
+        },
+        {
+            "name": "run_docking",
+            "description": "Runs single-ligand docking or multi-ligand PyRx-style virtual screening inside the sandboxed GridBox.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["receptor_path", "box_center", "box_size"],
+                "properties": {
+                    "receptor_path": { "type": "string" },
+                    "ligand_path": { "type": "string" },
+                    "ligand_smiles": { "type": "string" },
+                    "library_path": { "type": "string" },
+                    "box_center": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                    "box_size": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                    "scoring": { "type": "string", "enum": ["vina", "vinardo"] },
+                    "exhaustiveness": { "type": "integer", "minimum": 1, "maximum": 32 },
+                    "out_sdf_path": { "type": "string" },
+                    "out_csv_path": { "type": "string" }
+                }
+            },
+            "outputSchema": {
+                "type": "object",
+                "required": ["mode", "results"],
+                "properties": {
+                    "mode": { "type": "string" },
+                    "results": { "type": "array" }
+                }
+            }
+        },
+        {
+            "name": "optimize_ligand_in_pocket",
+            "description": "Scores a complex with HYDE per-atom coronas and optionally applies an in-pocket substituent mutation (-H,-F,-Cl,-OH,-NH2,-CH3,-CF3,-CN,-OCH3).",
+            "inputSchema": {
+                "type": "object",
+                "required": ["receptor_path"],
+                "properties": {
+                    "receptor_path": { "type": "string" },
+                    "ligand_path": { "type": "string" },
+                    "anchor_atom_index": { "type": "integer", "minimum": 0 },
+                    "substituent": { "type": "string", "enum": ["H", "F", "Cl", "OH", "NH2", "CH3", "CF3", "CN", "OCH3"] },
+                    "out_sdf_path": { "type": "string" }
+                }
+            },
+            "outputSchema": {
+                "type": "object",
+                "required": ["total_delta_g_kcal", "estimated_ki_nm", "atom_scores"],
+                "properties": {
+                    "total_delta_g_kcal": { "type": "number" },
+                    "estimated_ki_nm": { "type": "number" },
+                    "atom_scores": { "type": "array" }
+                }
+            }
+        },
+        {
+            "name": "export_complex",
+            "description": "Exports the docked complex and HYDE annotations to MolCraft (.pml/.molcraft.json) or Chymera (.cxc/.chymera.json) inside write_root.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["receptor_path", "ligand_path", "target", "out_script_path"],
+                "properties": {
+                    "receptor_path": { "type": "string" },
+                    "ligand_path": { "type": "string" },
+                    "target": { "type": "string", "enum": ["molcraft", "chymera", "pdb", "sdf"] },
+                    "out_script_path": { "type": "string" },
+                    "out_bundle_path": { "type": "string" }
+                }
+            },
+            "outputSchema": {
+                "type": "object",
+                "required": ["target", "written_files"],
+                "properties": {
+                    "target": { "type": "string" },
+                    "written_files": { "type": "array" }
+                }
+            }
+        }
+    ])
+}
+
+fn parse_vec3(val: Option<&Value>, field: &str) -> Result<[f64; 3], String> {
+    let arr = val
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| format!("missing array parameter '{field}'"))?;
+    if arr.len() != 3 {
+        return Err(format!("'{field}' must have length 3"));
+    }
+    let x = arr[0]
+        .as_f64()
+        .ok_or_else(|| format!("invalid number in '{field}[0]'"))?;
+    let y = arr[1]
+        .as_f64()
+        .ok_or_else(|| format!("invalid number in '{field}[1]'"))?;
+    let z = arr[2]
+        .as_f64()
+        .ok_or_else(|| format!("invalid number in '{field}[2]'"))?;
+    Ok([x, y, z])
+}
+
+fn handle_tool_call(
+    sandbox: &PathSandbox,
+    name: &str,
+    args: &Value,
+) -> Result<Value, (i64, String)> {
+    match name {
+        "detect_pockets" => {
+            let rec_path = args
+                .get("receptor_path")
+                .and_then(|v| v.as_str())
+                .ok_or((-32602, "missing 'receptor_path'".to_string()))?;
+            let strip = args
+                .get("strip_waters")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            let max_p = args
+                .get("max_pockets")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(8)
+                .clamp(1, 20) as usize;
+            let raw = sandbox
+                .read_string(Path::new(rec_path))
+                .map_err(|e| (-32602, e.to_string()))?;
+            let rec = parse_receptor_by_path(Path::new(rec_path), &raw, strip)
+                .map_err(|e| (-32602, e))?;
+            let mut pockets = detect_pockets(&rec, &PocketDetectConfig::default())
+                .map_err(|e| (-32000, e.to_string()))?;
+            pockets.truncate(max_p);
+            let compact: Vec<Value> = pockets
+                .iter()
+                .map(|p| {
+                    json!({
+                        "rank": p.rank,
+                        "center": p.center,
+                        "grid_box": p.grid_box,
+                        "volume_a3": p.volume_a3,
+                        "sasa_a2": p.sasa_a2,
+                        "druggability_score": p.druggability_score,
+                        "hydrophobicity": p.hydrophobicity,
+                        "lining_residues_count": p.lining_residues.len()
+                    })
+                })
+                .collect();
+            Ok(json!({
+                "pocket_count": compact.len(),
+                "pockets": compact
+            }))
+        }
+        "run_docking" => {
+            let rec_path = args
+                .get("receptor_path")
+                .and_then(|v| v.as_str())
+                .ok_or((-32602, "missing 'receptor_path'".to_string()))?;
+            let center =
+                parse_vec3(args.get("box_center"), "box_center").map_err(|e| (-32602, e))?;
+            let size = parse_vec3(args.get("box_size"), "box_size").map_err(|e| (-32602, e))?;
+            let gbox = GridBox::from_center_size(center, size, 0.375)
+                .map_err(|e| (-32602, e.to_string()))?;
+
+            let rec_raw = sandbox
+                .read_string(Path::new(rec_path))
+                .map_err(|e| (-32602, e.to_string()))?;
+            let rec = parse_receptor_by_path(Path::new(rec_path), &rec_raw, true)
+                .map_err(|e| (-32602, e))?;
+
+            let scoring = match args.get("scoring").and_then(|v| v.as_str()) {
+                Some("vinardo") => ScoringFunction::Vinardo,
+                _ => ScoringFunction::Vina,
+            };
+            let exhaustiveness = args
+                .get("exhaustiveness")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(6)
+                .clamp(1, 32) as usize;
+            let cfg = DockingConfig {
+                scoring,
+                exhaustiveness,
+                ..Default::default()
+            };
+
+            if let Some(lib_path) = args.get("library_path").and_then(|v| v.as_str()) {
+                let bytes = sandbox
+                    .read_bytes(Path::new(lib_path))
+                    .map_err(|e| (-32602, e.to_string()))?;
+                let ext = Path::new(lib_path)
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("smi");
+                let lib = load_ligand_library_bytes(ext, &bytes, MAX_MCP_LIBRARY_RECORDS)
+                    .map_err(|e| (-32602, e.to_string()))?;
+                let report = run_screening_campaign(&rec, &gbox, &lib, &cfg)
+                    .map_err(|e| (-32000, e.to_string()))?;
+                if let Some(out_csv) = args.get("out_csv_path").and_then(|v| v.as_str()) {
+                    sandbox
+                        .write_string(Path::new(out_csv), &campaign_report_to_csv(&report))
+                        .map_err(|e| (-32602, e.to_string()))?;
+                }
+                let rows: Vec<Value> = report
+                    .results
+                    .iter()
+                    .map(|c| {
+                        json!({
+                            "rank": c.rank,
+                            "name": c.name,
+                            "affinity_kcal_mol": c.best_affinity_kcal,
+                            "hyde_delta_g_kcal": c.hyde_delta_g_kcal,
+                            "mpo_score": c.mpo_score,
+                            "admet_score": c.admet.admet_score
+                        })
+                    })
+                    .collect();
+                Ok(json!({
+                    "mode": "screening",
+                    "enrichment": report.enrichment,
+                    "results": rows
+                }))
+            } else {
+                let lig = parse_single_ligand(sandbox, args).map_err(|e| (-32602, e))?;
+                let report =
+                    dock_ligand(&rec, &lig, &gbox, &cfg).map_err(|e| (-32000, e.to_string()))?;
+                if let Some(out_sdf) = args.get("out_sdf_path").and_then(|v| v.as_str()) {
+                    let refs: Vec<&Molecule3D> = report.poses.iter().map(|p| &p.molecule).collect();
+                    sandbox
+                        .write_string(Path::new(out_sdf), &write_sdf_3d(&refs))
+                        .map_err(|e| (-32602, e.to_string()))?;
+                }
+                let poses: Vec<Value> = report
+                    .poses
+                    .iter()
+                    .map(|p| {
+                        json!({
+                            "mode": p.mode,
+                            "affinity_kcal_mol": p.affinity_kcal_mol,
+                            "rmsd_to_best": p.terms.rmsd_to_best
+                        })
+                    })
+                    .collect();
+                Ok(json!({
+                    "mode": "single_ligand",
+                    "results": poses
+                }))
+            }
+        }
+        "optimize_ligand_in_pocket" => {
+            let rec_path = args
+                .get("receptor_path")
+                .and_then(|v| v.as_str())
+                .ok_or((-32602, "missing 'receptor_path'".to_string()))?;
+            let rec_raw = sandbox
+                .read_string(Path::new(rec_path))
+                .map_err(|e| (-32602, e.to_string()))?;
+            let rec = parse_receptor_by_path(Path::new(rec_path), &rec_raw, true)
+                .map_err(|e| (-32602, e))?;
+            let lig = parse_single_ligand(sandbox, args).map_err(|e| (-32602, e))?;
+
+            if let Some(sub_str) = args.get("substituent").and_then(|v| v.as_str()) {
+                let anchor = args
+                    .get("anchor_atom_index")
+                    .and_then(|v| v.as_u64())
+                    .ok_or((
+                        -32602,
+                        "missing 'anchor_atom_index' for substituent mutation".to_string(),
+                    ))? as usize;
+                let preset = match sub_str {
+                    "H" => SubstituentPreset::H,
+                    "F" => SubstituentPreset::F,
+                    "Cl" => SubstituentPreset::Cl,
+                    "OH" => SubstituentPreset::OH,
+                    "NH2" => SubstituentPreset::NH2,
+                    "CH3" => SubstituentPreset::CH3,
+                    "CF3" => SubstituentPreset::CF3,
+                    "CN" => SubstituentPreset::CN,
+                    "OCH3" => SubstituentPreset::OCH3,
+                    other => return Err((-32602, format!("unknown substituent '{other}'"))),
+                };
+                let outcome = mutate_and_minimize_in_pocket(&rec, &lig, anchor, preset)
+                    .map_err(|e| (-32602, e.to_string()))?;
+                if let Some(out_sdf) = args.get("out_sdf_path").and_then(|v| v.as_str()) {
+                    sandbox
+                        .write_string(
+                            Path::new(out_sdf),
+                            &write_sdf_3d(&[&outcome.mutated_ligand]),
+                        )
+                        .map_err(|e| (-32602, e.to_string()))?;
+                }
+                Ok(json!({
+                    "before_kcal": outcome.before_kcal,
+                    "after_kcal": outcome.after_kcal,
+                    "delta_delta_g_kcal": outcome.delta_delta_g_kcal,
+                    "total_delta_g_kcal": outcome.report.total_delta_g_kcal,
+                    "estimated_ki_nm": outcome.report.estimated_ki_nm,
+                    "atom_scores": outcome.report.atom_scores,
+                    "interactions": outcome.report.interactions
+                }))
+            } else {
+                let report = score_pose_hyde(&rec, &lig).map_err(|e| (-32000, e.to_string()))?;
+                Ok(serde_json::to_value(&report).map_err(|e| (-32000, e.to_string()))?)
+            }
+        }
+        "export_complex" => {
+            let rec_path = args
+                .get("receptor_path")
+                .and_then(|v| v.as_str())
+                .ok_or((-32602, "missing 'receptor_path'".to_string()))?;
+            let target = args
+                .get("target")
+                .and_then(|v| v.as_str())
+                .ok_or((-32602, "missing 'target'".to_string()))?;
+            let out_script = args
+                .get("out_script_path")
+                .and_then(|v| v.as_str())
+                .ok_or((-32602, "missing 'out_script_path'".to_string()))?;
+
+            let rec_raw = sandbox
+                .read_string(Path::new(rec_path))
+                .map_err(|e| (-32602, e.to_string()))?;
+            let rec = parse_receptor_by_path(Path::new(rec_path), &rec_raw, true)
+                .map_err(|e| (-32602, e))?;
+            let lig = parse_single_ligand(sandbox, args).map_err(|e| (-32602, e))?;
+            let hyde = score_pose_hyde(&rec, &lig).map_err(|e| (-32000, e.to_string()))?;
+
+            let mut written = Vec::new();
+            match target {
+                "molcraft" => {
+                    let (pml, bundle) =
+                        build_molcraft_export("DockCraftComplex", &rec, &lig, &hyde);
+                    sandbox
+                        .write_string(Path::new(out_script), &pml)
+                        .map_err(|e| (-32602, e.to_string()))?;
+                    written.push(out_script.to_string());
+                    if let Some(bp) = args.get("out_bundle_path").and_then(|v| v.as_str()) {
+                        let js = serde_json::to_string_pretty(&bundle)
+                            .map_err(|e| (-32000, e.to_string()))?;
+                        sandbox
+                            .write_string(Path::new(bp), &js)
+                            .map_err(|e| (-32602, e.to_string()))?;
+                        written.push(bp.to_string());
+                    }
+                }
+                "chymera" => {
+                    let (cxc, bundle) = build_chymera_export("DockCraftComplex", &rec, &lig, &hyde);
+                    sandbox
+                        .write_string(Path::new(out_script), &cxc)
+                        .map_err(|e| (-32602, e.to_string()))?;
+                    written.push(out_script.to_string());
+                    if let Some(bp) = args.get("out_bundle_path").and_then(|v| v.as_str()) {
+                        let js = serde_json::to_string_pretty(&bundle)
+                            .map_err(|e| (-32000, e.to_string()))?;
+                        sandbox
+                            .write_string(Path::new(bp), &js)
+                            .map_err(|e| (-32602, e.to_string()))?;
+                        written.push(bp.to_string());
+                    }
+                }
+                "pdb" => {
+                    sandbox
+                        .write_string(Path::new(out_script), &write_pdb(&rec))
+                        .map_err(|e| (-32602, e.to_string()))?;
+                    written.push(out_script.to_string());
+                }
+                "sdf" => {
+                    sandbox
+                        .write_string(Path::new(out_script), &write_sdf_3d(&[&lig]))
+                        .map_err(|e| (-32602, e.to_string()))?;
+                    written.push(out_script.to_string());
+                }
+                other => return Err((-32602, format!("unsupported export target '{other}'"))),
+            }
+            Ok(json!({
+                "target": target,
+                "written_files": written
+            }))
+        }
+        other => Err((-32601, format!("unknown tool '{other}'"))),
+    }
+}
+
+pub fn handle_mcp_line(
+    sandbox: &PathSandbox,
+    state: &mut SessionState,
+    raw_line: &str,
+) -> Option<Value> {
+    if raw_line.len() > MAX_MCP_MESSAGE_BYTES {
+        return Some(json_err(Value::Null, -32600, "message exceeds 1 MiB limit"));
+    }
+    let req: Value = match serde_json::from_str(raw_line) {
+        Ok(v) => v,
+        Err(e) => return Some(json_err(Value::Null, -32700, format!("parse error: {e}"))),
+    };
+    let id = req.get("id").cloned().unwrap_or(Value::Null);
+    let method = match req.get("method").and_then(|v| v.as_str()) {
+        Some(m) => m.to_string(),
+        None => return Some(json_err(id, -32600, "missing 'method'")),
+    };
+
+    if method == "notifications/initialized" {
+        state.initialized = true;
+        return None;
+    }
+
+    let sandbox_ref = sandbox;
+    let params = req.get("params").cloned().unwrap_or(Value::Null);
+
+    if method == "initialize" {
+        state.initialized = true;
+        return Some(json_ok(
+            id,
+            json!({
+                "protocolVersion": "2024-11-05",
+                "capabilities": { "tools": {} },
+                "serverInfo": {
+                    "name": "dockcraft-mcp",
+                    "version": env!("CARGO_PKG_VERSION")
+                }
+            }),
+        ));
+    }
+
+    if method == "ping" {
+        return Some(json_ok(id, json!({})));
+    }
+
+    if !state.initialized {
+        return Some(json_err(
+            id,
+            -32002,
+            "session not initialized: call 'initialize' first",
+        ));
+    }
+
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match method.as_str() {
+        "tools/list" => json_ok(id.clone(), json!({ "tools": tool_definitions() })),
+        "tools/call" => {
+            let Some(tname) = params.get("name").and_then(|v| v.as_str()) else {
+                return json_err(id.clone(), -32602, "missing tool 'name'");
+            };
+            let targs = params.get("arguments").cloned().unwrap_or(json!({}));
+            match handle_tool_call(sandbox_ref, tname, &targs) {
+                Ok(structured) => json_ok(
+                    id.clone(),
+                    json!({
+                        "content": [{ "type": "text", "text": structured.to_string() }],
+                        "structuredContent": structured
+                    }),
+                ),
+                Err((code, msg)) => json_err(id.clone(), code, msg),
+            }
+        }
+        other => json_err(id.clone(), -32601, format!("method '{other}' not found")),
+    }));
+
+    Some(match res {
+        Ok(v) => v,
+        Err(_) => json_err(id, -32603, "internal tool panic isolated"),
+    })
+}
+
+fn read_bounded_line<R: Read>(
+    reader: &mut BufReader<R>,
+    cap: usize,
+) -> std::io::Result<Option<String>> {
+    let mut buf = Vec::new();
+    let n = reader
+        .by_ref()
+        .take((cap + 1) as u64)
+        .read_until(b'\n', &mut buf)?;
+    if n == 0 {
+        return Ok(None);
+    }
+    if buf.len() > cap {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "message exceeds 1 MiB limit",
+        ));
+    }
+    let s = String::from_utf8(buf)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    Ok(Some(s.trim_end_matches(['\r', '\n']).to_string()))
+}
+
+pub fn serve_stdio(sandbox: &PathSandbox) -> std::io::Result<()> {
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    let mut reader = BufReader::new(stdin.lock());
+    let mut out = stdout.lock();
+    let mut state = SessionState::default();
+
+    loop {
+        match read_bounded_line(&mut reader, MAX_MCP_MESSAGE_BYTES) {
+            Ok(Some(line)) => {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                if let Some(resp) = handle_mcp_line(sandbox, &mut state, &line) {
+                    writeln!(out, "{resp}")?;
+                    out.flush()?;
+                }
+            }
+            Ok(None) => break,
+            Err(e) => {
+                let err = json_err(Value::Null, -32600, e.to_string());
+                writeln!(out, "{err}")?;
+                out.flush()?;
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn serve_tcp(
+    sandbox: PathSandbox,
+    bind_addr: &str,
+    auth_token: Option<String>,
+) -> std::io::Result<()> {
+    let listener = TcpListener::bind(bind_addr)?;
+    let active = Arc::new(AtomicUsize::new(0));
+    let sandbox = Arc::new(sandbox);
+    let token = Arc::new(auth_token);
+
+    for stream in listener.incoming() {
+        let Ok(stream) = stream else {
+            continue;
+        };
+        if active.load(Ordering::Acquire) >= MAX_TCP_CONCURRENT {
+            let mut s = stream;
+            let _ = writeln!(
+                s,
+                "{}",
+                json_err(Value::Null, -32000, "too many concurrent TCP sessions")
+            );
+            continue;
+        }
+        let active_c = Arc::clone(&active);
+        let sb_c = Arc::clone(&sandbox);
+        let tok_c = Arc::clone(&token);
+        active_c.fetch_add(1, Ordering::AcqRel);
+        std::thread::spawn(move || {
+            let _ = handle_tcp_client(stream, &sb_c, tok_c.as_deref());
+            active_c.fetch_sub(1, Ordering::AcqRel);
+        });
+    }
+    Ok(())
+}
+
+fn handle_tcp_client(
+    mut stream: TcpStream,
+    sandbox: &PathSandbox,
+    auth_token: Option<&str>,
+) -> std::io::Result<()> {
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
+    let peer = stream.try_clone()?;
+    let mut reader = BufReader::new(peer);
+    let mut state = SessionState::default();
+
+    if let Some(expected) = auth_token {
+        let Some(first_line) = read_bounded_line(&mut reader, 4096)? else {
+            return Ok(());
+        };
+        let auth_ok = serde_json::from_str::<Value>(&first_line)
+            .ok()
+            .and_then(|v| {
+                v.get("auth_token")
+                    .and_then(|t| t.as_str())
+                    .map(|s| constant_time_eq(s.as_bytes(), expected.as_bytes()))
+            })
+            .unwrap_or(false);
+        if !auth_ok {
+            writeln!(stream, "{}", json_err(Value::Null, -32001, "unauthorized"))?;
+            return Ok(());
+        }
+        writeln!(
+            stream,
+            "{}",
+            json_ok(Value::Null, json!({ "authenticated": true }))
+        )?;
+        stream.flush()?;
+    }
+
+    loop {
+        match read_bounded_line(&mut reader, MAX_MCP_MESSAGE_BYTES) {
+            Ok(Some(line)) => {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                if let Some(resp) = handle_mcp_line(sandbox, &mut state, &line) {
+                    writeln!(stream, "{resp}")?;
+                    stream.flush()?;
+                }
+            }
+            Ok(None) => break,
+            Err(e) => {
+                let _ = writeln!(stream, "{}", json_err(Value::Null, -32600, e.to_string()));
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
+fn _default_cap_marker() -> u64 {
+    DEFAULT_MAX_FILE_BYTES
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    fn mcp_enforces_init_gate_size_cap_sandbox_and_runs_all_tools()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let base = std::env::temp_dir().join(format!("dockcraft_mcp_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let rdir = base.join("read");
+        let wdir = base.join("write");
+        let secret = base.join("secret.pdb");
+        std::fs::create_dir_all(&rdir)?;
+        std::fs::create_dir_all(&wdir)?;
+        std::fs::write(
+            &secret,
+            b"ATOM      1  CA  ALA A   1       0.000   0.000   0.000  1.00  0.00           C\n",
+        )?;
+        symlink(&secret, rdir.join("escape.pdb"))?;
+
+        // Create minimal pocket PDB inside read root
+        let rec_pdb = concat!(
+            "ATOM      1  N   LYS A   1      -2.850   0.000   0.000  1.00 20.00           N\n",
+            "ATOM      2  O   ASP A   2       3.200   0.000   0.000  1.00 20.00           O\n",
+            "ATOM      3  CA  VAL A   3       0.000   3.600   0.000  1.00 20.00           C\n",
+            "ATOM      4  CA  VAL A   4       0.000  -3.600   0.000  1.00 20.00           C\n",
+            "ATOM      5  CA  VAL A   5       0.000   0.000   3.600  1.00 20.00           C\n",
+            "ATOM      6  CA  VAL A   6       0.000   0.000  -3.600  1.00 20.00           C\n",
+            "END\n"
+        );
+        std::fs::write(rdir.join("pocket.pdb"), rec_pdb)?;
+
+        let sandbox = PathSandbox::new(
+            Some(rdir.clone()),
+            Some(wdir.clone()),
+            DEFAULT_MAX_FILE_BYTES,
+        )?;
+        let mut state = SessionState::default();
+
+        // 1. Pre-initialize call rejected
+        let pre = handle_mcp_line(
+            &sandbox,
+            &mut state,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+        )
+        .ok_or("expected response")?;
+        assert_eq!(pre["error"]["code"], -32002);
+
+        // 2. Oversized > 1 MiB payload rejected
+        let big = format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"ping","pad":"{}"}}"#,
+            "A".repeat(MAX_MCP_MESSAGE_BYTES)
+        );
+        let over = handle_mcp_line(&sandbox, &mut state, &big).ok_or("expected response")?;
+        assert_eq!(over["error"]["code"], -32600);
+
+        // 3. Initialize succeeds
+        let init = handle_mcp_line(
+            &sandbox,
+            &mut state,
+            r#"{"jsonrpc":"2.0","id":3,"method":"initialize"}"#,
+        )
+        .ok_or("expected response")?;
+        assert!(init["result"]["capabilities"].is_object());
+
+        // 4. Symlink escape inside read_root rejected with -32602
+        let esc = handle_mcp_line(
+            &sandbox,
+            &mut state,
+            r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"detect_pockets","arguments":{"receptor_path":"escape.pdb"}}}"#,
+        )
+        .ok_or("expected response")?;
+        assert_eq!(esc["error"]["code"], -32602);
+
+        // 5. Run docking via SMILES -> write out.sdf inside write_root
+        let dock_resp = handle_mcp_line(
+            &sandbox,
+            &mut state,
+            r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"run_docking","arguments":{"receptor_path":"pocket.pdb","ligand_smiles":"CCO","box_center":[0,0,0],"box_size":[14,14,14],"exhaustiveness":2,"out_sdf_path":"docked.sdf"}}}"#,
+        )
+        .ok_or("expected response")?;
+        assert_eq!(
+            dock_resp["result"]["structuredContent"]["mode"],
+            "single_ligand"
+        );
+        assert!(wdir.join("docked.sdf").exists());
+
+        // 6. Export complex to MolCraft script
+        std::fs::copy(wdir.join("docked.sdf"), rdir.join("docked.sdf"))?;
+        let exp_resp = handle_mcp_line(
+            &sandbox,
+            &mut state,
+            r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"export_complex","arguments":{"receptor_path":"pocket.pdb","ligand_path":"docked.sdf","target":"molcraft","out_script_path":"scene.pml","out_bundle_path":"scene.molcraft.json"}}}"#,
+        )
+        .ok_or("expected response")?;
+        assert_eq!(
+            exp_resp["result"]["structuredContent"]["target"],
+            "molcraft"
+        );
+        assert!(wdir.join("scene.pml").exists());
+        assert!(wdir.join("scene.molcraft.json").exists());
+
+        let _ = std::fs::remove_dir_all(&base);
+        Ok(())
+    }
+}

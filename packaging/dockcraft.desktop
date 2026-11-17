@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=DockCraft
+GenericName=Structure-Based Virtual Screening & HYDE Optimization
+Comment=Pure-Rust GPU-accelerated virtual screening (PyRx/Vina) and 3D in-pocket HYDE affinity optimizer (SeeSAR)
+Exec=dockcraft
+Icon=dockcraft
+Terminal=false
+Categories=Science;Chemistry;Education;
+Keywords=docking;vina;hyde;drug-design;screening;structural-biology;

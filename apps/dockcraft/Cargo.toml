@@ -1,0 +1,20 @@
+[package]
+name = "dockcraft"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "DockCraft native desktop GUI fusing PyRx virtual screening and SeeSAR HYDE 3D in-pocket ligand optimization over wgpu 24"
+
+[lints]
+workspace = true
+
+[dependencies]
+struct-core = { path = "../../crates/struct-core" }
+pocket-detect = { path = "../../crates/pocket-detect" }
+dock-engine = { path = "../../crates/dock-engine" }
+hyde-scorer = { path = "../../crates/hyde-scorer" }
+dock-viewport = { path = "../../crates/dock-viewport" }
+dock-pipeline = { path = "../../crates/dock-pipeline" }
+egui = { workspace = true }
+eframe = { workspace = true }
+serde_json = { workspace = true }

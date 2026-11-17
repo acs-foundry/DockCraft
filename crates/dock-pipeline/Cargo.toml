@@ -1,0 +1,22 @@
+[package]
+name = "dock-pipeline"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Clean-room openat2 sandbox, bounded .chemcraft reader, batch PyRx-style VS campaign runner, ADMET/MPO/ROC-EF1%/EF5% scoring, and MolCraft/Chymera exporters"
+
+[lints]
+workspace = true
+
+[dependencies]
+struct-core = { path = "../struct-core" }
+pocket-detect = { path = "../pocket-detect" }
+dock-engine = { path = "../dock-engine" }
+hyde-scorer = { path = "../hyde-scorer" }
+rustix = { workspace = true }
+flate2 = { workspace = true }
+csv = { workspace = true }
+rayon = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

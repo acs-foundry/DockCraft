@@ -1,0 +1,20 @@
+[package]
+name = "dockcraft-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Headless CLI and hardened JSON-RPC 2.0 MCP server for DockCraft virtual screening, pocket detection, and HYDE optimization"
+
+[lints]
+workspace = true
+
+[dependencies]
+struct-core = { path = "../../crates/struct-core" }
+pocket-detect = { path = "../../crates/pocket-detect" }
+dock-engine = { path = "../../crates/dock-engine" }
+hyde-scorer = { path = "../../crates/hyde-scorer" }
+dock-pipeline = { path = "../../crates/dock-pipeline" }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

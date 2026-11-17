@@ -1,0 +1,26 @@
+# Maintainer: DockCraft Contributors
+pkgname=dockcraft
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Pure-Rust GPU-accelerated virtual screening (PyRx/Vina) and SeeSAR-style HYDE 3D SBDD workstation"
+arch=('x86_64')
+license=('MIT' 'Apache-2.0')
+depends=('gcc-libs' 'vulkan-icd-loader' 'libxkbcommon' 'wayland' 'libx11')
+makedepends=('cargo')
+source=("dockcraft-$pkgver-linux-x86_64.tar.gz")
+sha256sums=('SKIP')
+
+build() {
+    cd "$srcdir/$pkgname-$pkgver"
+    cargo build --release --workspace --offline
+}
+
+package() {
+    cd "$srcdir/$pkgname-$pkgver"
+    install -Dm755 "target/release/dockcraft" "$pkgdir/usr/bin/dockcraft"
+    install -Dm755 "target/release/dockcraft-cli" "$pkgdir/usr/bin/dockcraft-cli"
+    install -Dm644 "packaging/dockcraft.desktop" "$pkgdir/usr/share/applications/dockcraft.desktop"
+    install -Dm644 "packaging/dockcraft.svg" "$pkgdir/usr/share/icons/hicolor/scalable/apps/dockcraft.svg"
+    install -Dm644 "LICENSE-MIT" "$pkgdir/usr/share/licenses/$pkgname/LICENSE-MIT"
+    install -Dm644 "LICENSE-APACHE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE-APACHE"
+}

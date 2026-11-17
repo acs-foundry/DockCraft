@@ -1,0 +1,15 @@
+[package]
+name = "hyde-scorer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Clean-room HYDE per-atom desolvation/H-bond/steric corona decomposition, 3D pharmacophoric interaction detector, and real-time in-pocket substituent mutator"
+
+[lints]
+workspace = true
+
+[dependencies]
+struct-core = { path = "../struct-core" }
+pocket-detect = { path = "../pocket-detect" }
+serde = { workspace = true }
+thiserror = { workspace = true }

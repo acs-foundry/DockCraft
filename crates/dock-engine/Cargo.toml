@@ -1,0 +1,17 @@
+[package]
+name = "dock-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Clean-room precomputed 3D trilinear affinity grids, Vina/Vinardo analytical-gradient scoring, SO(3)+torsion L-BFGS, rayon Iterated Local Search, and optional Vina/Smina/Gnina runner"
+
+[lints]
+workspace = true
+
+[dependencies]
+struct-core = { path = "../struct-core" }
+pocket-detect = { path = "../pocket-detect" }
+rayon = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }

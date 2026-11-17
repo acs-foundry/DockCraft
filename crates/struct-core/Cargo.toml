@@ -1,0 +1,13 @@
+[package]
+name = "struct-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Clean-room 3D biomolecular topology, PDB/mmCIF/MOL2/SDF/PDBQT parsers, Gasteiger charges, pH 7.4 protonation, AutoDock4 typing, and 3D SMILES embedding"
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }
