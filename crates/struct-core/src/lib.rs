@@ -15,8 +15,9 @@ pub use chemistry::{
 };
 pub use error::StructError;
 pub use formats::{
-    parse_mmcif, parse_mol2, parse_pdb, parse_pdbqt, parse_sdf_3d_with_limit, parse_sdf_mol_block,
-    write_mmcif, write_mol2, write_pdb, write_pdbqt_ligand, write_pdbqt_receptor, write_sdf_3d,
+    MAX_LIGAND_ATOMS, MAX_RECEPTOR_ATOMS, parse_mmcif, parse_mol2, parse_pdb, parse_pdbqt,
+    parse_sdf_3d_with_limit, parse_sdf_mol_block, write_mmcif, write_mol2, write_pdb,
+    write_pdbqt_ligand, write_pdbqt_receptor, write_sdf_3d,
 };
 pub use types::{
     Ad4Type, Atom3D, Bond3D, BondOrder, Molecule3D, RotatableBond, element_atomic_number,
@@ -49,6 +50,19 @@ END
         assert!(benzoic.atoms.iter().any(|a| a.formal_charge == -1));
         assert!(benzoic.atoms.iter().any(|a| a.aromatic));
         assert_eq!(benzoic.rotatable_bonds.len(), 1);
+        // C7H5O2- (pH 7.4 carboxylate): MW includes implicit aromatic ring C-H hydrogens (~121.12 Da)
+        assert!((benzoic.molecular_weight() - 121.12).abs() < 0.2);
+
+        let benzene = parse_smiles_to_3d("c1ccccc1", Some("Benzene"))?;
+        assert!((benzene.molecular_weight() - 78.11).abs() < 0.1);
+        assert_eq!(benzene.formula(), "C6H6");
+        // Carbonyl carbon attached to oxygen must NOT be flagged hydrophobic
+        let c_carbonyl = benzoic
+            .atoms
+            .iter()
+            .find(|a| a.element == "C" && !a.aromatic)
+            .ok_or(StructError::EmptyInput)?;
+        assert!(!c_carbonyl.hydrophobic);
 
         let sdf = write_sdf_3d(&[&benzoic]);
         let sdf_back = parse_sdf_3d_with_limit(&sdf, 10)

@@ -21,6 +21,7 @@ use struct_core::{
 enum CliScoring {
     Vina,
     Vinardo,
+    Hybrid,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -159,6 +160,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 scoring: match scoring {
                     CliScoring::Vina => ScoringFunction::Vina,
                     CliScoring::Vinardo => ScoringFunction::Vinardo,
+                    CliScoring::Hybrid => ScoringFunction::DockCraftHybrid,
                 },
                 exhaustiveness,
                 ..Default::default()
@@ -191,7 +193,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let sandbox = PathSandbox::new(read_root, write_root, DEFAULT_MAX_FILE_BYTES)?;
             match transport {
                 McpTransport::Stdio => mcp::serve_stdio(&sandbox)?,
-                McpTransport::Tcp => mcp::serve_tcp(sandbox, &bind, auth_token)?,
+                McpTransport::Tcp => {
+                    let tok = auth_token
+                        .filter(|s| !s.trim().is_empty())
+                        .ok_or("--auth-token is mandatory when --transport tcp")?;
+                    mcp::serve_tcp(sandbox, &bind, &tok)?;
+                }
             }
         }
     }

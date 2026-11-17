@@ -1,27 +1,27 @@
 #![forbid(unsafe_code)]
 
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::Path;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use dock_engine::{DockingConfig, ScoringFunction, dock_ligand};
 use dock_pipeline::{
-    DEFAULT_MAX_FILE_BYTES, PathSandbox, build_chymera_export, build_molcraft_export,
-    campaign_report_to_csv, load_ligand_library_bytes, run_screening_campaign,
+    DEFAULT_MAX_FILE_BYTES, PathSandbox, SceneExportRequest, campaign_report_to_csv,
+    load_ligand_library_bytes, run_screening_campaign, write_sandboxed_scene_package,
 };
 use hyde_scorer::{SubstituentPreset, mutate_and_minimize_in_pocket, score_pose_hyde};
 use pocket_detect::{GridBox, PocketDetectConfig, detect_pockets};
 use serde_json::{Value, json};
 use struct_core::{
-    Molecule3D, parse_mmcif, parse_mol2, parse_pdb, parse_pdbqt, parse_sdf_3d_with_limit,
-    parse_smiles_to_3d, prepare_receptor, write_pdb, write_sdf_3d,
+    MAX_LIGAND_ATOMS, Molecule3D, parse_mmcif, parse_mol2, parse_pdb, parse_pdbqt,
+    parse_sdf_3d_with_limit, parse_smiles_to_3d, prepare_receptor, write_pdb, write_sdf_3d,
 };
 
 pub const MAX_MCP_MESSAGE_BYTES: usize = 1_048_576;
 pub const MAX_TCP_CONCURRENT: usize = 32;
+pub const MAX_TCP_SOCKETS: usize = 128;
 pub const MAX_MCP_LIBRARY_RECORDS: usize = 1000;
 
 #[derive(Default)]
@@ -106,6 +106,13 @@ fn parse_single_ligand(sandbox: &PathSandbox, val: &Value) -> Result<Molecule3D,
                 .map_err(|e| e.to_string())?
         }
     };
+    if mol.atoms.len() > MAX_LIGAND_ATOMS {
+        return Err(format!(
+            "ligand atom count {} exceeds limit {}",
+            mol.atoms.len(),
+            MAX_LIGAND_ATOMS
+        ));
+    }
     struct_core::perceive_all(&mut mol);
     Ok(mol)
 }
@@ -146,7 +153,7 @@ fn tool_definitions() -> Value {
                     "library_path": { "type": "string" },
                     "box_center": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
                     "box_size": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
-                    "scoring": { "type": "string", "enum": ["vina", "vinardo"] },
+                    "scoring": { "type": "string", "enum": ["vina", "vinardo", "hybrid"] },
                     "exhaustiveness": { "type": "integer", "minimum": 1, "maximum": 32 },
                     "out_sdf_path": { "type": "string" },
                     "out_csv_path": { "type": "string" }
@@ -297,6 +304,7 @@ fn handle_tool_call(
 
             let scoring = match args.get("scoring").and_then(|v| v.as_str()) {
                 Some("vinardo") => ScoringFunction::Vinardo,
+                Some("hybrid") => ScoringFunction::DockCraftHybrid,
                 _ => ScoringFunction::Vina,
             };
             let exhaustiveness = args
@@ -451,53 +459,37 @@ fn handle_tool_call(
             let lig = parse_single_ligand(sandbox, args).map_err(|e| (-32602, e))?;
             let hyde = score_pose_hyde(&rec, &lig).map_err(|e| (-32000, e.to_string()))?;
 
-            let mut written = Vec::new();
-            match target {
-                "molcraft" => {
-                    let (pml, bundle) =
-                        build_molcraft_export("DockCraftComplex", &rec, &lig, &hyde);
-                    sandbox
-                        .write_string(Path::new(out_script), &pml)
-                        .map_err(|e| (-32602, e.to_string()))?;
-                    written.push(out_script.to_string());
-                    if let Some(bp) = args.get("out_bundle_path").and_then(|v| v.as_str()) {
-                        let js = serde_json::to_string_pretty(&bundle)
-                            .map_err(|e| (-32000, e.to_string()))?;
-                        sandbox
-                            .write_string(Path::new(bp), &js)
-                            .map_err(|e| (-32602, e.to_string()))?;
-                        written.push(bp.to_string());
-                    }
-                }
-                "chymera" => {
-                    let (cxc, bundle) = build_chymera_export("DockCraftComplex", &rec, &lig, &hyde);
-                    sandbox
-                        .write_string(Path::new(out_script), &cxc)
-                        .map_err(|e| (-32602, e.to_string()))?;
-                    written.push(out_script.to_string());
-                    if let Some(bp) = args.get("out_bundle_path").and_then(|v| v.as_str()) {
-                        let js = serde_json::to_string_pretty(&bundle)
-                            .map_err(|e| (-32000, e.to_string()))?;
-                        sandbox
-                            .write_string(Path::new(bp), &js)
-                            .map_err(|e| (-32602, e.to_string()))?;
-                        written.push(bp.to_string());
-                    }
-                }
+            let written = match target {
+                "molcraft" | "chymera" => write_sandboxed_scene_package(
+                    sandbox,
+                    &SceneExportRequest {
+                        target,
+                        complex_name: "DockCraftComplex",
+                        out_script_path: Path::new(out_script),
+                        out_bundle_path: args
+                            .get("out_bundle_path")
+                            .and_then(|v| v.as_str())
+                            .map(Path::new),
+                    },
+                    &rec,
+                    &lig,
+                    &hyde,
+                )
+                .map_err(|e| (-32602, e.to_string()))?,
                 "pdb" => {
                     sandbox
                         .write_string(Path::new(out_script), &write_pdb(&rec))
                         .map_err(|e| (-32602, e.to_string()))?;
-                    written.push(out_script.to_string());
+                    vec![out_script.to_string()]
                 }
                 "sdf" => {
                     sandbox
                         .write_string(Path::new(out_script), &write_sdf_3d(&[&lig]))
                         .map_err(|e| (-32602, e.to_string()))?;
-                    written.push(out_script.to_string());
+                    vec![out_script.to_string()]
                 }
                 other => return Err((-32602, format!("unsupported export target '{other}'"))),
-            }
+            };
             Ok(json!({
                 "target": target,
                 "written_files": written
@@ -524,11 +516,6 @@ pub fn handle_mcp_line(
         Some(m) => m.to_string(),
         None => return Some(json_err(id, -32600, "missing 'method'")),
     };
-
-    if method == "notifications/initialized" {
-        state.initialized = true;
-        return None;
-    }
 
     let sandbox_ref = sandbox;
     let params = req.get("params").cloned().unwrap_or(Value::Null);
@@ -558,6 +545,10 @@ pub fn handle_mcp_line(
             -32002,
             "session not initialized: call 'initialize' first",
         ));
+    }
+
+    if method == "notifications/initialized" {
+        return None;
     }
 
     let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match method.as_str() {
@@ -640,94 +631,227 @@ pub fn serve_stdio(sandbox: &PathSandbox) -> std::io::Result<()> {
     Ok(())
 }
 
-pub fn serve_tcp(
-    sandbox: PathSandbox,
-    bind_addr: &str,
-    auth_token: Option<String>,
-) -> std::io::Result<()> {
-    let listener = TcpListener::bind(bind_addr)?;
-    let active = Arc::new(AtomicUsize::new(0));
-    let sandbox = Arc::new(sandbox);
-    let token = Arc::new(auth_token);
-
-    for stream in listener.incoming() {
-        let Ok(stream) = stream else {
-            continue;
-        };
-        if active.load(Ordering::Acquire) >= MAX_TCP_CONCURRENT {
-            let mut s = stream;
-            let _ = writeln!(
-                s,
-                "{}",
-                json_err(Value::Null, -32000, "too many concurrent TCP sessions")
-            );
-            continue;
-        }
-        let active_c = Arc::clone(&active);
-        let sb_c = Arc::clone(&sandbox);
-        let tok_c = Arc::clone(&token);
-        active_c.fetch_add(1, Ordering::AcqRel);
-        std::thread::spawn(move || {
-            let _ = handle_tcp_client(stream, &sb_c, tok_c.as_deref());
-            active_c.fetch_sub(1, Ordering::AcqRel);
-        });
-    }
-    Ok(())
+struct TcpConn {
+    id: u64,
+    stream: TcpStream,
+    read_buf: Vec<u8>,
+    authed: bool,
+    state: SessionState,
+    in_flight: bool,
+    last_active: Instant,
 }
 
-fn handle_tcp_client(
-    mut stream: TcpStream,
-    sandbox: &PathSandbox,
-    auth_token: Option<&str>,
-) -> std::io::Result<()> {
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
-    let peer = stream.try_clone()?;
-    let mut reader = BufReader::new(peer);
-    let mut state = SessionState::default();
+struct WorkerDone {
+    conn_id: u64,
+    state: SessionState,
+    response: Option<Value>,
+}
 
-    if let Some(expected) = auth_token {
-        let Some(first_line) = read_bounded_line(&mut reader, 4096)? else {
-            return Ok(());
-        };
-        let auth_ok = serde_json::from_str::<Value>(&first_line)
-            .ok()
-            .and_then(|v| {
-                v.get("auth_token")
-                    .and_then(|t| t.as_str())
-                    .map(|s| constant_time_eq(s.as_bytes(), expected.as_bytes()))
-            })
-            .unwrap_or(false);
-        if !auth_ok {
-            writeln!(stream, "{}", json_err(Value::Null, -32001, "unauthorized"))?;
-            return Ok(());
-        }
-        writeln!(
-            stream,
-            "{}",
-            json_ok(Value::Null, json!({ "authenticated": true }))
-        )?;
-        stream.flush()?;
+pub fn serve_tcp(sandbox: PathSandbox, bind_addr: &str, auth_token: &str) -> std::io::Result<()> {
+    if auth_token.trim().is_empty() {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            "--auth-token must be non-empty for TCP transport",
+        ));
     }
+    let addr: SocketAddr = bind_addr.parse().map_err(|e| {
+        std::io::Error::new(
+            ErrorKind::InvalidInput,
+            format!("invalid --bind '{bind_addr}': {e}"),
+        )
+    })?;
+    if !addr.ip().is_loopback() {
+        return Err(std::io::Error::new(
+            ErrorKind::PermissionDenied,
+            format!("refusing non-loopback TCP bind '{addr}'; use 127.0.0.1 or ::1"),
+        ));
+    }
+    let listener = TcpListener::bind(addr)?;
+    serve_tcp_with_listener(listener, sandbox, auth_token, None)
+}
+
+pub fn serve_tcp_with_listener(
+    listener: TcpListener,
+    sandbox: PathSandbox,
+    auth_token: &str,
+    stop: Option<&std::sync::atomic::AtomicBool>,
+) -> std::io::Result<()> {
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+
+    listener.set_nonblocking(true)?;
+    let sandbox = Arc::new(sandbox);
+    let expected_tok = auth_token.to_string();
+    let mut conns: Vec<TcpConn> = Vec::new();
+    let mut next_id = 1u64;
+    let (tx, rx) = mpsc::channel::<WorkerDone>();
+    let mut active_workers = 0usize;
+    let mut tmp = [0u8; 8192];
 
     loop {
-        match read_bounded_line(&mut reader, MAX_MCP_MESSAGE_BYTES) {
-            Ok(Some(line)) => {
-                if line.trim().is_empty() {
-                    continue;
+        if let Some(flag) = stop
+            && flag.load(Ordering::Relaxed)
+        {
+            break;
+        }
+
+        // 1. Accept any waiting TCP sockets non-blockingly
+        while conns.len() < MAX_TCP_SOCKETS {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    if stream.set_nonblocking(true).is_ok() {
+                        conns.push(TcpConn {
+                            id: next_id,
+                            stream,
+                            read_buf: Vec::new(),
+                            authed: false,
+                            state: SessionState::default(),
+                            in_flight: false,
+                            last_active: Instant::now(),
+                        });
+                        next_id += 1;
+                    }
                 }
-                if let Some(resp) = handle_mcp_line(sandbox, &mut state, &line) {
-                    writeln!(stream, "{resp}")?;
-                    stream.flush()?;
-                }
-            }
-            Ok(None) => break,
-            Err(e) => {
-                let _ = writeln!(stream, "{}", json_err(Value::Null, -32600, e.to_string()));
-                break;
+                Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                Err(_) => break,
             }
         }
+
+        // 2. Deliver finished worker responses
+        while let Ok(done) = rx.try_recv() {
+            active_workers = active_workers.saturating_sub(1);
+            if let Some(conn) = conns.iter_mut().find(|c| c.id == done.conn_id) {
+                conn.state = done.state;
+                conn.in_flight = false;
+                conn.last_active = Instant::now();
+                if let Some(resp) = done.response {
+                    let _ = conn.stream.set_nonblocking(false);
+                    let _ = writeln!(conn.stream, "{resp}");
+                    let _ = conn.stream.flush();
+                    let _ = conn.stream.set_nonblocking(true);
+                }
+            }
+        }
+
+        // 3. Evict silent unauthenticated sockets (> 2s) and stale idle sockets (> 30s)
+        let now = Instant::now();
+        conns.retain(|c| {
+            let idle = now.duration_since(c.last_active);
+            if !c.authed && idle > Duration::from_secs(2) {
+                return false;
+            }
+            if idle > Duration::from_secs(30) && !c.in_flight {
+                return false;
+            }
+            true
+        });
+
+        // 4. Non-blocking read & dispatch ready lines
+        let mut to_drop = Vec::new();
+        for (idx, conn) in conns.iter_mut().enumerate() {
+            if conn.in_flight {
+                continue;
+            }
+            loop {
+                match conn.stream.read(&mut tmp) {
+                    Ok(0) => {
+                        to_drop.push(conn.id);
+                        break;
+                    }
+                    Ok(n) => {
+                        conn.last_active = Instant::now();
+                        if conn.read_buf.len() + n > MAX_MCP_MESSAGE_BYTES {
+                            let _ = conn.stream.set_nonblocking(false);
+                            let _ = writeln!(
+                                conn.stream,
+                                "{}",
+                                json_err(Value::Null, -32600, "message exceeds 1 MiB limit")
+                            );
+                            to_drop.push(conn.id);
+                            break;
+                        }
+                        conn.read_buf.extend_from_slice(&tmp[..n]);
+                    }
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                    Err(_) => {
+                        to_drop.push(conn.id);
+                        break;
+                    }
+                }
+            }
+
+            if to_drop.contains(&conn.id) {
+                continue;
+            }
+
+            if let Some(nl_pos) = conn.read_buf.iter().position(|&b| b == b'\n') {
+                let raw_bytes: Vec<u8> = conn.read_buf.drain(..=nl_pos).collect();
+                let Ok(line) = String::from_utf8(raw_bytes) else {
+                    to_drop.push(conn.id);
+                    continue;
+                };
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if !conn.authed {
+                    let auth_ok = serde_json::from_str::<Value>(trimmed)
+                        .ok()
+                        .and_then(|v| {
+                            v.get("auth_token")
+                                .and_then(|t| t.as_str())
+                                .map(|s| constant_time_eq(s.as_bytes(), expected_tok.as_bytes()))
+                        })
+                        .unwrap_or(false);
+                    let _ = conn.stream.set_nonblocking(false);
+                    if !auth_ok {
+                        let _ = writeln!(
+                            conn.stream,
+                            "{}",
+                            json_err(Value::Null, -32001, "unauthorized")
+                        );
+                        let _ = conn.stream.flush();
+                        to_drop.push(conn.id);
+                    } else {
+                        conn.authed = true;
+                        let _ = writeln!(
+                            conn.stream,
+                            "{}",
+                            json_ok(Value::Null, json!({ "authenticated": true }))
+                        );
+                        let _ = conn.stream.flush();
+                        let _ = conn.stream.set_nonblocking(true);
+                    }
+                } else if active_workers < MAX_TCP_CONCURRENT {
+                    conn.in_flight = true;
+                    active_workers += 1;
+                    let sb_c = Arc::clone(&sandbox);
+                    let tx_c = tx.clone();
+                    let cid = conn.id;
+                    let mut st_c = SessionState {
+                        initialized: conn.state.initialized,
+                    };
+                    let line_owned = trimmed.to_string();
+                    std::thread::spawn(move || {
+                        let resp = handle_mcp_line(&sb_c, &mut st_c, &line_owned);
+                        let _ = tx_c.send(WorkerDone {
+                            conn_id: cid,
+                            state: st_c,
+                            response: resp,
+                        });
+                    });
+                }
+            }
+            let _ = idx;
+        }
+
+        if !to_drop.is_empty() {
+            conns.retain(|c| !to_drop.contains(&c.id));
+        }
+
+        std::thread::sleep(Duration::from_millis(4));
     }
+
     Ok(())
 }
 
@@ -776,7 +900,16 @@ mod tests {
         )?;
         let mut state = SessionState::default();
 
-        // 1. Pre-initialize call rejected
+        // 1. Pre-initialize calls (including notifications/initialized) rejected with -32002
+        let notif_bypass = handle_mcp_line(
+            &sandbox,
+            &mut state,
+            r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+        )
+        .ok_or("expected error for pre-init notification")?;
+        assert_eq!(notif_bypass["error"]["code"], -32002);
+        assert!(!state.initialized);
+
         let pre = handle_mcp_line(
             &sandbox,
             &mut state,
@@ -824,20 +957,67 @@ mod tests {
         );
         assert!(wdir.join("docked.sdf").exists());
 
-        // 6. Export complex to MolCraft script
+        // 6. Export complex to MolCraft & Chymera writes self-contained receptor.pdb & ligand.sdf
         std::fs::copy(wdir.join("docked.sdf"), rdir.join("docked.sdf"))?;
         let exp_resp = handle_mcp_line(
             &sandbox,
             &mut state,
-            r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"export_complex","arguments":{"receptor_path":"pocket.pdb","ligand_path":"docked.sdf","target":"molcraft","out_script_path":"scene.pml","out_bundle_path":"scene.molcraft.json"}}}"#,
+            r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"export_complex","arguments":{"receptor_path":"pocket.pdb","ligand_path":"docked.sdf","target":"chymera","out_script_path":"scene.cxc","out_bundle_path":"scene.chymera.json"}}}"#,
         )
         .ok_or("expected response")?;
-        assert_eq!(
-            exp_resp["result"]["structuredContent"]["target"],
-            "molcraft"
-        );
-        assert!(wdir.join("scene.pml").exists());
-        assert!(wdir.join("scene.molcraft.json").exists());
+        assert_eq!(exp_resp["result"]["structuredContent"]["target"], "chymera");
+        assert!(wdir.join("receptor.pdb").exists());
+        assert!(wdir.join("ligand.sdf").exists());
+        assert!(wdir.join("scene.cxc").exists());
+        assert!(wdir.join("scene.chymera.json").exists());
+
+        // 7. Reject oversized 200^3 A box DoS immediately
+        let huge_box = handle_mcp_line(
+            &sandbox,
+            &mut state,
+            r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"run_docking","arguments":{"receptor_path":"pocket.pdb","ligand_smiles":"CCO","box_center":[0,0,0],"box_size":[200,200,200]}}}"#,
+        )
+        .ok_or("expected response")?;
+        assert_eq!(huge_box["error"]["code"], -32602);
+
+        // 8. TCP refuses non-loopback 0.0.0.0 and empty token
+        assert!(serve_tcp(sandbox.clone(), "0.0.0.0:7879", "secret-token").is_err());
+        assert!(serve_tcp(sandbox.clone(), "127.0.0.1:7879", "").is_err());
+
+        // 9. Silent-connection immunity: 40 silent TCP sockets must NOT block an authenticated client
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_c = std::sync::Arc::clone(&stop);
+        let sb_c = sandbox.clone();
+        let srv = std::thread::spawn(move || {
+            let _ = serve_tcp_with_listener(listener, sb_c, "tok-super-secret", Some(&stop_c));
+        });
+
+        let mut silent_clients = Vec::new();
+        for _ in 0..40 {
+            if let Ok(s) = TcpStream::connect(("127.0.0.1", port)) {
+                silent_clients.push(s);
+            }
+        }
+        let mut good = TcpStream::connect(("127.0.0.1", port))?;
+        good.set_read_timeout(Some(Duration::from_secs(3)))?;
+        writeln!(good, r#"{{"auth_token":"tok-super-secret"}}"#)?;
+        good.flush()?;
+        let mut rdr = BufReader::new(good.try_clone()?);
+        let mut auth_line = String::new();
+        rdr.read_line(&mut auth_line)?;
+        assert!(auth_line.contains("authenticated"));
+
+        writeln!(good, r#"{{"jsonrpc":"2.0","id":10,"method":"initialize"}}"#)?;
+        good.flush()?;
+        let mut init_line = String::new();
+        rdr.read_line(&mut init_line)?;
+        assert!(init_line.contains("dockcraft-mcp"));
+
+        drop(silent_clients);
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = srv.join();
 
         let _ = std::fs::remove_dir_all(&base);
         Ok(())

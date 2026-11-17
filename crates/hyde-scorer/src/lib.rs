@@ -4,13 +4,15 @@ use std::time::Instant;
 
 use pocket_detect::compute_sasa_fibonacci;
 use serde::{Deserialize, Serialize};
-use struct_core::{Ad4Type, Atom3D, BondOrder, Molecule3D, norm3, perceive_all};
+use struct_core::{Ad4Type, Atom3D, BondOrder, MAX_LIGAND_ATOMS, Molecule3D, norm3, perceive_all};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum HydeError {
     #[error("empty structure")]
     EmptyStructure,
+    #[error("ligand atom count {count} exceeds limit {limit}")]
+    TooManyLigandAtoms { count: usize, limit: usize },
     #[error("invalid atom index {0}")]
     InvalidAtomIndex(usize),
     #[error("topology error during mutation: {0}")]
@@ -54,8 +56,11 @@ pub struct AtomHydeScore {
     pub diagnostic: String,
 }
 
+/// Clean-room empirical SASA-desolvation, H-bond recovery, lipophilic burial, and steric
+/// decomposition (HYDE-inspired; uses clean-room empirical weights rather than BioSolveIT calibrated tables).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HydeReport {
+    pub scoring_model: String,
     pub total_delta_g_kcal: f64,
     pub estimated_ki_nm: f64,
     pub ligand_efficiency: f64,
@@ -217,7 +222,7 @@ pub fn detect_interactions(receptor: &Molecule3D, ligand: &Molecule3D) -> Vec<In
             }
 
             // Halogen bond: C-X ... (O/N/S) with sigma-hole angle >= 120 deg
-            if matches!(la.element.as_str(), "CL" | "BR" | "I")
+            if matches!(la.element.as_str(), "Cl" | "Br" | "I")
                 && ra.h_acceptor
                 && (2.6..=3.9).contains(&d)
             {
@@ -243,10 +248,7 @@ pub fn detect_interactions(receptor: &Molecule3D, ligand: &Molecule3D) -> Vec<In
             }
 
             // Hydrophobic contacts
-            if la.ad4_type.is_hydrophobic()
-                && ra.ad4_type.is_hydrophobic()
-                && (3.2..=4.4).contains(&d)
-            {
+            if la.hydrophobic && ra.hydrophobic && (3.2..=4.4).contains(&d) {
                 interactions.push(Interaction {
                     kind: InteractionKind::HydrophobicContact,
                     lig_atom_indices: vec![li],
@@ -320,6 +322,12 @@ pub fn score_pose_hyde(
     receptor: &Molecule3D,
     ligand: &Molecule3D,
 ) -> Result<HydeReport, HydeError> {
+    if ligand.atoms.len() > MAX_LIGAND_ATOMS {
+        return Err(HydeError::TooManyLigandAtoms {
+            count: ligand.atoms.len(),
+            limit: MAX_LIGAND_ATOMS,
+        });
+    }
     let rec_heavy: Vec<(usize, &Atom3D)> = receptor
         .atoms
         .iter()
@@ -393,7 +401,7 @@ pub fn score_pose_hyde(
             if d > 5.0 {
                 continue;
             }
-            if la.ad4_type.is_hydrophobic() && ra.ad4_type.is_hydrophobic() && d <= 4.5 {
+            if la.hydrophobic && ra.hydrophobic && d <= 4.5 {
                 apolar_neighbors += 1;
             }
             let r_sum = la.ad4_type.vina_radius() + ra.ad4_type.vina_radius();
@@ -408,7 +416,7 @@ pub fn score_pose_hyde(
             }
         }
 
-        let hydrophobic_kcal = if la.ad4_type.is_hydrophobic() && apolar_neighbors > 0 {
+        let hydrophobic_kcal = if la.hydrophobic && apolar_neighbors > 0 {
             let match_factor = (apolar_neighbors as f64 / 3.0).clamp(0.3, 1.15);
             -0.024 * dsasa * match_factor
         } else {
@@ -454,6 +462,7 @@ pub fn score_pose_hyde(
     let ligand_efficiency = -total_dg / (lig_heavy.len().max(1) as f64);
 
     Ok(HydeReport {
+        scoring_model: "dockcraft-cleanroom-hyde-inspired".to_string(),
         total_delta_g_kcal: total_dg,
         estimated_ki_nm,
         ligand_efficiency,

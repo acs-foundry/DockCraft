@@ -390,7 +390,11 @@ impl DockCraftApp {
             let (pml, bundle) = build_molcraft_export(&lig.name, rec, lig, hyde);
             let p1 = dir.join("dockcraft_scene.pml");
             let p2 = dir.join("dockcraft_scene.molcraft.json");
-            let ok = std::fs::write(&p1, pml).is_ok()
+            let p_rec = dir.join("receptor.pdb");
+            let p_lig = dir.join("ligand.sdf");
+            let ok = std::fs::write(&p_rec, &bundle.receptor_pdb).is_ok()
+                && std::fs::write(&p_lig, &bundle.ligand_sdf).is_ok()
+                && std::fs::write(&p1, pml).is_ok()
                 && serde_json::to_string_pretty(&bundle)
                     .map(|js| std::fs::write(&p2, js).is_ok())
                     .unwrap_or(false);
@@ -403,7 +407,11 @@ impl DockCraftApp {
             let (cxc, bundle) = build_chymera_export(&lig.name, rec, lig, hyde);
             let p1 = dir.join("dockcraft_scene.cxc");
             let p2 = dir.join("dockcraft_scene.chymera.json");
-            let ok = std::fs::write(&p1, cxc).is_ok()
+            let p_rec = dir.join("receptor.pdb");
+            let p_lig = dir.join("ligand.sdf");
+            let ok = std::fs::write(&p_rec, &bundle.receptor_pdb).is_ok()
+                && std::fs::write(&p_lig, &bundle.ligand_sdf).is_ok()
+                && std::fs::write(&p1, cxc).is_ok()
                 && serde_json::to_string_pretty(&bundle)
                     .map(|js| std::fs::write(&p2, js).is_ok())
                     .unwrap_or(false);
@@ -475,10 +483,16 @@ impl eframe::App for DockCraftApp {
                     .selected_text(match self.scoring {
                         ScoringFunction::Vina => "Vina",
                         ScoringFunction::Vinardo => "Vinardo",
+                        ScoringFunction::DockCraftHybrid => "DockCraft Hybrid",
                     })
                     .show_ui(ui, |ui| {
                         ui.selectable_value(&mut self.scoring, ScoringFunction::Vina, "Vina");
                         ui.selectable_value(&mut self.scoring, ScoringFunction::Vinardo, "Vinardo");
+                        ui.selectable_value(
+                            &mut self.scoring,
+                            ScoringFunction::DockCraftHybrid,
+                            "DockCraft Hybrid",
+                        );
                     });
                 ui.add(egui::Slider::new(&mut self.exhaustiveness, 1..=16).text("Exh"));
                 ui.separator();
@@ -875,10 +889,14 @@ mod tests {
     #[test]
     fn showcase_complex_scores_hyde_and_mutates() -> Result<(), Box<dyn std::error::Error>> {
         let (rec, lig) = build_demo_showcase();
-        let pockets = detect_pockets(&rec, &PocketDetectConfig::default())?;
-        assert!(!pockets.is_empty() || rec.atoms.len() == 12);
+        let _pockets = detect_pockets(&rec, &PocketDetectConfig::default())?;
         let rep = score_pose_hyde(&rec, &lig)?;
         assert_eq!(rep.atom_scores.len(), lig.heavy_atom_count());
+        assert!(
+            !rep.interactions.is_empty(),
+            "expected 3D interactions in showcase"
+        );
+        assert!(evaluate_admet(&lig).mw > 100.0);
         let mut_out = mutate_and_minimize_in_pocket(&rec, &lig, 2, SubstituentPreset::F)?;
         assert!(mut_out.mutated_ligand.atoms.len() > lig.atoms.len());
         Ok(())

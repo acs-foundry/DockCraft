@@ -283,14 +283,14 @@ fn extract_chemcraft_json_mols(
 
 #[must_use]
 pub fn compute_mpo_score(affinity_kcal: f64, hyde_dg: f64, admet: &AdmetProfile) -> f64 {
-    // Normalize affinity from [-12, -2] kcal/mol into [0, 1]
-    let aff_norm = ((-affinity_kcal - 2.0) / 10.0).clamp(0.0, 1.0);
-    let hyde_norm = ((-hyde_dg - 1.5) / 10.0).clamp(0.0, 1.0);
+    // Continuous ramp over [-11, 0] kcal/mol so MPO separates weak vs medium vs tight binders
+    let aff_norm = (-affinity_kcal / 11.0).clamp(0.0, 1.0);
+    let hyde_norm = ((-hyde_dg + 1.0) / 11.0).clamp(0.0, 1.0);
     let admet_norm = (admet.admet_score / 100.0).clamp(0.0, 1.0);
     let pains_mult = if admet.pains_alerts.is_empty() {
         1.0
     } else {
-        0.65
+        0.55
     };
     ((0.45 * aff_norm + 0.30 * hyde_norm + 0.25 * admet_norm) * pains_mult).clamp(0.0, 1.0)
 }
@@ -373,6 +373,7 @@ pub fn run_screening_campaign(
             ad4: Ad4Type::C,
             h_donor: false,
             h_acceptor: false,
+            hydrophobic: true,
         });
     }
     let grids = AffinityGridSet::build(receptor, grid_box, &all_channels, config.scoring)?;

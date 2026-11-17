@@ -279,7 +279,7 @@ impl Atom3D {
             aromatic: false,
             h_donor: false,
             h_acceptor: false,
-            hydrophobic: false,
+            hydrophobic: ad4_type.is_hydrophobic(),
             b_factor: 20.0,
             is_backbone: false,
         }
@@ -355,14 +355,108 @@ impl Molecule3D {
         self.atoms.iter().filter(|a| a.is_heavy()).count()
     }
 
+    pub fn implicit_hydrogens_at(&self, idx: usize) -> usize {
+        let Some(a) = self.atoms.get(idx) else {
+            return 0;
+        };
+        if !a.is_heavy() {
+            return 0;
+        }
+        let mut bo_sum = 0.0_f64;
+        if let Some(nbrs) = self.adj.get(idx) {
+            for &(_, bid) in nbrs {
+                bo_sum += match self.bonds[bid].order {
+                    BondOrder::Single => 1.0,
+                    BondOrder::Double => 2.0,
+                    BondOrder::Triple => 3.0,
+                    BondOrder::Aromatic => 1.5,
+                };
+            }
+        }
+        if bo_sum == 0.0 && !self.bonds.is_empty() {
+            return 0;
+        }
+        let fc = i32::from(a.formal_charge);
+        let target: i32 = match a.element.as_str() {
+            "C" => (4 - fc.abs()).max(0),
+            "N" => (3 + fc).clamp(0, 4),
+            "O" => (2 + fc).clamp(0, 3),
+            "S" => {
+                if bo_sum <= 2.1 {
+                    (2 + fc).clamp(0, 3)
+                } else if bo_sum <= 4.1 {
+                    4
+                } else {
+                    6
+                }
+            }
+            "P" => {
+                if bo_sum <= 3.1 {
+                    (3 + fc).clamp(0, 4)
+                } else {
+                    5
+                }
+            }
+            "F" | "Cl" | "Br" | "I" => (1 + fc).clamp(0, 1),
+            _ => 0,
+        };
+        let used = bo_sum.ceil() as i32;
+        (target - used).max(0) as usize
+    }
+
     pub fn molecular_weight(&self) -> f64 {
-        self.atoms.iter().map(|a| element_weight(&a.element)).sum()
+        let explicit: f64 = self.atoms.iter().map(|a| element_weight(&a.element)).sum();
+        let implicit_h: usize = if self.bonds.is_empty() {
+            0
+        } else {
+            (0..self.atoms.len())
+                .map(|i| self.implicit_hydrogens_at(i))
+                .sum()
+        };
+        explicit + (implicit_h as f64) * element_weight("H")
+    }
+
+    /// Indices of the stationary rigid core (all heavy atoms not belonging to any distal moving branch).
+    pub fn rigid_core_indices(&self) -> Vec<usize> {
+        let mut moving = vec![false; self.atoms.len()];
+        for rb in &self.rotatable_bonds {
+            for &m in &rb.moving_atoms {
+                if m < moving.len() {
+                    moving[m] = true;
+                }
+            }
+        }
+        let core: Vec<usize> = self
+            .atoms
+            .iter()
+            .enumerate()
+            .filter(|(i, a)| a.is_heavy() && !moving[*i])
+            .map(|(i, _)| i)
+            .collect();
+        if core.is_empty() {
+            self.atoms
+                .iter()
+                .enumerate()
+                .filter(|(_, a)| a.is_heavy())
+                .map(|(i, _)| i)
+                .collect()
+        } else {
+            core
+        }
     }
 
     pub fn formula(&self) -> String {
         let mut counts: BTreeMap<&str, u32> = BTreeMap::new();
         for a in &self.atoms {
             *counts.entry(a.element.as_str()).or_default() += 1;
+        }
+        if !self.bonds.is_empty() {
+            let imp_h: u32 = (0..self.atoms.len())
+                .map(|i| self.implicit_hydrogens_at(i) as u32)
+                .sum();
+            if imp_h > 0 {
+                *counts.entry("H").or_default() += imp_h;
+            }
         }
         let mut out = String::new();
         if let Some(c) = counts.remove("C") {

@@ -16,6 +16,9 @@ pub enum PocketError {
     InvalidBox(String),
 }
 
+pub const MAX_GRID_BOX_AXIS_A: f64 = 60.0;
+pub const MAX_GRID_VOXELS: usize = 1_500_000;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct GridBox {
     pub center: [f64; 3],
@@ -29,23 +32,34 @@ impl GridBox {
         size: [f64; 3],
         spacing: f64,
     ) -> Result<Self, PocketError> {
-        if !spacing.is_finite() || spacing <= 0.05 || spacing > 2.0 {
+        if !spacing.is_finite() || spacing < 0.15 || spacing > 2.0 {
             return Err(PocketError::InvalidBox(format!(
-                "grid spacing {spacing} out of (0.05, 2.0]"
+                "grid spacing {spacing} out of [0.15, 2.0]"
             )));
         }
         for (axis, (&c, &s)) in center.iter().zip(size.iter()).enumerate() {
-            if !c.is_finite() || !s.is_finite() || s <= 1.0 {
+            if !c.is_finite() || !s.is_finite() || s <= 1.0 || s > MAX_GRID_BOX_AXIS_A {
                 return Err(PocketError::InvalidBox(format!(
-                    "axis {axis} has invalid center/size ({c}, {s})"
+                    "axis {axis} center/size ({c}, {s}) must have 1.0 < size <= {MAX_GRID_BOX_AXIS_A} A"
                 )));
             }
         }
-        Ok(Self {
+        let gbox = Self {
             center,
             size,
             spacing,
-        })
+        };
+        let dims = gbox.dimensions();
+        let voxels = dims[0]
+            .checked_mul(dims[1])
+            .and_then(|v| v.checked_mul(dims[2]))
+            .unwrap_or(usize::MAX);
+        if voxels > MAX_GRID_VOXELS {
+            return Err(PocketError::InvalidBox(format!(
+                "grid voxel count {voxels} exceeds limit {MAX_GRID_VOXELS}"
+            )));
+        }
+        Ok(gbox)
     }
 
     pub fn from_ligand(ligand: &Molecule3D, padding: f64) -> Result<Self, PocketError> {
@@ -489,7 +503,7 @@ pub fn detect_pockets(
                 res_seq: atom.res_seq,
                 res_name: atom.res_name.clone(),
             });
-            if atom.ad4_type.is_hydrophobic() {
+            if atom.hydrophobic {
                 apolar_count += 1;
             }
             if atom.ad4_type.is_acceptor() || atom.ad4_type.is_donor_heavy() {
@@ -510,9 +524,9 @@ pub fn detect_pockets(
             .clamp(0.0, 1.0);
 
         let box_size = [
-            ((max_p[0] - min_p[0]) + 2.0 * config.box_padding).max(16.0),
-            ((max_p[1] - min_p[1]) + 2.0 * config.box_padding).max(16.0),
-            ((max_p[2] - min_p[2]) + 2.0 * config.box_padding).max(16.0),
+            ((max_p[0] - min_p[0]) + 2.0 * config.box_padding).clamp(16.0, 42.0),
+            ((max_p[1] - min_p[1]) + 2.0 * config.box_padding).clamp(16.0, 42.0),
+            ((max_p[2] - min_p[2]) + 2.0 * config.box_padding).clamp(16.0, 42.0),
         ];
         let grid_box = GridBox::from_center_size(center, box_size, config.box_spacing)?;
 
@@ -630,6 +644,8 @@ mod tests {
             gbox.dimensions()[0],
             ((gbox.size[0] / 0.375).ceil() as usize) + 1
         );
+        // Reject oversized 200^3 A box DoS immediately
+        assert!(GridBox::from_center_size([0.0, 0.0, 0.0], [200.0, 200.0, 200.0], 0.375).is_err());
         Ok(())
     }
 }

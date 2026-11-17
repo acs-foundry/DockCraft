@@ -8,6 +8,8 @@ pub enum ScoringFunction {
     #[default]
     Vina,
     Vinardo,
+    /// Vina terms combined with an explicit screened electrostatic term (`3.2 * q1*q2 / r^2`).
+    DockCraftHybrid,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -26,7 +28,7 @@ pub struct ScoreBreakdown {
 #[must_use]
 pub fn vina_vdw_radius(ad4: Ad4Type, sf: ScoringFunction) -> f64 {
     match sf {
-        ScoringFunction::Vina => ad4.vina_radius(),
+        ScoringFunction::Vina | ScoringFunction::DockCraftHybrid => ad4.vina_radius(),
         ScoringFunction::Vinardo => match ad4 {
             Ad4Type::C | Ad4Type::A => 1.90,
             Ad4Type::N | Ad4Type::NA | Ad4Type::NS => 1.75,
@@ -65,7 +67,7 @@ pub fn is_hbond_pair(a: &Atom3D, b: &Atom3D) -> bool {
 
 #[inline]
 pub fn is_hydrophobic_pair(a: &Atom3D, b: &Atom3D) -> bool {
-    a.ad4_type.is_hydrophobic() && b.ad4_type.is_hydrophobic()
+    a.hydrophobic && b.hydrophobic
 }
 
 /// Evaluates pairwise interaction `(energy_kcal, dE / dr)` between a receptor atom `rec` and ligand atom `lig` separated by distance `r`.
@@ -90,7 +92,7 @@ pub fn pairwise_energy_and_deriv(
     };
 
     let (e_g1, de_g1, e_g2, de_g2, e_rep, de_rep, e_hyd, de_hyd, e_hb, de_hb) = match sf {
-        ScoringFunction::Vina => {
+        ScoringFunction::Vina | ScoringFunction::DockCraftHybrid => {
             let w_g1 = -0.035_579;
             let w_g2 = -0.005_156;
             let w_rep = 0.840_245;
@@ -179,11 +181,10 @@ pub fn pairwise_energy_and_deriv(
         }
     };
 
-    // Soft screened electrostatic / salt-bridge complementarity term
+    // Electrostatics apply ONLY in explicit `DockCraftHybrid`; `Vina` and `Vinardo` are pure literature forms.
     let q_prod = rec.charge * lig.charge;
     let r_eff = r.max(2.2);
-    let (elec, delec) = if q_prod.abs() > 1e-4 {
-        // Screened Coulomb (eps = 4 * r): E = 332 * q1*q2 / (18 * r^2) scaled conservatively
+    let (elec, delec) = if sf == ScoringFunction::DockCraftHybrid && q_prod.abs() > 1e-4 {
         let scale = 3.2;
         let e = scale * q_prod / (r_eff * r_eff);
         let de = if r >= 2.2 {

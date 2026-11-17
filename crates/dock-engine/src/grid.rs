@@ -13,6 +13,7 @@ pub struct AtomChannelKey {
     pub ad4: Ad4Type,
     pub h_donor: bool,
     pub h_acceptor: bool,
+    pub hydrophobic: bool,
 }
 
 impl AtomChannelKey {
@@ -22,6 +23,7 @@ impl AtomChannelKey {
             ad4: atom.ad4_type,
             h_donor: atom.h_donor,
             h_acceptor: atom.h_acceptor,
+            hydrophobic: atom.hydrophobic,
         }
     }
 }
@@ -119,7 +121,11 @@ impl AffinityGridSet {
         }
 
         let mut channel_grids = vec![vec![0.0_f32; n_vox]; unique_channels.len()];
-        let mut elec_grid = vec![0.0_f32; n_vox];
+        let mut elec_grid = if scoring == ScoringFunction::DockCraftHybrid {
+            vec![0.0_f32; n_vox]
+        } else {
+            Vec::new()
+        };
 
         let hash = RecSpatialHash::new(&rec_heavy, 4.0);
         let mut probe_atoms: Vec<Atom3D> = unique_channels
@@ -130,6 +136,7 @@ impl AffinityGridSet {
                 a.ad4_type = ch.ad4;
                 a.h_donor = ch.h_donor;
                 a.h_acceptor = ch.h_acceptor;
+                a.hydrophobic = ch.hydrophobic;
                 a.charge = 0.0; // electrostatics stored separately in elec_grid
                 a
             })
@@ -149,29 +156,31 @@ impl AffinityGridSet {
                         continue;
                     }
 
-                    // Electrostatic unit probe potential
-                    let mut phi = 0.0_f64;
-                    for &r_idx in &neighbors {
-                        let ra = rec_heavy[r_idx];
-                        let dx = pos[0] - ra.coords[0];
-                        let dy = pos[1] - ra.coords[1];
-                        let dz = pos[2] - ra.coords[2];
-                        let r2 = dx * dx + dy * dy + dz * dz;
-                        if r2 >= 64.0 {
-                            continue;
+                    // Electrostatic unit probe potential (used only by DockCraftHybrid)
+                    if scoring == ScoringFunction::DockCraftHybrid {
+                        let mut phi = 0.0_f64;
+                        for &r_idx in &neighbors {
+                            let ra = rec_heavy[r_idx];
+                            let dx = pos[0] - ra.coords[0];
+                            let dy = pos[1] - ra.coords[1];
+                            let dz = pos[2] - ra.coords[2];
+                            let r2 = dx * dx + dy * dy + dz * dz;
+                            if r2 >= 64.0 {
+                                continue;
+                            }
+                            let r = r2.sqrt();
+                            if ra.charge.abs() > 1e-4 {
+                                let r_eff = r.max(2.2);
+                                let (env, _) = if r > 7.2 {
+                                    smooth_down(r, 7.2, 8.0)
+                                } else {
+                                    (1.0, 0.0)
+                                };
+                                phi += 3.2 * ra.charge / (r_eff * r_eff) * env;
+                            }
                         }
-                        let r = r2.sqrt();
-                        if ra.charge.abs() > 1e-4 {
-                            let r_eff = r.max(2.2);
-                            let (env, _) = if r > 7.2 {
-                                smooth_down(r, 7.2, 8.0)
-                            } else {
-                                (1.0, 0.0)
-                            };
-                            phi += 3.2 * ra.charge / (r_eff * r_eff) * env;
-                        }
+                        elec_grid[vox] = phi as f32;
                     }
-                    elec_grid[vox] = phi as f32;
 
                     for (c_idx, probe) in probe_atoms.iter_mut().enumerate() {
                         probe.coords = pos;
@@ -278,7 +287,10 @@ impl AffinityGridSet {
             inv_h,
         );
 
-        let (e_q, g_q) = if charge.abs() > 1e-4 {
+        let (e_q, g_q) = if self.scoring == ScoringFunction::DockCraftHybrid
+            && !self.elec_grid.is_empty()
+            && charge.abs() > 1e-4
+        {
             let (phi, dphi) = trilinear(
                 &self.elec_grid,
                 [i000, i100, i010, i110, i001, i101, i011, i111],
@@ -303,6 +315,57 @@ impl AffinityGridSet {
                 g_c[2] + g_q[2] + wall_g[2],
             ],
         )
+    }
+
+    /// Extracts sterically favorable, spatially diverse cavity points inside the GridBox.
+    #[must_use]
+    pub fn cavity_anchor_points(&self, max_points: usize) -> Vec<[f64; 3]> {
+        let base_idx = self
+            .channels
+            .iter()
+            .position(|k| matches!(k.ad4, Ad4Type::C | Ad4Type::A))
+            .unwrap_or(0);
+        let Some(base_grid) = self.channel_grids.get(base_idx) else {
+            return vec![self.grid_box.center];
+        };
+        let step = ((2.0 / self.spacing).round() as usize).max(2);
+        let [nx, ny, nz] = self.dims;
+        let mut scored: Vec<(f32, [f64; 3])> = Vec::new();
+        for ix in (1..nx.saturating_sub(1)).step_by(step) {
+            let x = self.origin[0] + ix as f64 * self.spacing;
+            for iy in (1..ny.saturating_sub(1)).step_by(step) {
+                let y = self.origin[1] + iy as f64 * self.spacing;
+                for iz in (1..nz.saturating_sub(1)).step_by(step) {
+                    let vox = (ix * ny + iy) * nz + iz;
+                    let e = base_grid[vox];
+                    if e < -0.01 {
+                        let z = self.origin[2] + iz as f64 * self.spacing;
+                        scored.push((e, [x, y, z]));
+                    }
+                }
+            }
+        }
+        scored.sort_by(|a, b| a.0.total_cmp(&b.0));
+
+        let mut chosen = Vec::with_capacity(max_points.max(1));
+        for &(_, p) in &scored {
+            let far = chosen.iter().all(|c: &[f64; 3]| {
+                let dx = c[0] - p[0];
+                let dy = c[1] - p[1];
+                let dz = c[2] - p[2];
+                dx * dx + dy * dy + dz * dz >= 2.2 * 2.2
+            });
+            if far {
+                chosen.push(p);
+                if chosen.len() >= max_points {
+                    break;
+                }
+            }
+        }
+        if chosen.is_empty() {
+            chosen.push(self.grid_box.center);
+        }
+        chosen
     }
 }
 

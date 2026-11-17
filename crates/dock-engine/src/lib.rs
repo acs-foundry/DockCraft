@@ -18,6 +18,8 @@ use thiserror::Error;
 pub enum DockError {
     #[error("empty receptor or ligand coordinates")]
     EmptyStructure,
+    #[error("ligand atom count {count} exceeds limit {limit}")]
+    TooManyLigandAtoms { count: usize, limit: usize },
     #[error("grid error: {0}")]
     Grid(#[from] pocket_detect::PocketError),
     #[error("format error: {0}")]

@@ -1,8 +1,12 @@
 #![forbid(unsafe_code)]
 
+use std::path::Path;
+
 use hyde_scorer::HydeReport;
 use serde::{Deserialize, Serialize};
 use struct_core::{Molecule3D, write_pdb, write_sdf_3d};
+
+use crate::sandbox::{PathSandbox, SandboxError};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExportAtomAnnotation {
@@ -80,7 +84,7 @@ pub fn build_chymera_export(
 ) -> (String, InteropSceneBundle) {
     let mut cxc = String::new();
     cxc.push_str(&format!(
-        "# DockCraft -> Chymera (.cxc) script ({complex_name})\n"
+        "# DockCraft -> ChimeraX/Chymera (.cxc) script ({complex_name})\n"
     ));
     cxc.push_str("open receptor.pdb\n");
     cxc.push_str("open ligand.sdf\n");
@@ -111,6 +115,61 @@ pub fn build_chymera_export(
 
     let bundle = make_bundle("Chymera", complex_name, receptor, ligand, hyde);
     (cxc, bundle)
+}
+
+pub struct SceneExportRequest<'a> {
+    pub target: &'a str,
+    pub complex_name: &'a str,
+    pub out_script_path: &'a Path,
+    pub out_bundle_path: Option<&'a Path>,
+}
+
+/// Writes the full self-contained scene directory (`script`, `receptor.pdb`, `ligand.sdf`, optional JSON bundle)
+/// through the `openat2` sandbox so ChimeraX / MolCraft never encounter missing `receptor.pdb` / `ligand.sdf`.
+pub fn write_sandboxed_scene_package(
+    sandbox: &PathSandbox,
+    req: &SceneExportRequest<'_>,
+    receptor: &Molecule3D,
+    ligand: &Molecule3D,
+    hyde: &HydeReport,
+) -> Result<Vec<String>, SandboxError> {
+    let (script_text, bundle) = if req.target == "chymera" {
+        build_chymera_export(req.complex_name, receptor, ligand, hyde)
+    } else {
+        build_molcraft_export(req.complex_name, receptor, ligand, hyde)
+    };
+
+    let parent_dir = req
+        .out_script_path
+        .parent()
+        .unwrap_or_else(|| Path::new(""));
+    let rec_rel = if parent_dir.as_os_str().is_empty() {
+        Path::new("receptor.pdb").to_path_buf()
+    } else {
+        parent_dir.join("receptor.pdb")
+    };
+    let lig_rel = if parent_dir.as_os_str().is_empty() {
+        Path::new("ligand.sdf").to_path_buf()
+    } else {
+        parent_dir.join("ligand.sdf")
+    };
+
+    sandbox.write_string(&rec_rel, &bundle.receptor_pdb)?;
+    sandbox.write_string(&lig_rel, &bundle.ligand_sdf)?;
+    sandbox.write_string(req.out_script_path, &script_text)?;
+
+    let mut written = vec![
+        rec_rel.display().to_string(),
+        lig_rel.display().to_string(),
+        req.out_script_path.display().to_string(),
+    ];
+    if let Some(bp) = req.out_bundle_path {
+        let js = serde_json::to_string_pretty(&bundle)
+            .map_err(|e| SandboxError::RejectedPath(format!("bundle serialize error: {e}")))?;
+        sandbox.write_string(bp, &js)?;
+        written.push(bp.display().to_string());
+    }
+    Ok(written)
 }
 
 fn make_bundle(

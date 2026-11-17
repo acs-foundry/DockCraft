@@ -7,6 +7,9 @@ use crate::types::{
     Ad4Type, Atom3D, BondOrder, Molecule3D, element_atomic_number, normalize_element,
 };
 
+pub const MAX_RECEPTOR_ATOMS: usize = 60_000;
+pub const MAX_LIGAND_ATOMS: usize = 512;
+
 /// Parse a PDB file (`ATOM`, `HETATM`, `CONECT`, first `MODEL`) cleanly and run receptor/ligand preparation.
 pub fn parse_pdb(input: &str, strip_waters: bool) -> Result<Molecule3D, StructError> {
     if input.trim().is_empty() {
@@ -32,6 +35,12 @@ pub fn parse_pdb(input: &str, strip_waters: bool) -> Result<Molecule3D, StructEr
             continue;
         }
         if raw.starts_with("ATOM  ") || raw.starts_with("HETATM") {
+            if mol.atoms.len() >= MAX_RECEPTOR_ATOMS {
+                return Err(StructError::TooManyAtoms {
+                    count: mol.atoms.len() + 1,
+                    limit: MAX_RECEPTOR_ATOMS,
+                });
+            }
             let is_het = raw.starts_with("HETATM");
             let alt_loc = raw.get(16..17).unwrap_or(" ");
             if !matches!(alt_loc, " " | "A" | "1") {
@@ -291,6 +300,12 @@ pub fn parse_mmcif(input: &str, strip_waters: bool) -> Result<Molecule3D, Struct
             .unwrap_or(20.0);
 
         let mut atom = Atom3D::new(mol.atoms.len(), &el, [x, y, z]);
+        if mol.atoms.len() >= MAX_RECEPTOR_ATOMS {
+            return Err(StructError::TooManyAtoms {
+                count: mol.atoms.len() + 1,
+                limit: MAX_RECEPTOR_ATOMS,
+            });
+        }
         atom.is_backbone = !is_het && matches!(name.as_str(), "N" | "CA" | "C" | "O");
         atom.name = name;
         atom.res_name = res_name;
@@ -421,6 +436,12 @@ pub fn parse_mol2(input: &str) -> Result<Molecule3D, StructError> {
                 mol_line += 1;
             }
             Sec::Atom => {
+                if mol.atoms.len() >= MAX_RECEPTOR_ATOMS {
+                    return Err(StructError::TooManyAtoms {
+                        count: mol.atoms.len() + 1,
+                        limit: MAX_RECEPTOR_ATOMS,
+                    });
+                }
                 let toks: Vec<&str> = t.split_whitespace().collect();
                 if toks.len() < 6 {
                     return Err(StructError::InvalidMol2 {
@@ -586,6 +607,12 @@ pub fn parse_sdf_mol_block(block: &str) -> Result<Molecule3D, StructError> {
                 line: 4,
                 msg: "invalid V2000 bond count".to_string(),
             })?;
+    if ac > MAX_LIGAND_ATOMS {
+        return Err(StructError::TooManyAtoms {
+            count: ac,
+            limit: MAX_LIGAND_ATOMS,
+        });
+    }
     if lines.len() < 4 + ac + bc {
         return Err(StructError::InvalidSdf {
             line: 4,
@@ -712,6 +739,12 @@ fn parse_sdf_v3000(lines: &[&str], title: &str) -> Result<Molecule3D, StructErro
             _ => {}
         }
         if in_atom {
+            if mol.atoms.len() >= MAX_LIGAND_ATOMS {
+                return Err(StructError::TooManyAtoms {
+                    count: mol.atoms.len() + 1,
+                    limit: MAX_LIGAND_ATOMS,
+                });
+            }
             let toks: Vec<&str> = rest.split_whitespace().collect();
             if toks.len() < 5 {
                 return Err(StructError::InvalidSdf {
@@ -853,6 +886,12 @@ pub fn parse_pdbqt(input: &str) -> Result<Molecule3D, StructError> {
             break;
         }
         if raw.starts_with("ATOM  ") || raw.starts_with("HETATM") {
+            if mol.atoms.len() >= MAX_RECEPTOR_ATOMS {
+                return Err(StructError::TooManyAtoms {
+                    count: mol.atoms.len() + 1,
+                    limit: MAX_RECEPTOR_ATOMS,
+                });
+            }
             let is_het = raw.starts_with("HETATM");
             let name = raw.get(12..16).unwrap_or("C").trim().to_string();
             let res_name = raw.get(17..20).unwrap_or("LIG").trim().to_string();

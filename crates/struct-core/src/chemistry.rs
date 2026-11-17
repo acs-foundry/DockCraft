@@ -233,8 +233,17 @@ fn apply_ph74_protonation_and_polar_h(mol: &mut Molecule3D) {
                             && mol.bonds[bid].order == BondOrder::Double
                     })
             });
-            // Aliphatic amine without carbonyl/aryl conjugation -> protonated at pH 7.4 (+1)
-            if all_single && !heavy_nbrs.is_empty() && heavy_nbrs.len() <= 3 && !near_ewg {
+            // Amidine / guanidine (=N attached to C bearing another N) -> protonated (+1) at pH 7.4
+            let is_amidine_imine = heavy_nbrs.len() == 1
+                && heavy_nbrs[0].1 == BondOrder::Double
+                && mol.atoms[heavy_nbrs[0].0].element == "C"
+                && mol.adj[heavy_nbrs[0].0]
+                    .iter()
+                    .any(|&(nb, _)| nb != i && mol.atoms[nb].element == "N");
+            // Aliphatic amine without carbonyl/aryl conjugation, or amidine imine -> protonated at pH 7.4 (+1)
+            if is_amidine_imine
+                || (all_single && !heavy_nbrs.is_empty() && heavy_nbrs.len() <= 3 && !near_ewg)
+            {
                 mol.atoms[i].formal_charge = 1;
             }
         }
@@ -398,7 +407,7 @@ pub fn assign_gasteiger_charges(mol: &mut Molecule3D) {
     let mut q: Vec<f64> = mol
         .atoms
         .iter()
-        .map(|a| f64::from(a.formal_charge) * 0.5)
+        .map(|a| f64::from(a.formal_charge))
         .collect();
     let mut params: Vec<(f64, f64, f64)> = Vec::with_capacity(n);
     for (i, a) in mol.atoms.iter().enumerate() {
@@ -427,7 +436,11 @@ pub fn assign_gasteiger_charges(mol: &mut Molecule3D) {
             } else {
                 (j, i, chi[i] - chi[j])
             };
-            let denom = (params[donor].0 + params[donor].1 + params[donor].2).max(4.0);
+            let denom = if mol.atoms[donor].element == "H" {
+                20.02
+            } else {
+                (params[donor].0 + params[donor].1 + params[donor].2).max(4.0)
+            };
             let flow = (d_chi / denom) * damp;
             dq[donor] += flow;
             dq[acceptor] -= flow;
@@ -569,14 +582,49 @@ pub fn build_rotatable_bonds(mol: &mut Molecule3D) {
         }
     }
 
-    // Choose rigid root anchor: atom in most rings or closest to heavy centroid
-    let root = (0..mol.atoms.len())
+    // Choose rigid root anchor: central atom (min graph eccentricity / max rigid connectivity)
+    let heavy_ids: Vec<usize> = (0..mol.atoms.len())
         .filter(|&i| mol.atoms[i].is_heavy())
-        .max_by_key(|&i| {
+        .collect();
+    let root = heavy_ids
+        .iter()
+        .copied()
+        .min_by_key(|&i| {
+            // Graph eccentricity from `i` across heavy atoms, tie-broken by (-ring_count, -deg)
+            let mut dist = vec![usize::MAX; mol.atoms.len()];
+            let mut q = VecDeque::new();
+            dist[i] = 0;
+            q.push_back(i);
+            let mut max_d = 0usize;
+            while let Some(cur) = q.pop_front() {
+                max_d = max_d.max(dist[cur]);
+                for &(nb, _) in &mol.adj[cur] {
+                    if mol.atoms[nb].is_heavy() && dist[nb] == usize::MAX {
+                        dist[nb] = dist[cur] + 1;
+                        q.push_back(nb);
+                    }
+                }
+            }
             let r_cnt = mol.rings.iter().filter(|r| r.contains(&i)).count();
-            (r_cnt, mol.adj[i].len())
+            (max_d, usize::MAX - r_cnt, usize::MAX - mol.adj[i].len())
         })
         .unwrap_or(0);
+
+    // BFS topological distance from root so nested rotatable bonds apply root-to-leaf
+    let mut depth_from_root = vec![usize::MAX; mol.atoms.len()];
+    if root < mol.atoms.len() {
+        let mut q = VecDeque::new();
+        depth_from_root[root] = 0;
+        q.push_back(root);
+        while let Some(cur) = q.pop_front() {
+            for &(nb, _) in &mol.adj[cur] {
+                if depth_from_root[nb] == usize::MAX {
+                    depth_from_root[nb] = depth_from_root[cur] + 1;
+                    q.push_back(nb);
+                }
+            }
+        }
+    }
 
     for b in &mol.bonds {
         if b.order != BondOrder::Single || ring_edges.contains(&b.id) {
@@ -620,6 +668,8 @@ pub fn build_rotatable_bonds(mol: &mut Molecule3D) {
             });
         }
     }
+    mol.rotatable_bonds
+        .sort_by_key(|rb| (depth_from_root[rb.u], rb.moving_atoms.len()));
 }
 
 fn is_symmetric_cap(mol: &Molecule3D, node: usize, parent: usize) -> bool {

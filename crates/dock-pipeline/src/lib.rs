@@ -11,7 +11,10 @@ pub use campaign::{
     campaign_report_to_csv, compute_enrichment_metrics, compute_mpo_score,
     load_ligand_library_bytes, run_screening_campaign,
 };
-pub use export::{InteropSceneBundle, build_chymera_export, build_molcraft_export};
+pub use export::{
+    InteropSceneBundle, SceneExportRequest, build_chymera_export, build_molcraft_export,
+    write_sandboxed_scene_package,
+};
 pub use sandbox::{
     DEFAULT_MAX_FILE_BYTES, MAX_ZIP_DECOMPRESSED_BYTES, PathSandbox, SandboxError,
     read_bounded_chemcraft_entries,
