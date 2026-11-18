@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use pocket_detect::compute_sasa_fibonacci;
 use serde::{Deserialize, Serialize};
-use struct_core::{Ad4Type, Atom3D, BondOrder, MAX_LIGAND_ATOMS, Molecule3D, norm3, perceive_all};
+use struct_core::{Atom3D, BondOrder, MAX_LIGAND_ATOMS, Molecule3D, norm3, perceive_all};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -122,6 +122,13 @@ pub struct MutationOutcome {
     pub delta_delta_g_kcal: f64,
     pub report: HydeReport,
     pub elapsed_ms: u128,
+    /// `true` when the clicked atom was replaced by the substituent, `false` when the substituent
+    /// was appended to it because the clicked atom was an internal one with spare valence.
+    pub replaced_anchor: bool,
+    /// Largest displacement of an existing ligand atom relative to the ligand's own frame, in
+    /// angstroms. A rigid-body nudge of the whole ligand leaves this at zero; a value above zero
+    /// means the relaxation actually changed the ligand's internal geometry.
+    pub internal_rmsd_shift: f64,
 }
 
 fn vec_len(v: [f64; 3]) -> f64 {
@@ -472,6 +479,72 @@ pub fn score_pose_hyde(
 }
 
 /// Real-time 3D in-pocket substituent mutator + quick rigid-body local relaxation.
+/// Removes a terminal atom and renumbers the molecule, returning the index map.
+fn remove_terminal_atom(mol: &mut Molecule3D, victim: usize) -> Vec<Option<usize>> {
+    let mut map: Vec<Option<usize>> = Vec::with_capacity(mol.atoms.len());
+    let mut kept = Vec::with_capacity(mol.atoms.len());
+    for (i, atom) in mol.atoms.iter().enumerate() {
+        if i == victim {
+            map.push(None);
+        } else {
+            map.push(Some(kept.len()));
+            let mut a = atom.clone();
+            a.id = kept.len();
+            kept.push(a);
+        }
+    }
+    let old_bonds = std::mem::take(&mut mol.bonds);
+    mol.atoms = kept;
+    mol.adj = vec![Vec::new(); mol.atoms.len()];
+    for b in old_bonds {
+        if let (Some(u), Some(v)) = (map[b.u], map[b.v]) {
+            let _ = mol.add_bond(u, v, b.order);
+        }
+    }
+    map
+}
+
+/// Rotates `movers` about the axis `origin -> origin + axis` by `theta` radians.
+fn rotate_about_axis(
+    mol: &mut Molecule3D,
+    movers: &[usize],
+    origin: [f64; 3],
+    axis: [f64; 3],
+    theta: f64,
+) {
+    let k = norm3(axis);
+    let (sin_t, cos_t) = theta.sin_cos();
+    let one_c = 1.0 - cos_t;
+    for &m in movers {
+        if m >= mol.atoms.len() {
+            continue;
+        }
+        let p = mol.atoms[m].coords;
+        let r = [p[0] - origin[0], p[1] - origin[1], p[2] - origin[2]];
+        let kxr = struct_core::cross3(k, r);
+        let kdr = k[0] * r[0] + k[1] * r[1] + k[2] * r[2];
+        mol.atoms[m].coords = [
+            origin[0] + r[0] * cos_t + kxr[0] * sin_t + k[0] * kdr * one_c,
+            origin[1] + r[1] * cos_t + kxr[1] * sin_t + k[1] * kdr * one_c,
+            origin[2] + r[2] * cos_t + kxr[2] * sin_t + k[2] * kdr * one_c,
+        ];
+    }
+}
+
+/// Replaces the clicked atom with a substituent (or appends it, when the clicked atom is an
+/// internal one with spare valence) and relaxes the new group inside the pocket.
+///
+/// Two things used to be wrong here. The function **always appended**: clicking a hydrogen and
+/// asking for `-F` left the hydrogen in place and bonded a fluorine to it, and clicking a carbon
+/// gave it a fifth bond. And its "minimisation" translated the *entire* ligand along the six
+/// coordinate axes in 0.18 A steps, which cannot change any internal coordinate, so the
+/// substituent never moved relative to the scaffold and the reported relaxation was a rigid-body
+/// shift with an internal displacement of exactly zero.
+///
+/// Now a terminal anchor (a hydrogen, a halogen, a hydroxyl oxygen) is deleted and the
+/// substituent is grown from the atom it was attached to, along the bond direction it vacated.
+/// The new group is then relaxed by scanning the torsion about its attachment bond and by rigid
+/// nudges, and `internal_rmsd_shift` reports how far the ligand's own geometry actually moved.
 pub fn mutate_and_minimize_in_pocket(
     receptor: &Molecule3D,
     ligand: &Molecule3D,
@@ -487,177 +560,233 @@ pub fn mutate_and_minimize_in_pocket(
     let before_kcal = before_report.total_delta_g_kcal;
 
     let mut mut_mol = ligand.clone();
-    let anchor_pos = mut_mol.atoms[anchor_atom_idx].coords;
 
-    // Outward unit direction away from bonded neighbors of anchor atom
-    let mut dir = [0.0_f64; 3];
-    if let Some(nbrs) = mut_mol.adj.get(anchor_atom_idx) {
-        for &(nb, _) in nbrs {
-            let p = mut_mol.atoms[nb].coords;
-            dir[0] += anchor_pos[0] - p[0];
-            dir[1] += anchor_pos[1] - p[1];
-            dir[2] += anchor_pos[2] - p[2];
+    // A terminal atom is a substituent in its own right, so the clicked atom is replaced. An
+    // internal atom keeps its place and the group is appended to its free valence.
+    let terminal_parent = (mut_mol.adj[anchor_atom_idx].len() == 1)
+        .then(|| mut_mol.adj[anchor_atom_idx][0].0)
+        .filter(|_| mut_mol.atoms.len() > 2);
+    let replaced_anchor = terminal_parent.is_some();
+
+    let (attach_to, u) = match terminal_parent {
+        Some(parent) => {
+            let pp = mut_mol.atoms[parent].coords;
+            let ap = mut_mol.atoms[anchor_atom_idx].coords;
+            let dir = norm3([ap[0] - pp[0], ap[1] - pp[1], ap[2] - pp[2]]);
+            let map = remove_terminal_atom(&mut mut_mol, anchor_atom_idx);
+            let new_parent = map
+                .get(parent)
+                .copied()
+                .flatten()
+                .ok_or(HydeError::InvalidAtomIndex(parent))?;
+            (new_parent, dir)
         }
-    }
-    let n = vec_len(dir);
-    let u: [f64; 3] = if n > 1e-6 {
-        [dir[0] / n, dir[1] / n, dir[2] / n]
-    } else {
-        [1.0, 0.0, 0.0]
+        None => {
+            let anchor_pos = mut_mol.atoms[anchor_atom_idx].coords;
+            let mut dir = [0.0_f64; 3];
+            for &(nb, _) in &mut_mol.adj[anchor_atom_idx] {
+                let p = mut_mol.atoms[nb].coords;
+                dir[0] += anchor_pos[0] - p[0];
+                dir[1] += anchor_pos[1] - p[1];
+                dir[2] += anchor_pos[2] - p[2];
+            }
+            let d = if vec_len(dir) > 1e-6 {
+                norm3(dir)
+            } else {
+                [1.0, 0.0, 0.0]
+            };
+            (anchor_atom_idx, d)
+        }
     };
 
-    // Orthogonal basis (v, w) for polyatomic substituents (CF3 / OCH3)
+    let attach_pos = mut_mol.atoms[attach_to].coords;
+    let attach_element = mut_mol.atoms[attach_to].element.clone();
+
+    // Orthogonal basis (v, w) for polyatomic substituents (CF3 / OCH3 / NH2 / OH).
     let seed_vec = if u[0].abs() < 0.8 {
         [1.0, 0.0, 0.0]
     } else {
         [0.0, 1.0, 0.0]
     };
-    let v_raw = struct_core::cross3(u, seed_vec);
-    let v = norm3(v_raw);
+    let v = norm3(struct_core::cross3(u, seed_vec));
     let w = struct_core::cross3(u, v);
 
-    let add_child = |mol: &mut Molecule3D,
-                     parent: usize,
-                     el: &str,
-                     pos: [f64; 3],
-                     order: BondOrder|
-     -> Result<usize, HydeError> {
-        let next_id = mol.atoms.len() + 1;
-        let idx = mol.add_atom(Atom3D::new(next_id, el, pos));
-        mol.add_bond(parent, idx, order)
-            .ok_or(HydeError::InvalidAtomIndex(parent))?;
-        Ok(idx)
-    };
+    let mut added: Vec<usize> = Vec::new();
 
     let p_at = |d: f64| -> [f64; 3] {
         [
-            anchor_pos[0] + u[0] * d,
-            anchor_pos[1] + u[1] * d,
-            anchor_pos[2] + u[2] * d,
+            attach_pos[0] + u[0] * d,
+            attach_pos[1] + u[1] * d,
+            attach_pos[2] + u[2] * d,
         ]
+    };
+
+    macro_rules! add_child {
+        ($mol:expr, $parent:expr, $el:expr, $pos:expr, $order:expr) => {{
+            let idx = $mol.add_atom(Atom3D::new($mol.atoms.len(), $el, $pos));
+            $mol.add_bond($parent, idx, $order)
+                .ok_or(HydeError::InvalidAtomIndex($parent))?;
+            added.push(idx);
+            idx
+        }};
+    }
+
+    // Bond lengths come from the element pair, not from a per-preset constant.
+    let first_len = |el: &str, order: BondOrder| -> f64 {
+        struct_core::ideal_bond_length(&attach_element, el, order)
     };
 
     match preset {
         SubstituentPreset::H => {
-            add_child(
-                &mut mut_mol,
-                anchor_atom_idx,
+            add_child!(
+                mut_mol,
+                attach_to,
                 "H",
-                p_at(1.09),
-                BondOrder::Single,
-            )?;
+                p_at(first_len("H", BondOrder::Single)),
+                BondOrder::Single
+            );
         }
         SubstituentPreset::F => {
-            add_child(
-                &mut mut_mol,
-                anchor_atom_idx,
+            add_child!(
+                mut_mol,
+                attach_to,
                 "F",
-                p_at(1.36),
-                BondOrder::Single,
-            )?;
+                p_at(first_len("F", BondOrder::Single)),
+                BondOrder::Single
+            );
         }
         SubstituentPreset::Cl => {
-            add_child(
-                &mut mut_mol,
-                anchor_atom_idx,
+            add_child!(
+                mut_mol,
+                attach_to,
                 "Cl",
-                p_at(1.74),
-                BondOrder::Single,
-            )?;
+                p_at(first_len("Cl", BondOrder::Single)),
+                BondOrder::Single
+            );
         }
         SubstituentPreset::OH => {
-            let o = add_child(
-                &mut mut_mol,
-                anchor_atom_idx,
+            let o = add_child!(
+                mut_mol,
+                attach_to,
                 "O",
-                p_at(1.38),
-                BondOrder::Single,
-            )?;
+                p_at(first_len("O", BondOrder::Single)),
+                BondOrder::Single
+            );
+            let op = mut_mol.atoms[o].coords;
+            let oh = struct_core::ideal_bond_length("O", "H", BondOrder::Single);
             let h_pos = [
-                mut_mol.atoms[o].coords[0] + (0.33 * u[0] + 0.90 * v[0]),
-                mut_mol.atoms[o].coords[1] + (0.33 * u[1] + 0.90 * v[1]),
-                mut_mol.atoms[o].coords[2] + (0.33 * u[2] + 0.90 * v[2]),
+                op[0] + oh * (0.33 * u[0] + 0.94 * v[0]),
+                op[1] + oh * (0.33 * u[1] + 0.94 * v[1]),
+                op[2] + oh * (0.33 * u[2] + 0.94 * v[2]),
             ];
-            add_child(&mut mut_mol, o, "H", h_pos, BondOrder::Single)?;
+            add_child!(mut_mol, o, "H", h_pos, BondOrder::Single);
         }
         SubstituentPreset::NH2 => {
-            let n_idx = add_child(
-                &mut mut_mol,
-                anchor_atom_idx,
+            let n_idx = add_child!(
+                mut_mol,
+                attach_to,
                 "N",
-                p_at(1.42),
-                BondOrder::Single,
-            )?;
-            for sign in [1.0, -1.0] {
+                p_at(first_len("N", BondOrder::Single)),
+                BondOrder::Single
+            );
+            let np = mut_mol.atoms[n_idx].coords;
+            let nh = struct_core::ideal_bond_length("N", "H", BondOrder::Single);
+            for sign in [1.0_f64, -1.0] {
                 let hp = [
-                    mut_mol.atoms[n_idx].coords[0] + 0.40 * u[0] + sign * 0.85 * v[0],
-                    mut_mol.atoms[n_idx].coords[1] + 0.40 * u[1] + sign * 0.85 * v[1],
-                    mut_mol.atoms[n_idx].coords[2] + 0.40 * u[2] + sign * 0.85 * v[2],
+                    np[0] + nh * (0.33 * u[0] + sign * 0.94 * v[0]),
+                    np[1] + nh * (0.33 * u[1] + sign * 0.94 * v[1]),
+                    np[2] + nh * (0.33 * u[2] + sign * 0.94 * v[2]),
                 ];
-                add_child(&mut mut_mol, n_idx, "H", hp, BondOrder::Single)?;
+                add_child!(mut_mol, n_idx, "H", hp, BondOrder::Single);
             }
         }
         SubstituentPreset::CH3 => {
-            add_child(
-                &mut mut_mol,
-                anchor_atom_idx,
+            add_child!(
+                mut_mol,
+                attach_to,
                 "C",
-                p_at(1.51),
-                BondOrder::Single,
-            )?;
+                p_at(first_len("C", BondOrder::Single)),
+                BondOrder::Single
+            );
         }
         SubstituentPreset::CF3 => {
-            let c_idx = add_child(
-                &mut mut_mol,
-                anchor_atom_idx,
+            let c_idx = add_child!(
+                mut_mol,
+                attach_to,
                 "C",
-                p_at(1.50),
-                BondOrder::Single,
-            )?;
+                p_at(first_len("C", BondOrder::Single)),
+                BondOrder::Single
+            );
             let cp = mut_mol.atoms[c_idx].coords;
+            let cf = struct_core::ideal_bond_length("C", "F", BondOrder::Single);
             for k in 0..3 {
                 let ang = k as f64 * (std::f64::consts::TAU / 3.0);
                 let fp = [
-                    cp[0] + 0.45 * u[0] + 1.24 * (ang.cos() * v[0] + ang.sin() * w[0]),
-                    cp[1] + 0.45 * u[1] + 1.24 * (ang.cos() * v[1] + ang.sin() * w[1]),
-                    cp[2] + 0.45 * u[2] + 1.24 * (ang.cos() * v[2] + ang.sin() * w[2]),
+                    cp[0] + cf * (0.33 * u[0] + 0.94 * (ang.cos() * v[0] + ang.sin() * w[0])),
+                    cp[1] + cf * (0.33 * u[1] + 0.94 * (ang.cos() * v[1] + ang.sin() * w[1])),
+                    cp[2] + cf * (0.33 * u[2] + 0.94 * (ang.cos() * v[2] + ang.sin() * w[2])),
                 ];
-                add_child(&mut mut_mol, c_idx, "F", fp, BondOrder::Single)?;
+                add_child!(mut_mol, c_idx, "F", fp, BondOrder::Single);
             }
         }
         SubstituentPreset::CN => {
-            let c_idx = add_child(
-                &mut mut_mol,
-                anchor_atom_idx,
-                "C",
-                p_at(1.45),
-                BondOrder::Single,
-            )?;
-            add_child(&mut mut_mol, c_idx, "N", p_at(2.61), BondOrder::Triple)?;
+            let l1 = first_len("C", BondOrder::Single);
+            let c_idx = add_child!(mut_mol, attach_to, "C", p_at(l1), BondOrder::Single);
+            let cn = struct_core::ideal_bond_length("C", "N", BondOrder::Triple);
+            add_child!(mut_mol, c_idx, "N", p_at(l1 + cn), BondOrder::Triple);
         }
         SubstituentPreset::OCH3 => {
-            let o_idx = add_child(
-                &mut mut_mol,
-                anchor_atom_idx,
+            let o_idx = add_child!(
+                mut_mol,
+                attach_to,
                 "O",
-                p_at(1.38),
-                BondOrder::Single,
-            )?;
+                p_at(first_len("O", BondOrder::Single)),
+                BondOrder::Single
+            );
             let op = mut_mol.atoms[o_idx].coords;
+            let oc = struct_core::ideal_bond_length("O", "C", BondOrder::Single);
             let me_pos = [
-                op[0] + 0.50 * u[0] + 1.32 * v[0],
-                op[1] + 0.50 * u[1] + 1.32 * v[1],
-                op[2] + 0.50 * u[2] + 1.32 * v[2],
+                op[0] + oc * (0.33 * u[0] + 0.94 * v[0]),
+                op[1] + oc * (0.33 * u[1] + 0.94 * v[1]),
+                op[2] + oc * (0.33 * u[2] + 0.94 * v[2]),
             ];
-            add_child(&mut mut_mol, o_idx, "C", me_pos, BondOrder::Single)?;
+            add_child!(mut_mol, o_idx, "C", me_pos, BondOrder::Single);
         }
     }
 
     perceive_all(&mut mut_mol);
 
-    // Fast coordinate relaxation in pocket (small rigid-body nudges along lowest-energy gradient)
+    let reference: Vec<[f64; 3]> = mut_mol.atoms.iter().map(|a| a.coords).collect();
     let mut best_mol = mut_mol.clone();
     let mut best_rep = score_pose_hyde(receptor, &best_mol)?;
+
+    // 1. Torsion scan of the new group about its attachment bond. This is the degree of freedom
+    //    the substituent actually has, and the one the old rigid-body nudge could never reach.
+    if added.len() > 1 {
+        let pivot = added[0];
+        let movers: Vec<usize> = added[1..].to_vec();
+        let origin = best_mol.atoms[pivot].coords;
+        let axis = [
+            origin[0] - attach_pos[0],
+            origin[1] - attach_pos[1],
+            origin[2] - attach_pos[2],
+        ];
+        if vec_len(axis) > 1e-6 {
+            let steps = 24usize;
+            for step in 1..steps {
+                let theta = std::f64::consts::TAU * (step as f64) / (steps as f64);
+                let mut trial = mut_mol.clone();
+                rotate_about_axis(&mut trial, &movers, origin, axis, theta);
+                let rep = score_pose_hyde(receptor, &trial)?;
+                if rep.total_delta_g_kcal < best_rep.total_delta_g_kcal - 1e-6 {
+                    best_rep = rep;
+                    best_mol = trial;
+                }
+            }
+        }
+    }
+
+    // 2. Small rigid-body nudges of the whole ligand, to let the new group settle in the pocket.
     let dirs = [
         [0.18, 0.0, 0.0],
         [-0.18, 0.0, 0.0],
@@ -687,7 +816,34 @@ pub fn mutate_and_minimize_in_pocket(
         }
     }
 
-    let _ = Ad4Type::C;
+    // Internal displacement, measured after removing the rigid-body part: how far the geometry
+    // moved in the ligand's own frame.
+    let internal_rmsd_shift = {
+        let n = best_mol.atoms.len().min(reference.len());
+        if n == 0 {
+            0.0
+        } else {
+            let mut c_ref = [0.0_f64; 3];
+            let mut c_new = [0.0_f64; 3];
+            for i in 0..n {
+                for k in 0..3 {
+                    c_ref[k] += reference[i][k] / n as f64;
+                    c_new[k] += best_mol.atoms[i].coords[k] / n as f64;
+                }
+            }
+            let mut worst = 0.0_f64;
+            for i in 0..n {
+                let d = [
+                    (best_mol.atoms[i].coords[0] - c_new[0]) - (reference[i][0] - c_ref[0]),
+                    (best_mol.atoms[i].coords[1] - c_new[1]) - (reference[i][1] - c_ref[1]),
+                    (best_mol.atoms[i].coords[2] - c_new[2]) - (reference[i][2] - c_ref[2]),
+                ];
+                worst = worst.max(vec_len(d));
+            }
+            worst
+        }
+    };
+
     let after_kcal = best_rep.total_delta_g_kcal;
     Ok(MutationOutcome {
         substituent: preset,
@@ -697,13 +853,15 @@ pub fn mutate_and_minimize_in_pocket(
         delta_delta_g_kcal: after_kcal - before_kcal,
         report: best_rep,
         elapsed_ms: start.elapsed().as_millis(),
+        replaced_anchor,
+        internal_rmsd_shift,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use struct_core::{Atom3D, BondOrder, Molecule3D, assign_ad4_types_and_flags};
+    use struct_core::{Ad4Type, Atom3D, BondOrder, Molecule3D, assign_ad4_types_and_flags};
 
     #[test]
     fn distinguishes_green_hbond_from_red_unsatisfied_buried_polar_and_clash()

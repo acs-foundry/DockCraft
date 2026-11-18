@@ -154,7 +154,7 @@ fn tool_definitions() -> Value {
                     "box_center": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
                     "box_size": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
                     "scoring": { "type": "string", "enum": ["vina", "vinardo", "hybrid"] },
-                    "exhaustiveness": { "type": "integer", "minimum": 1, "maximum": 32 },
+                    "exhaustiveness": { "type": "integer", "minimum": 1, "maximum": 128 },
                     "out_sdf_path": { "type": "string" },
                     "out_csv_path": { "type": "string" }
                 }
@@ -307,11 +307,16 @@ fn handle_tool_call(
                 Some("hybrid") => ScoringFunction::DockCraftHybrid,
                 _ => ScoringFunction::Vina,
             };
+            // The engine already raises the walker count on its own for flexible ligands, so the
+            // default stays modest. The ceiling used to be 32, which sat just below the regime
+            // where a 13-rotatable-bond ligand converges; cost grows linearly in this number and
+            // the per-request caps bound the rest, so 128 is affordable and no longer truncates
+            // a deliberate request for a deeper search.
             let exhaustiveness = args
                 .get("exhaustiveness")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(6)
-                .clamp(1, 32) as usize;
+                .clamp(1, 128) as usize;
             let cfg = DockingConfig {
                 scoring,
                 exhaustiveness,

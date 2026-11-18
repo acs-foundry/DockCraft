@@ -18,14 +18,56 @@ DockCraft unifies two complementary workflows in a single portable Cargo workspa
 
 ## Architecture (8-Crate Portable Workspace)
 
-- `crates/struct-core` — PDB, mmCIF, MOL2, SDF (V2000/V3000), PDBQT parsers/writers (bounded atom limits), Gasteiger-Marsili PEOE partial charges (`20.02` H denominator), pH 7.4 protonation (including carboxylate, amine, and amidinium/guanidinium), AutoDock4 typing + hydrophobic flags, implicit-H molecular weight, root-to-leaf rotatable bond graph, and 3D SMILES conformer builder.
+- `crates/struct-core` — PDB, mmCIF, MOL2, SDF (V2000/V3000), PDBQT parsers/writers (bounded atom limits), Gasteiger-Marsili PEOE partial charges (`20.02` H denominator), pH 7.4 protonation (carboxylate, amine, and **one delocalised charge per amidinium/guanidinium group**, so benzamidine is +1 and metformin +1), smallest-cycle ring perception from 3 to 8 members, aromaticity that does not leak across a fused bond, AutoDock4 typing + hydrophobic flags, implicit-H molecular weight, largest-rigid-fragment root with a root-to-leaf rotatable bond graph, and a 3D SMILES builder with element-aware bond lengths, VSEPR bond angles, puckered saturated rings and `@`/`@@` tetrahedral stereochemistry.
 - `crates/pocket-detect` — 1.2 Å cavity grid scanner, 14-direction ray enclosure, 42-pt Fibonacci SASA, and bounded `GridBox` extraction.
-- `crates/dock-engine` — Trilinear affinity grids, pure Vina / Vinardo / opt-in Hybrid scoring, rigid-core-anchored SO(3)+torsion L-BFGS (`m = 8`), `rayon` two-stage global search + ILS, RMSD clustering, and external engine adapter.
+- `crates/dock-engine` — Trilinear affinity grids, pure Vina / Vinardo / opt-in Hybrid scoring, rigid-core-anchored SO(3)+torsion L-BFGS (`m = 8`), `rayon` two-stage global search + ILS with a full-circle conformer bank, stall restarts and a walker/step budget that scales with the ligand's torsional degrees of freedom, RMSD clustering, and external engine adapter.
 - `crates/hyde-scorer` — Clean-room HYDE-inspired per-atom $\Delta G$ & $K_i$, H-bond/salt-bridge/$\pi-\pi$/cation-$\pi$/halogen-bond detector, and interactive substituent mutator.
 - `crates/dock-viewport` — Pure-Rust `wgpu` 24 WGSL instanced sphere/cylinder/corona/line pipelines integrated via `egui_wgpu::CallbackTrait`.
 - `crates/dock-pipeline` — `openat2(RESOLVE_BENEATH | NO_SYMLINKS)` sandbox (`PathSandbox`), bounded 32 MiB `.chemcraft` reader, standalone 8-descriptor QED/PAINS/ADMET/MPO/ROC engine, and self-contained `MolCraft` (`.pml` + `receptor.pdb` + `ligand.sdf` + `.molcraft.json`) & `Chymera` (`.cxc` + `receptor.pdb` + `ligand.sdf` + `.chymera.json`) exporters.
 - `apps/dockcraft-cli` — Headless CLI (`prepare-receptor`, `screen`, `score-pose`, `mcp`) and hardened JSON-RPC 2.0 MCP server (`stdio` and loopback-only Bearer-token `tcp`).
 - `apps/dockcraft` — Native desktop GUI workstation (`eframe` + `egui` + `wgpu`).
+
+---
+
+## Validation status (measured, not claimed)
+
+Every figure below is produced by a test in this repository. Run `cargo test --release --workspace -- --nocapture` to reproduce them.
+
+### Re-docking from a randomized conformer
+
+`crates/dock-pipeline/tests/randomized_conformer_redock.rs`. The crystal ligand is displaced 9.0 A **and every torsion is redrawn uniformly over the full circle**, which is the state a ligand arrives in from a SMILES embedding. The box follows the standard re-docking protocol (centred on the native ligand); finding the right *site* is a separate problem, covered by the pocket-detection test.
+
+| Complex | Rotatable bonds | Mean RMSD | Worst | Under 2 A | Evaluations | Wall time (grid build included) |
+|---|---|---|---|---|---|---|
+| 3PTB / benzamidine | 1 | 1.20 A | 1.93 A | 12/12 | 22.7 k | 1.06 s |
+| 1STP / biotin | 5 | 0.54 A | 0.94 A | 12/12 | 118 k | 1.86 s |
+| 1HSG / indinavir | 13 | 0.97 A | 1.38 A | 12/12 | 933 k | 5.40 s |
+| 3ERT / 4-hydroxytamoxifen | 8 | 1.48 A | 1.80 A | 12/12 | 294 k | 3.41 s |
+
+Measured over 12 seeds per complex; the test in the repository runs 3 of them to keep the suite quick. **The wall times include building the affinity grid**, which is most of the cost for a single ligand and is amortised across a library in a campaign.
+
+### Enrichment against null models
+
+`crates/dock-pipeline/tests/enrichment_null_models.rs`. Six aryl amidines against fourteen decoys, **all twenty carrying a net +1 at pH 7.4**, so no model can win on charge alone.
+
+Docking ROC AUC **0.976**, EF5% **3.33** (the attainable maximum for 6 actives in 20 compounds). Strongest null model: hydrogen-bond donor count at 0.750; TPSA 0.714; nitrogen count 0.607; formal charge exactly **0.500**; molecular weight 0.417; QED and the ADMET score 0.476.
+
+Twenty hand-picked compounds are a sanity check, not a validation: a real one needs a property-matched decoy set with measured affinities. What this rules out is the failure mode it replaced, where the actives were the only cations in the set and ranking by formal charge alone scored a perfect 1.000.
+
+### Grid accuracy
+
+`crates/dock-engine/tests/grid_accuracy.rs`. The trilinear interpolant against direct evaluation of the scoring function, at 0.375 A spacing: exact at the grid nodes (4.2e-8 kcal/mol), mean absolute error 0.033 kcal/mol at cell centres, 0.088 kcal/mol worst case within the pose-relevant band (|E| <= 2 kcal/mol), and up to 1.0 kcal/mol deep inside the repulsive wall, where it does not affect ranking.
+
+### Absolute energies
+
+`crates/dock-pipeline/tests/affinity_accuracy.rs`. **The reported kcal/mol values are scores, not predicted affinities, and `estimated_ki_nm` is derived from one of them rather than measured.** Against published affinities for the four benchmark complexes the mean absolute error is 4.25 kcal/mol for Vina (worst 10.69) and 3.60 for HYDE (worst 6.98), dominated by streptavidin-biotin, which is outside the applicability domain of every empirical scoring function. Excluding it, both are around 2-2.5 kcal/mol, which is still three orders of magnitude in Ki. Both rank the micromolar complex last. Four complexes cannot establish a correlation and none is claimed.
+
+### Known limitations
+
+- Pocket detection ranks by druggability, not by the site you want: on 3ERT the top-scoring pocket is 22 A from the estrogen site. Give the engine a `GridBox` you have chosen, or check which pocket you got.
+- Ring perception covers 3 to 8 members. Macrocycles are not perceived as rings.
+- Double-bond (`/`, `\\`) stereochemistry in SMILES is parsed and ignored; only tetrahedral `@`/`@@` is honoured.
+- HYDE is a per-atom interaction decomposition for inspection. Do not read its total as an affinity.
 
 ---
 

@@ -9,9 +9,10 @@ pub mod formats;
 pub mod types;
 
 pub use chemistry::{
-    MAX_SMILES_3D_ATOMS, assign_ad4_types_and_flags, assign_gasteiger_charges,
-    build_rotatable_bonds, cross3, embed_3d_coordinates, norm3, parse_smiles_to_3d, perceive_all,
-    prepare_receptor,
+    MAX_SMILES_3D_ATOMS, apply_torsion_angles, assign_ad4_types_and_flags,
+    assign_gasteiger_charges, build_rotatable_bonds, cross3, embed_3d_coordinates,
+    ideal_bond_length, norm3, parse_smiles_to_3d, perceive_all, prepare_receptor,
+    randomize_torsions,
 };
 pub use error::StructError;
 pub use formats::{

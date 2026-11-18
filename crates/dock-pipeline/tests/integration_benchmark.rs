@@ -65,9 +65,13 @@ fn roc_auc_by_key(items: &[(bool, f64)]) -> f64 {
 }
 
 #[test]
-fn redocks_real_rcsb_benchmarks_from_9_angstroms_under_2a_rmsd()
+fn redocks_real_rcsb_benchmarks_from_9_angstroms_with_native_torsions()
 -> Result<(), Box<dyn std::error::Error>> {
-    // Wait: let's test the 4 authentic RCSB PDB structures extracted verbatim from files.rcsb.org
+    // Rigid-body re-docking of the 4 authentic RCSB structures: the ligand is displaced by 9 A
+    // and reoriented, but keeps its crystal torsions. That exercises placement and the local
+    // optimizer, and nothing else -- a ligand built from SMILES does not arrive with the right
+    // conformer. The global-search claim belongs to `randomized_conformer_redock.rs`, which
+    // redraws every torsion first.
     let cases = [
         ("3ptb_trypsin.pdb", "3ptb_benzamidine.sdf", 9usize, 6usize),
         ("1stp_streptavidin.pdb", "1stp_biotin.sdf", 16usize, 8usize),
@@ -135,7 +139,7 @@ fn redocks_real_rcsb_benchmarks_from_9_angstroms_under_2a_rmsd()
 }
 
 #[test]
-fn real_pocket_detection_and_screening_beats_mw_null_model()
+fn detects_real_trypsin_s1_pocket_and_runs_a_campaign_end_to_end()
 -> Result<(), Box<dyn std::error::Error>> {
     let rec_raw = std::fs::read_to_string(fixture_path("3ptb_trypsin.pdb"))?;
     let mut rec = parse_pdb(&rec_raw, true)?;
@@ -295,13 +299,12 @@ fn real_pocket_detection_and_screening_beats_mw_null_model()
         mpo_spread > 0.30,
         "MPO score must show real separation (spread={mpo_spread:.3})"
     );
-    assert!(
-        mpo_auc > mw_null_auc + 0.40 && mpo_auc >= 0.85,
-        "MPO screening ({mpo_auc:.3}) must decisively beat MW null model ({mw_null_auc:.3})"
-    );
-    assert!(
-        enr.roc_auc > mw_null_auc + 0.30,
-        "Docking ROC AUC ({:.3}) must decisively beat MW null model ({mw_null_auc:.3})",
+    // Enrichment is NOT asserted here. These decoys are neutral while the actives are cationic,
+    // so ranking by formal charge alone scores a perfect AUC on this set and any margin measured
+    // against a molecular-weight null model would be meaningless. The enrichment claim lives in
+    // `enrichment_null_models.rs`, on charge-matched decoys and against thirteen null models.
+    eprintln!(
+        "  (enrichment not asserted here: see enrichment_null_models.rs; MW null = {mw_null_auc:.3}, dock = {:.3}, MPO = {mpo_auc:.3})",
         enr.roc_auc
     );
 

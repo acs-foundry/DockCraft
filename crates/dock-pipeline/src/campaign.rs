@@ -3,9 +3,7 @@
 use std::time::Instant;
 
 use dock_engine::grid::AtomChannelKey;
-use dock_engine::{
-    AffinityGridSet, DockingConfig, DockingPose, ScoringFunction, dock_ligand_with_grids,
-};
+use dock_engine::{AffinityGridSet, DockingConfig, DockingPose, dock_ligand_with_grids};
 use hyde_scorer::{HydeReport, score_pose_hyde};
 use pocket_detect::GridBox;
 use rayon::prelude::*;
@@ -417,7 +415,6 @@ pub fn run_screening_campaign(
     }
 
     let enrichment = compute_enrichment_metrics(&screened);
-    let _ = ScoringFunction::Vina;
 
     Ok(CampaignReport {
         results: screened,

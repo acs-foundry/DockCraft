@@ -592,6 +592,14 @@ impl Molecule3D {
     }
 
     /// Detect small 5/6-membered rings via shortest-path BFS per bond (fast even for large proteins).
+    /// Smallest-cycle ring perception, 3 to 8 members.
+    ///
+    /// The BFS is run once per bond and keeps the shortest path back, so each bond contributes
+    /// the smallest ring it belongs to and a fused system still yields its individual rings
+    /// rather than the perimeter. The limit used to be 6, which left seven- and eight-membered
+    /// rings -- dibenzazepines, benzodiazepines, azepines, caprolactams, cyclooctanes --
+    /// completely invisible: they were never placed as rings by the 3D builder, so the structure
+    /// closed on itself and imipramine came out with two heavy atoms 2.0 A apart.
     pub fn detect_small_rings(&mut self) {
         self.rings.clear();
         let n = self.atoms.len();
@@ -609,8 +617,8 @@ impl Molecule3D {
             visited.insert(b.u, (usize::MAX, 0));
             q.push_back(b.u);
             while let Some(cur) = q.pop_front() {
-                let d_cur = visited.get(&cur).map_or(5, |&(_, d)| d);
-                if cur == b.v || d_cur >= 5 {
+                let d_cur = visited.get(&cur).map_or(7, |&(_, d)| d);
+                if cur == b.v || d_cur >= 7 {
                     continue;
                 }
                 for &(nbr, e) in &self.adj[cur] {
@@ -624,14 +632,14 @@ impl Molecule3D {
                 }
             }
             if let Some(&(mut prev_node, dv)) = visited.get(&b.v)
-                && (2..=5).contains(&dv)
+                && (2..=7).contains(&dv)
             {
                 let mut ring = vec![b.v];
                 while prev_node != usize::MAX {
                     ring.push(prev_node);
                     prev_node = visited.get(&prev_node).map_or(usize::MAX, |&(p, _)| p);
                 }
-                if (3..=6).contains(&ring.len()) {
+                if (3..=8).contains(&ring.len()) {
                     let mut sorted = ring.clone();
                     sorted.sort_unstable();
                     if seen_sets.insert(sorted) {

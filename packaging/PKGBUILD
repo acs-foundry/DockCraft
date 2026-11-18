@@ -1,26 +1,35 @@
 # Maintainer: DockCraft Contributors
-pkgname=dockcraft
+#
+# Binary package: it installs the prebuilt binaries from
+# dist/dockcraft-$pkgver-linux-x86_64.tar.gz. The previous version of this file declared that
+# tarball as its source and then ran `cargo build --workspace --offline` on it, which cannot
+# work: the tarball holds compiled binaries, not the crate sources, and the checksum was 'SKIP'
+# so nothing was verified either. `makepkg` failed on it every time.
+#
+# To build from source instead, clone the repository and run
+#   cargo build --release --workspace
+# then packaging/install.sh, or regenerate the tarball and rerun makepkg here.
+pkgname=dockcraft-bin
+_pkgname=dockcraft
 pkgver=0.1.0
 pkgrel=1
-pkgdesc="Pure-Rust GPU-accelerated virtual screening (PyRx/Vina) and SeeSAR-style HYDE 3D SBDD workstation"
+pkgdesc="Pure-Rust virtual screening (PyRx/Vina/Vinardo) and HYDE-style 3D structure-based design workstation (prebuilt)"
 arch=('x86_64')
 license=('MIT' 'Apache-2.0')
 depends=('gcc-libs' 'vulkan-icd-loader' 'libxkbcommon' 'wayland' 'libx11')
-makedepends=('cargo')
-source=("dockcraft-$pkgver-linux-x86_64.tar.gz")
-sha256sums=('SKIP')
-
-build() {
-    cd "$srcdir/$pkgname-$pkgver"
-    cargo build --release --workspace --offline
-}
+provides=("$_pkgname=$pkgver")
+conflicts=("$_pkgname")
+# Prebuilt binaries: let makepkg leave them alone.
+options=('!strip' '!debug')
+source=("$_pkgname-$pkgver-linux-x86_64.tar.gz::file://${startdir}/../dist/$_pkgname-$pkgver-linux-x86_64.tar.gz")
+sha256sums=('d033c2f9e0501e84f6b3ab8e181df5463ee3b1f4d6a6976771a95d802edfb47c')
 
 package() {
-    cd "$srcdir/$pkgname-$pkgver"
-    install -Dm755 "target/release/dockcraft" "$pkgdir/usr/bin/dockcraft"
-    install -Dm755 "target/release/dockcraft-cli" "$pkgdir/usr/bin/dockcraft-cli"
-    install -Dm644 "packaging/dockcraft.desktop" "$pkgdir/usr/share/applications/dockcraft.desktop"
-    install -Dm644 "packaging/dockcraft.svg" "$pkgdir/usr/share/icons/hicolor/scalable/apps/dockcraft.svg"
-    install -Dm644 "LICENSE-MIT" "$pkgdir/usr/share/licenses/$pkgname/LICENSE-MIT"
-    install -Dm644 "LICENSE-APACHE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE-APACHE"
+    cd "$srcdir/$_pkgname-$pkgver-linux-x86_64"
+    install -Dm755 dockcraft "$pkgdir/usr/bin/dockcraft"
+    install -Dm755 dockcraft-cli "$pkgdir/usr/bin/dockcraft-cli"
+    install -Dm644 dockcraft.desktop "$pkgdir/usr/share/applications/dockcraft.desktop"
+    install -Dm644 dockcraft.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/dockcraft.svg"
+    install -Dm644 LICENSE-MIT "$pkgdir/usr/share/licenses/$_pkgname/LICENSE-MIT"
+    install -Dm644 LICENSE-APACHE "$pkgdir/usr/share/licenses/$_pkgname/LICENSE-APACHE"
 }

@@ -2,7 +2,10 @@ use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::f64::consts::PI;
 
 use crate::error::StructError;
-use crate::types::{Ad4Type, Atom3D, BondOrder, Molecule3D, RotatableBond};
+use crate::types::{
+    Ad4Type, Atom3D, BondOrder, Molecule3D, RotatableBond, element_covalent_radius,
+    normalize_element,
+};
 
 /// Maximum atoms permitted in a single SMILES input parsed to 3D.
 pub const MAX_SMILES_3D_ATOMS: usize = 512;
@@ -74,33 +77,60 @@ fn perceive_aromatic_residues_and_rings(mol: &mut Molecule3D) {
         }
     }
 
-    // 2. Planarity/unsaturated 5/6-membered ring aromaticity (for ligands & non-standard PDB hetatms)
+    // 2. Ring aromaticity for ligands and non-standard PDB hetatms.
+    //
+    // The test is topological wherever bond orders are available: every atom of the ring must
+    // contribute a pi electron through a double or aromatic bond **inside that same ring**, or be
+    // a lone-pair-donating heteroatom of a five-membered ring (pyrrole, furan, thiophene,
+    // imidazole). Asking only whether a ring atom has *any* unsaturated bond makes the saturated
+    // ring of a fused system inherit its partner's aromaticity through the two fusion atoms,
+    // which marked all 10 heavy atoms of tetralin, indane, indoline and
+    // tetrahydroisoquinoline aromatic instead of 6, and then suppressed the pH 7.4 protonation
+    // of the ring nitrogen because aromatic nitrogens are skipped.
+    //
+    // The geometric fallback (flat ring, short bonds, degree <= 3) is kept only for structures
+    // that carry no bond-order information at all, such as a PDB hetatm whose bonds were inferred
+    // from distances: there, geometry is the only evidence there is.
+    let bond_orders_known = mol.bonds.iter().any(|b| b.order != BondOrder::Single);
     for ring in &mol.rings {
         if !(5..=6).contains(&ring.len()) {
             continue;
         }
         let all_marked = ring.iter().all(|&v| mol.atoms[v].aromatic);
-        let has_arom_bond = ring.windows(2).any(|w| {
-            mol.adj[w[0]]
+        let ring_bond_order = |u: usize, v: usize| -> Option<BondOrder> {
+            mol.adj[u]
                 .iter()
-                .find(|&&(nb, _)| nb == w[1])
-                .is_some_and(|&(_, bid)| mol.bonds[bid].order == BondOrder::Aromatic)
-        });
-        let planar = ring_is_planar(mol, ring);
-        let has_unsat = ring.iter().any(|&v| {
-            mol.adj[v].iter().any(|&(_, bid)| {
-                matches!(
-                    mol.bonds[bid].order,
-                    BondOrder::Double | BondOrder::Aromatic
-                )
-            })
+                .find(|&&(nb, _)| nb == v)
+                .map(|&(_, bid)| mol.bonds[bid].order)
+        };
+        let n = ring.len();
+        // Every ring bond, not merely some bond: in a fused system the shared bond is aromatic
+        // because it belongs to the aromatic partner ring, and accepting that one bond was what
+        // made tetralin's saturated ring aromatic.
+        let all_ring_bonds_aromatic = (0..n)
+            .all(|w| ring_bond_order(ring[w], ring[(w + 1) % n]) == Some(BondOrder::Aromatic));
+        let every_atom_contributes_pi = (0..n).all(|w| {
+            let v = ring[w];
+            let prev = ring[(w + n - 1) % n];
+            let next = ring[(w + 1) % n];
+            let multi = |o: Option<BondOrder>| {
+                matches!(o, Some(BondOrder::Double) | Some(BondOrder::Aromatic))
+            };
+            if multi(ring_bond_order(v, prev)) || multi(ring_bond_order(v, next)) {
+                return true;
+            }
+            // Lone-pair donor completing a 5-membered aromatic sextet.
+            n == 5 && matches!(mol.atoms[v].element.as_str(), "N" | "O" | "S")
         });
         let valid_elems = ring
             .iter()
             .all(|&v| matches!(mol.atoms[v].element.as_str(), "C" | "N" | "O" | "S"));
-        if all_marked
+        let geometric_fallback =
+            !bond_orders_known && ring_is_planar(mol, ring) && deg_at_most_3(mol, ring);
+        if (all_marked && bond_orders_known && all_ring_bonds_aromatic)
+            || (all_marked && !bond_orders_known)
             || (valid_elems
-                && (has_arom_bond || (planar && (has_unsat || deg_at_most_3(mol, ring)))))
+                && (all_ring_bonds_aromatic || every_atom_contributes_pi || geometric_fallback))
         {
             for &v in ring {
                 if !mol.atoms[v].is_backbone {
@@ -178,6 +208,7 @@ fn ring_is_planar(mol: &Molecule3D, ring: &[usize]) -> bool {
 /// so H-bond donors (`HD`) have realistic 3D vectors for Vina/HYDE geometric scoring.
 fn apply_ph74_protonation_and_polar_h(mol: &mut Molecule3D) {
     let n_orig = mol.atoms.len();
+    let (amidine_group_ns, amidine_sites) = amidine_guanidine_groups(mol);
     // Pre-mark formal charges for pH 7.4 ionizable protein/ligand groups
     for i in 0..n_orig {
         let el = mol.atoms[i].element.clone();
@@ -219,6 +250,11 @@ fn apply_ph74_protonation_and_polar_h(mol: &mut Molecule3D) {
                 }
             }
         } else if el == "N" && !mol.atoms[i].aromatic && mol.atoms[i].formal_charge == 0 {
+            if amidine_group_ns.contains(&i) {
+                // Delocalised amidinium/guanidinium: exactly one charge for the whole group.
+                mol.atoms[i].formal_charge = i8::from(amidine_sites.contains(&i));
+                continue;
+            }
             let heavy_nbrs: Vec<(usize, BondOrder)> = mol.adj[i]
                 .iter()
                 .filter(|&&(nb, _)| mol.atoms[nb].is_heavy())
@@ -233,17 +269,9 @@ fn apply_ph74_protonation_and_polar_h(mol: &mut Molecule3D) {
                             && mol.bonds[bid].order == BondOrder::Double
                     })
             });
-            // Amidine / guanidine (=N attached to C bearing another N) -> protonated (+1) at pH 7.4
-            let is_amidine_imine = heavy_nbrs.len() == 1
-                && heavy_nbrs[0].1 == BondOrder::Double
-                && mol.atoms[heavy_nbrs[0].0].element == "C"
-                && mol.adj[heavy_nbrs[0].0]
-                    .iter()
-                    .any(|&(nb, _)| nb != i && mol.atoms[nb].element == "N");
-            // Aliphatic amine without carbonyl/aryl conjugation, or amidine imine -> protonated at pH 7.4 (+1)
-            if is_amidine_imine
-                || (all_single && !heavy_nbrs.is_empty() && heavy_nbrs.len() <= 3 && !near_ewg)
-            {
+            // Aliphatic amine without carbonyl/aryl conjugation -> protonated at pH 7.4 (+1).
+            // Amidines and guanidines are handled above, once per group.
+            if all_single && !heavy_nbrs.is_empty() && heavy_nbrs.len() <= 3 && !near_ewg {
                 mol.atoms[i].formal_charge = 1;
             }
         }
@@ -582,50 +610,10 @@ pub fn build_rotatable_bonds(mol: &mut Molecule3D) {
         }
     }
 
-    // Choose rigid root anchor: central atom (min graph eccentricity / max rigid connectivity)
-    let heavy_ids: Vec<usize> = (0..mol.atoms.len())
-        .filter(|&i| mol.atoms[i].is_heavy())
-        .collect();
-    let root = heavy_ids
-        .iter()
-        .copied()
-        .min_by_key(|&i| {
-            // Graph eccentricity from `i` across heavy atoms, tie-broken by (-ring_count, -deg)
-            let mut dist = vec![usize::MAX; mol.atoms.len()];
-            let mut q = VecDeque::new();
-            dist[i] = 0;
-            q.push_back(i);
-            let mut max_d = 0usize;
-            while let Some(cur) = q.pop_front() {
-                max_d = max_d.max(dist[cur]);
-                for &(nb, _) in &mol.adj[cur] {
-                    if mol.atoms[nb].is_heavy() && dist[nb] == usize::MAX {
-                        dist[nb] = dist[cur] + 1;
-                        q.push_back(nb);
-                    }
-                }
-            }
-            let r_cnt = mol.rings.iter().filter(|r| r.contains(&i)).count();
-            (max_d, usize::MAX - r_cnt, usize::MAX - mol.adj[i].len())
-        })
-        .unwrap_or(0);
-
-    // BFS topological distance from root so nested rotatable bonds apply root-to-leaf
-    let mut depth_from_root = vec![usize::MAX; mol.atoms.len()];
-    if root < mol.atoms.len() {
-        let mut q = VecDeque::new();
-        depth_from_root[root] = 0;
-        q.push_back(root);
-        while let Some(cur) = q.pop_front() {
-            for &(nb, _) in &mol.adj[cur] {
-                if depth_from_root[nb] == usize::MAX {
-                    depth_from_root[nb] = depth_from_root[cur] + 1;
-                    q.push_back(nb);
-                }
-            }
-        }
-    }
-
+    // Pass 1: collect the bonds that qualify as rotatable, independently of where the root ends
+    // up. The root can only be chosen once these are known, because it is defined relative to
+    // them.
+    let mut candidates: Vec<(usize, usize, usize)> = Vec::new(); // (bond_id, u, v)
     for b in &mol.bonds {
         if b.order != BondOrder::Single || ring_edges.contains(&b.id) {
             continue;
@@ -644,24 +632,88 @@ pub fn build_rotatable_bonds(mol: &mut Molecule3D) {
         if h_deg_u <= 1 || h_deg_v <= 1 {
             continue; // Terminal bond (CH3, OH, halogen, NH3+)
         }
-        // Exclude symmetric `-CX3` / `-NH3+` rotation caps
         if is_symmetric_cap(mol, b.u, b.v) || is_symmetric_cap(mol, b.v, b.u) {
             continue;
         }
-        // Check component split removing bond `b.id`: keep root stationary, move the other half!
-        let side_u = bfs_component_without_bond(mol, b.u, b.id);
-        if side_u.contains(&b.v) {
-            continue; // Large non-SSSR ring cycle
+        if bfs_component_without_bond(mol, b.u, b.id).contains(&b.v) {
+            continue; // Large non-SSSR ring cycle: cutting it does not split the molecule
         }
-        let side_v = bfs_component_without_bond(mol, b.v, b.id);
+        candidates.push((b.id, b.u, b.v));
+    }
+
+    // Choose the rigid root anchor the way AutoDock/Vina does: the *largest rigid fragment*, i.e.
+    // the biggest connected component left once every rotatable bond is cut. Picking the graph
+    // centre instead (the previous rule) put the root in the middle of the flexible chain of, for
+    // example, 4-phenylbutan-1-ol, which left the benzene ring on the moving side of a torsion:
+    // the bulkiest rigid part of the ligand then swung around the docking position instead of
+    // defining it. Ties are broken by ring membership, then by heavy-atom degree.
+    let cut: BTreeSet<usize> = candidates.iter().map(|&(bid, _, _)| bid).collect();
+    let mut fragment_of = vec![usize::MAX; mol.atoms.len()];
+    let mut fragment_size: Vec<usize> = Vec::new();
+    for start in 0..mol.atoms.len() {
+        if !mol.atoms[start].is_heavy() || fragment_of[start] != usize::MAX {
+            continue;
+        }
+        let fid = fragment_size.len();
+        let mut size = 0usize;
+        let mut q = VecDeque::new();
+        fragment_of[start] = fid;
+        q.push_back(start);
+        while let Some(cur) = q.pop_front() {
+            size += 1;
+            for &(nb, bid) in &mol.adj[cur] {
+                if mol.atoms[nb].is_heavy() && !cut.contains(&bid) && fragment_of[nb] == usize::MAX
+                {
+                    fragment_of[nb] = fid;
+                    q.push_back(nb);
+                }
+            }
+        }
+        fragment_size.push(size);
+    }
+
+    let heavy_ids: Vec<usize> = (0..mol.atoms.len())
+        .filter(|&i| mol.atoms[i].is_heavy())
+        .collect();
+    let root = heavy_ids
+        .iter()
+        .copied()
+        .max_by_key(|&i| {
+            let frag = fragment_of[i];
+            let size = fragment_size.get(frag).copied().unwrap_or(0);
+            let r_cnt = mol.rings.iter().filter(|r| r.contains(&i)).count();
+            (size, r_cnt, mol.adj[i].len(), usize::MAX - i)
+        })
+        .unwrap_or(0);
+
+    // BFS topological distance from root so nested rotatable bonds apply root-to-leaf.
+    let mut depth_from_root = vec![usize::MAX; mol.atoms.len()];
+    if root < mol.atoms.len() {
+        let mut q = VecDeque::new();
+        depth_from_root[root] = 0;
+        q.push_back(root);
+        while let Some(cur) = q.pop_front() {
+            for &(nb, _) in &mol.adj[cur] {
+                if depth_from_root[nb] == usize::MAX {
+                    depth_from_root[nb] = depth_from_root[cur] + 1;
+                    q.push_back(nb);
+                }
+            }
+        }
+    }
+
+    // Pass 2: for each rotatable bond, keep the root side stationary and move the other half.
+    for &(bid, bu, bv) in &candidates {
+        let side_u = bfs_component_without_bond(mol, bu, bid);
+        let side_v = bfs_component_without_bond(mol, bv, bid);
         let (anchor, tip, moving) = if side_u.contains(&root) {
-            (b.u, b.v, side_v)
+            (bu, bv, side_v)
         } else {
-            (b.v, b.u, side_u)
+            (bv, bu, side_u)
         };
         if !moving.is_empty() {
             mol.rotatable_bonds.push(RotatableBond {
-                bond_id: b.id,
+                bond_id: bid,
                 u: anchor,
                 v: tip,
                 moving_atoms: moving,
@@ -717,8 +769,15 @@ pub fn parse_smiles_to_3d(input: &str, name: Option<&str>) -> Result<Molecule3D,
     let mut stack: Vec<usize> = Vec::new();
     let mut current: Option<usize> = None;
     let mut pending_bond: Option<BondOrder> = None;
-    let mut rings: HashMap<u16, (usize, Option<BondOrder>, usize)> = HashMap::new();
+    // Ring-bond bookkeeping carries the slot reserved in the opening atom's neighbour list, so a
+    // ring bond counts at the position where its digit was written rather than where it closes.
+    let mut rings: HashMap<u16, (usize, Option<BondOrder>, usize, usize)> = HashMap::new();
     let mut bracket_hs: Vec<(usize, u8)> = Vec::new();
+    // Tetrahedral chirality from the SMILES, and the neighbour order it refers to.
+    const PENDING_RING: usize = usize::MAX;
+    const PENDING_H: usize = usize::MAX - 1;
+    let mut chiral: Vec<(usize, i8)> = Vec::new();
+    let mut nbr_order: HashMap<usize, Vec<usize>> = HashMap::new();
     let mut i = 0usize;
 
     while i < bytes.len() {
@@ -783,7 +842,7 @@ pub fn parse_smiles_to_3d(input: &str, name: Option<&str>) -> Result<Molecule3D,
                     pos: i,
                     msg: "ring closure without atom".to_string(),
                 })?;
-                if let Some((other, bo1, _)) = rings.remove(&rnum) {
+                if let Some((other, bo1, _, slot)) = rings.remove(&rnum) {
                     let bo = bo1.or(pending_bond).unwrap_or_else(|| {
                         if mol.atoms[other].aromatic && mol.atoms[cur].aromatic {
                             BondOrder::Aromatic
@@ -792,14 +851,24 @@ pub fn parse_smiles_to_3d(input: &str, name: Option<&str>) -> Result<Molecule3D,
                         }
                     });
                     let _ = mol.add_bond(other, cur, bo);
+                    if let Some(list) = nbr_order.get_mut(&other)
+                        && let Some(entry) = list.get_mut(slot)
+                    {
+                        *entry = cur;
+                    }
+                    nbr_order.entry(cur).or_default().push(other);
                 } else {
-                    rings.insert(rnum, (cur, pending_bond, i));
+                    let list = nbr_order.entry(cur).or_default();
+                    let slot = list.len();
+                    list.push(PENDING_RING);
+                    rings.insert(rnum, (cur, pending_bond, i, slot));
                 }
                 pending_bond = None;
                 i = next_i;
             }
             b'[' => {
-                let (atom, exp_h, next_i) = parse_smiles_bracket(bytes, i, mol.atoms.len())?;
+                let (atom, exp_h, chirality, next_i) =
+                    parse_smiles_bracket(bytes, i, mol.atoms.len())?;
                 if mol.atoms.len() >= MAX_SMILES_3D_ATOMS {
                     return Err(StructError::TooManyAtoms {
                         count: mol.atoms.len() + 1,
@@ -819,6 +888,16 @@ pub fn parse_smiles_to_3d(input: &str, name: Option<&str>) -> Result<Molecule3D,
                         }
                     });
                     let _ = mol.add_bond(prev, nid, bo);
+                    nbr_order.entry(prev).or_default().push(nid);
+                    nbr_order.entry(nid).or_default().push(prev);
+                }
+                // An implicit hydrogen written inside the brackets occupies the neighbour slot
+                // immediately after the preceding atom (or the first slot when there is none).
+                if exp_h == 1 {
+                    nbr_order.entry(nid).or_default().push(PENDING_H);
+                }
+                if chirality != 0 {
+                    chiral.push((nid, chirality));
                 }
                 current = Some(nid);
                 pending_bond = None;
@@ -842,6 +921,8 @@ pub fn parse_smiles_to_3d(input: &str, name: Option<&str>) -> Result<Molecule3D,
                         }
                     });
                     let _ = mol.add_bond(prev, nid, bo);
+                    nbr_order.entry(prev).or_default().push(nid);
+                    nbr_order.entry(nid).or_default().push(prev);
                 }
                 current = Some(nid);
                 pending_bond = None;
@@ -856,7 +937,7 @@ pub fn parse_smiles_to_3d(input: &str, name: Option<&str>) -> Result<Molecule3D,
             msg: "unclosed '('".to_string(),
         });
     }
-    if let Some((_, (_, _, pos))) = rings.into_iter().next() {
+    if let Some((_, (_, _, pos, _))) = rings.into_iter().next() {
         return Err(StructError::InvalidSmiles {
             pos,
             msg: "unclosed ring closure".to_string(),
@@ -868,6 +949,14 @@ pub fn parse_smiles_to_3d(input: &str, name: Option<&str>) -> Result<Molecule3D,
 
     embed_3d_coordinates(&mut mol);
     for (parent, cnt) in bracket_hs {
+        let first_h_id = mol.atoms.len();
+        if let Some(list) = nbr_order.get_mut(&parent) {
+            for slot in list.iter_mut() {
+                if *slot == PENDING_H {
+                    *slot = first_h_id;
+                }
+            }
+        }
         let dirs = ideal_h_directions(&mol, parent, usize::from(cnt));
         let ppos = mol.atoms[parent].coords;
         for d in dirs {
@@ -885,8 +974,113 @@ pub fn parse_smiles_to_3d(input: &str, name: Option<&str>) -> Result<Molecule3D,
             let _ = mol.add_bond(parent, hid, BondOrder::Single);
         }
     }
+    enforce_tetrahedral_chirality(&mut mol, &chiral, &nbr_order);
     perceive_all(&mut mol);
     Ok(mol)
+}
+
+/// Signed volume of the tetrahedron `(a, b, c, d)`.
+///
+/// OpenSMILES defines `@` as: viewed from the first neighbour towards the centre, the remaining
+/// three appear anticlockwise. Working that out for an ideal tetrahedron gives a negative signed
+/// volume for `@` and a positive one for `@@`.
+fn signed_volume(a: [f64; 3], b: [f64; 3], c: [f64; 3], d: [f64; 3]) -> f64 {
+    let u = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+    let v = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+    let w = [d[0] - a[0], d[1] - a[1], d[2] - a[2]];
+    let cross = cross3(v, w);
+    u[0] * cross[0] + u[1] * cross[1] + u[2] * cross[2]
+}
+
+/// Every atom reachable from `start` without passing through `blocked`.
+fn branch_from(mol: &Molecule3D, start: usize, blocked: usize) -> Vec<usize> {
+    let mut seen = vec![false; mol.atoms.len()];
+    seen[blocked] = true;
+    seen[start] = true;
+    let mut out = vec![start];
+    let mut q = VecDeque::from(vec![start]);
+    while let Some(cur) = q.pop_front() {
+        for &(nb, _) in &mol.adj[cur] {
+            if !seen[nb] {
+                seen[nb] = true;
+                out.push(nb);
+                q.push_back(nb);
+            }
+        }
+    }
+    out
+}
+
+/// Imposes the tetrahedral chirality written in the SMILES on the embedded 3D structure.
+///
+/// Without this the builder produced *identical* coordinates for `C[C@@H](N)C(=O)O` and
+/// `C[C@H](N)C(=O)O`: the `@`/`@@` token was parsed and discarded, so one of the two enantiomers
+/// was silently docked in place of the other, and nothing downstream could tell.
+///
+/// When the embedded centre has the wrong handedness, two of its four branches are exchanged by a
+/// 180 degree rotation about the bisector of their bond directions. That operation is rigid about
+/// the stereocentre, so every bond length and every internal geometry inside the two branches is
+/// preserved exactly; only the two attachment directions swap. The pair chosen is the one with
+/// disjoint branches (so a ring is never torn) and the fewest atoms to move.
+fn enforce_tetrahedral_chirality(
+    mol: &mut Molecule3D,
+    chiral: &[(usize, i8)],
+    nbr_order: &HashMap<usize, Vec<usize>>,
+) {
+    for &(centre, tag) in chiral {
+        let Some(nbrs) = nbr_order.get(&centre) else {
+            continue;
+        };
+        if nbrs.len() != 4 || nbrs.iter().any(|&x| x >= mol.atoms.len()) {
+            continue;
+        }
+        let pts: Vec<[f64; 3]> = nbrs.iter().map(|&n| mol.atoms[n].coords).collect();
+        let vol = signed_volume(pts[0], pts[1], pts[2], pts[3]);
+        if vol.abs() < 1e-9 {
+            continue;
+        }
+        let wanted_positive = tag > 0;
+        if (vol > 0.0) == wanted_positive {
+            continue;
+        }
+
+        let branches: Vec<Vec<usize>> = nbrs.iter().map(|&n| branch_from(mol, n, centre)).collect();
+        let mut best: Option<(usize, usize, usize)> = None; // (cost, i, j)
+        for i in 0..4 {
+            for j in (i + 1)..4 {
+                if branches[i].iter().any(|a| branches[j].contains(a)) {
+                    continue; // same ring: exchanging these would tear it
+                }
+                let cost = branches[i].len() + branches[j].len();
+                if best.is_none_or(|(c, _, _)| cost < c) {
+                    best = Some((cost, i, j));
+                }
+            }
+        }
+        let Some((_, i, j)) = best else {
+            continue;
+        };
+
+        let c = mol.atoms[centre].coords;
+        let u = norm3([pts[i][0] - c[0], pts[i][1] - c[1], pts[i][2] - c[2]]);
+        let v = norm3([pts[j][0] - c[0], pts[j][1] - c[1], pts[j][2] - c[2]]);
+        let sum = [u[0] + v[0], u[1] + v[1], u[2] + v[2]];
+        if sum[0] * sum[0] + sum[1] * sum[1] + sum[2] * sum[2] < 1e-12 {
+            continue; // collinear and opposite: not a tetrahedral centre
+        }
+        let axis = norm3(sum);
+        // Rotation by pi about a unit axis: x -> 2 (axis . x) axis - x.
+        for &atom_id in branches[i].iter().chain(branches[j].iter()) {
+            let q = mol.atoms[atom_id].coords;
+            let r = [q[0] - c[0], q[1] - c[1], q[2] - c[2]];
+            let dot = axis[0] * r[0] + axis[1] * r[1] + axis[2] * r[2];
+            mol.atoms[atom_id].coords = [
+                c[0] + 2.0 * dot * axis[0] - r[0],
+                c[1] + 2.0 * dot * axis[1] - r[1],
+                c[2] + 2.0 * dot * axis[2] - r[2],
+            ];
+        }
+    }
 }
 
 fn parse_smiles_organic(
@@ -929,11 +1123,14 @@ fn parse_smiles_organic(
     Ok((atom, pos + len))
 }
 
+/// Parses a bracket atom. The third element of the returned tuple is the tetrahedral chirality
+/// tag: `-1` for `@` (the remaining neighbours appear anticlockwise when viewed from the first
+/// one), `+1` for `@@`, and `0` when none was written.
 fn parse_smiles_bracket(
     bytes: &[u8],
     start: usize,
     id: usize,
-) -> Result<(Atom3D, u8, usize), StructError> {
+) -> Result<(Atom3D, u8, i8, usize), StructError> {
     let mut i = start + 1;
     while i < bytes.len() && bytes[i].is_ascii_digit() {
         i += 1;
@@ -958,8 +1155,17 @@ fn parse_smiles_bracket(
     };
     let mut chg: i8 = 0;
     let mut exp_h: u8 = 0;
+    let mut chirality: i8 = 0;
     while i < bytes.len() && bytes[i] != b']' {
         match bytes[i] {
+            b'@' => {
+                if bytes.get(i + 1) == Some(&b'@') {
+                    chirality = 1;
+                    i += 1;
+                } else {
+                    chirality = -1;
+                }
+            }
             b'H' => {
                 if let Some(&d) = bytes.get(i + 1)
                     && d.is_ascii_digit()
@@ -989,7 +1195,7 @@ fn parse_smiles_bracket(
     let mut atom = Atom3D::new(id, &sym, [0.0; 3]);
     atom.aromatic = arom;
     atom.formal_charge = chg;
-    Ok((atom, exp_h, i + 1))
+    Ok((atom, exp_h, chirality, i + 1))
 }
 
 /// Generate clean 3D Cartesian coordinates (rings + tetrahedral/trigonal BFS + UFF-lite relaxation).
@@ -1003,7 +1209,15 @@ pub fn embed_3d_coordinates(mol: &mut Molecule3D) {
         let mut sorted_ri: Vec<usize> = (0..mol.rings.len()).collect();
         sorted_ri.sort_by_key(|&ri| std::cmp::Reverse(mol.rings[ri].len()));
         if let Some(&first_ri) = sorted_ri.first() {
-            place_3d_ring(&mol.rings[first_ri], [0.0, 0.0, 0.0], 0.0, &mut coords);
+            let first_ring = &mol.rings[first_ri];
+            place_3d_ring(
+                first_ring,
+                [0.0, 0.0, 0.0],
+                0.0,
+                ring_bond_length(mol, first_ring),
+                ring_pucker(mol, first_ring),
+                &mut coords,
+            );
             placed_rings[first_ri] = true;
             loop {
                 let mut prog = false;
@@ -1066,16 +1280,23 @@ pub fn embed_3d_coordinates(mol: &mut Molecule3D) {
                                 coords[v] = Some([
                                     center[0] + rad * ang.cos(),
                                     center[1] + rad * ang.sin(),
-                                    if !mol.atoms[v].aromatic && ring.len() == 6 && idx % 2 == 1 {
-                                        0.25
+                                    if idx.is_multiple_of(2) {
+                                        ring_pucker(mol, ring)
                                     } else {
-                                        0.0
+                                        -ring_pucker(mol, ring)
                                     },
                                 ]);
                             }
                         }
                     } else {
-                        place_3d_ring(ring, [3.8, 0.5, 0.2], 0.3, &mut coords);
+                        place_3d_ring(
+                            ring,
+                            [3.8, 0.5, 0.2],
+                            0.3,
+                            ring_bond_length(mol, ring),
+                            ring_pucker(mol, ring),
+                            &mut coords,
+                        );
                     }
                     placed_rings[ri] = true;
                     prog = true;
@@ -1099,70 +1320,25 @@ pub fn embed_3d_coordinates(mol: &mut Molecule3D) {
     }
     while let Some(u) = q.pop_front() {
         let pu = coords[u].unwrap_or([0.0; 3]);
-        let mut sum = [0.0; 3];
-        let mut p_cnt = 0usize;
+        let mut known: Vec<[f64; 3]> = Vec::with_capacity(4);
         let mut unplaced = Vec::new();
         for &(v, bid) in &mol.adj[u] {
             if let Some(pv) = coords[v] {
-                let d = norm3([pv[0] - pu[0], pv[1] - pu[1], pv[2] - pu[2]]);
-                sum[0] += d[0];
-                sum[1] += d[1];
-                sum[2] += d[2];
-                p_cnt += 1;
+                known.push(norm3([pv[0] - pu[0], pv[1] - pu[1], pv[2] - pu[2]]));
             } else {
                 unplaced.push((v, bid));
             }
         }
-        let dir = if p_cnt == 0 {
-            [1.0, 0.0, 0.0]
-        } else {
-            let n_dir = norm3([-sum[0], -sum[1], -sum[2]]);
-            if n_dir[0].hypot(n_dir[1]).hypot(n_dir[2]) < 1e-4 {
-                [0.0, 1.0, 0.4]
-            } else {
-                n_dir
-            }
-        };
-        let arb = if dir[2].abs() < 0.8 {
-            [0.0, 0.0, 1.0]
-        } else {
-            [0.0, 1.0, 0.0]
-        };
-        let t1 = norm3(cross3(dir, arb));
-        let t2 = cross3(dir, t1);
-        let k = unplaced.len();
-        for (idx, (v, bid)) in unplaced.into_iter().enumerate() {
-            let bl = match mol.bonds[bid].order {
-                BondOrder::Double => 1.33,
-                BondOrder::Triple => 1.20,
-                BondOrder::Aromatic => 1.39,
-                BondOrder::Single => {
-                    if mol.atoms[u].element == "S" || mol.atoms[v].element == "S" {
-                        1.78
-                    } else if matches!(mol.atoms[u].element.as_str(), "Cl" | "Br" | "I")
-                        || matches!(mol.atoms[v].element.as_str(), "Cl" | "Br" | "I")
-                    {
-                        1.76
-                    } else {
-                        1.50
-                    }
-                }
-            };
-            let spread: f64 = if mol.atoms[u].aromatic { 0.0 } else { 0.48 };
-            let phi = 2.0 * PI * (idx as f64) / (k.max(1) as f64) + (u as f64) * 0.7;
-            let v_dir = if k == 1 {
-                norm3([
-                    dir[0] + t1[0] * 0.35,
-                    dir[1] + t1[1] * 0.35,
-                    dir[2] + t2[2] * 0.25,
-                ])
-            } else {
-                norm3([
-                    dir[0] * 0.75 + (t1[0] * phi.cos() + t2[0] * phi.sin()) * spread.max(0.66),
-                    dir[1] * 0.75 + (t1[1] * phi.cos() + t2[1] * phi.sin()) * spread.max(0.66),
-                    dir[2] * 0.75 + (t1[2] * phi.cos() + t2[2] * phi.sin()) * spread.max(0.66),
-                ])
-            };
+        let theta = ideal_bond_angle(mol, u);
+        let phase = (u as f64) * 0.9;
+        for (v, bid) in unplaced {
+            let bl = ideal_bond_length(
+                &mol.atoms[u].element,
+                &mol.atoms[v].element,
+                mol.bonds[bid].order,
+            );
+            let v_dir = next_bond_direction(&known, theta, phase);
+            known.push(v_dir);
             coords[v] = Some([
                 pu[0] + bl * v_dir[0],
                 pu[1] + bl * v_dir[1],
@@ -1172,17 +1348,59 @@ pub fn embed_3d_coordinates(mol: &mut Molecule3D) {
         }
     }
 
-    // 40-step 3D bond-length + non-bonded clash relaxation
+    // 1-3 restraints: an angle at atom j expressed as the distance its two neighbours should keep,
+    // by the law of cosines. Without an angle term the relaxation has nothing to stop a strained
+    // fused system from collapsing -- imipramine's seven-membered ring closed to a 2.09 A contact
+    // between two heavy atoms -- and nothing to hold an sp2 centre at 120 degrees.
+    let mut angle_pairs: Vec<(usize, usize, f64)> = Vec::new();
+    let mut one_three: BTreeSet<(usize, usize)> = BTreeSet::new();
+    for j in 0..n {
+        let theta = ideal_bond_angle(mol, j);
+        let nbrs: Vec<(usize, usize)> = mol.adj[j].iter().map(|&(v, bid)| (v, bid)).collect();
+        for a in 0..nbrs.len() {
+            for b in (a + 1)..nbrs.len() {
+                let (i, bid_i) = nbrs[a];
+                let (k, bid_k) = nbrs[b];
+                // Inside a small ring the internal angle is fixed by the ring, not by
+                // hybridisation, so leave those to the ring geometry and the bond terms.
+                if mol
+                    .rings
+                    .iter()
+                    .any(|r| r.contains(&i) && r.contains(&j) && r.contains(&k) && r.len() <= 6)
+                {
+                    continue;
+                }
+                let li = ideal_bond_length(
+                    &mol.atoms[i].element,
+                    &mol.atoms[j].element,
+                    mol.bonds[bid_i].order,
+                );
+                let lk = ideal_bond_length(
+                    &mol.atoms[k].element,
+                    &mol.atoms[j].element,
+                    mol.bonds[bid_k].order,
+                );
+                let target = (li * li + lk * lk - 2.0 * li * lk * theta.cos())
+                    .max(0.25)
+                    .sqrt();
+                angle_pairs.push((i, k, target));
+                one_three.insert((i.min(k), i.max(k)));
+            }
+        }
+    }
+
+    // 3D bond-length + angle + non-bonded clash relaxation, in two blocks: the saturated rings get
+    // their pucker re-imposed between them, because the first block flattens the ones fused to an
+    // aromatic partner.
     let mut pos: Vec<[f64; 3]> = coords.into_iter().map(|c| c.unwrap_or([0.0; 3])).collect();
-    for _ in 0..40 {
+    for step in 0..56 {
+        if step == 36 {
+            pucker_saturated_rings(mol, &mut pos);
+        }
         let mut disp = vec![[0.0; 3]; n];
         for b in &mol.bonds {
-            let target = match b.order {
-                BondOrder::Double => 1.34,
-                BondOrder::Triple => 1.20,
-                BondOrder::Aromatic => 1.39,
-                BondOrder::Single => 1.50,
-            };
+            let target =
+                ideal_bond_length(&mol.atoms[b.u].element, &mol.atoms[b.v].element, b.order);
             let d = [
                 pos[b.v][0] - pos[b.u][0],
                 pos[b.v][1] - pos[b.u][1],
@@ -1195,10 +1413,26 @@ pub fn embed_3d_coordinates(mol: &mut Molecule3D) {
                 disp[b.v][c] -= d[c] * k;
             }
         }
+        for &(i, k, target) in &angle_pairs {
+            let d = [
+                pos[k][0] - pos[i][0],
+                pos[k][1] - pos[i][1],
+                pos[k][2] - pos[i][2],
+            ];
+            let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt().max(1e-4);
+            let f = (len - target) / len * 0.18;
+            for c in 0..3 {
+                disp[i][c] += d[c] * f;
+                disp[k][c] -= d[c] * f;
+            }
+        }
         for i in 0..n {
             for j in (i + 1)..n {
                 if mol.adj[i].iter().any(|&(nb, _)| nb == j) {
                     continue;
+                }
+                if one_three.contains(&(i, j)) {
+                    continue; // governed by its angle restraint above
                 }
                 let d = [
                     pos[j][0] - pos[i][0],
@@ -1228,16 +1462,63 @@ pub fn embed_3d_coordinates(mol: &mut Molecule3D) {
     }
 }
 
-fn place_3d_ring(ring: &[usize], center: [f64; 3], rot: f64, coords: &mut [Option<[f64; 3]>]) {
-    let k = ring.len() as f64;
-    let rad = 1.40 / (2.0 * (PI / k).sin());
+/// Places a ring around `center`.
+///
+/// `bond_len` is the ring's own mean bond length, so a cyclohexane comes out at 1.52 A per bond
+/// rather than at the benzene value. `pucker` is the out-of-plane amplitude: zero for an aromatic
+/// or unsaturated ring, which really is flat, and non-zero for a saturated one, which is not. A
+/// perfectly planar cyclohexane is eclipsed in every bond and about 6 kcal/mol above the chair,
+/// and it also made the ring look flat to any downstream planarity test.
+fn place_3d_ring(
+    ring: &[usize],
+    center: [f64; 3],
+    rot: f64,
+    bond_len: f64,
+    pucker: f64,
+    coords: &mut [Option<[f64; 3]>],
+) {
+    let n = ring.len();
+    let k = n as f64;
+    // For an even ring the alternating +-pucker turns the planar chord into the hypotenuse of a
+    // right triangle, so the in-plane radius shrinks to keep the bond length right.
+    let planar_chord = if pucker > 0.0 && n.is_multiple_of(2) {
+        (bond_len * bond_len - 4.0 * pucker * pucker)
+            .max(0.04)
+            .sqrt()
+    } else {
+        bond_len
+    };
+    let rad = planar_chord / (2.0 * (PI / k).sin());
     for (i, &v) in ring.iter().enumerate() {
         let ang = rot + 2.0 * PI * (i as f64) / k;
+        let z = if pucker <= 0.0 {
+            0.0
+        } else if n.is_multiple_of(2) {
+            // Chair: alternating above and below the mean plane.
+            if i.is_multiple_of(2) { pucker } else { -pucker }
+        } else if i == 0 {
+            // Envelope: a single flap atom out of the plane of the other four.
+            pucker * 1.6
+        } else {
+            0.0
+        };
         coords[v] = Some([
             center[0] + rad * ang.cos(),
             center[1] + rad * ang.sin(),
-            center[2],
+            center[2] + z,
         ]);
+    }
+}
+
+/// Out-of-plane amplitude for a ring: 0 when it is flat by chemistry, otherwise the standard
+/// chair / envelope displacement.
+fn ring_pucker(mol: &Molecule3D, ring: &[usize]) -> f64 {
+    if !ring_is_saturated(mol, ring) || ring.len() < 5 {
+        0.0
+    } else if ring.len().is_multiple_of(2) {
+        0.25
+    } else {
+        0.28
     }
 }
 
@@ -1272,4 +1553,441 @@ pub fn cross3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
         a[2] * b[0] - a[0] * b[2],
         a[0] * b[1] - a[1] * b[0],
     ]
+}
+
+/// Locates amidine / guanidine / biguanide groups and decides where their single pH 7.4 charge
+/// sits.
+///
+/// Returns `(group_nitrogens, protonation_sites)`. An amidinium or guanidinium is a *delocalised*
+/// cation: the whole group carries one positive charge, shared across its nitrogens. Charging each
+/// nitrogen separately gives benzamidine +2, guanidine +3 and metformin +5, which then propagates
+/// into molecular weight, cLogP, hydrogen-bond counts, Gasteiger charges and every downstream
+/// score. Centres that share a nitrogen (as the two amidine carbons of a biguanide do) are merged
+/// into one group so metformin ends up +1, not +2.
+fn amidine_guanidine_groups(mol: &Molecule3D) -> (BTreeSet<usize>, BTreeSet<usize>) {
+    let mut group_ns = BTreeSet::new();
+    let mut sites = BTreeSet::new();
+
+    // 1. Amidine-like centres: a non-aromatic carbon bearing >= 2 nitrogens, at least one of them
+    //    doubly bonded, and no doubly bonded O/S (which would make it an amide, urea or
+    //    carbamate, none of them basic at pH 7.4).
+    let mut centres: Vec<(usize, Vec<usize>, Vec<usize>)> = Vec::new(); // (c, all N, double-bonded N)
+    for c in 0..mol.atoms.len() {
+        if mol.atoms[c].element != "C" || mol.atoms[c].aromatic || !mol.atoms[c].is_hetatm {
+            continue;
+        }
+        let mut ns = Vec::new();
+        let mut double_ns = Vec::new();
+        let mut has_double_chalcogen = false;
+        for &(nb, bid) in &mol.adj[c] {
+            let order = mol.bonds[bid].order;
+            match mol.atoms[nb].element.as_str() {
+                "N" if !mol.atoms[nb].aromatic => {
+                    ns.push(nb);
+                    if order == BondOrder::Double {
+                        double_ns.push(nb);
+                    }
+                }
+                "O" | "S" if order == BondOrder::Double => has_double_chalcogen = true,
+                _ => {}
+            }
+        }
+        if ns.len() >= 2 && !double_ns.is_empty() && !has_double_chalcogen {
+            centres.push((c, ns, double_ns));
+        }
+    }
+    if centres.is_empty() {
+        return (group_ns, sites);
+    }
+
+    // 2. Merge centres that share a nitrogen (biguanides) into connected groups.
+    let n_centres = centres.len();
+    let mut parent: Vec<usize> = (0..n_centres).collect();
+    fn find(parent: &mut [usize], x: usize) -> usize {
+        let mut r = x;
+        while parent[r] != r {
+            r = parent[r];
+        }
+        let mut cur = x;
+        while parent[cur] != r {
+            let next = parent[cur];
+            parent[cur] = r;
+            cur = next;
+        }
+        r
+    }
+    for a in 0..n_centres {
+        for b in (a + 1)..n_centres {
+            if centres[a].1.iter().any(|n| centres[b].1.contains(n)) {
+                let (ra, rb) = (find(&mut parent, a), find(&mut parent, b));
+                if ra != rb {
+                    parent[ra] = rb;
+                }
+            }
+        }
+    }
+
+    // 3. One charge per group, placed on the lowest-indexed doubly bonded nitrogen.
+    let mut by_root: HashMap<usize, (BTreeSet<usize>, BTreeSet<usize>)> = HashMap::new();
+    for (i, centre) in centres.iter().enumerate() {
+        let root = find(&mut parent, i);
+        let entry = by_root.entry(root).or_default();
+        entry.0.extend(centre.1.iter().copied());
+        entry.1.extend(centre.2.iter().copied());
+    }
+    for (all_n, double_n) in by_root.into_values() {
+        if let Some(&site) = double_n.iter().next().or_else(|| all_n.iter().next()) {
+            sites.insert(site);
+        }
+        group_ns.extend(all_n);
+    }
+    (group_ns, sites)
+}
+
+/// Ideal bond angle at an atom, from its bonding: 180 degrees with a triple bond or two double
+/// bonds, 120 degrees when it is aromatic or carries one double bond, 109.47 degrees otherwise.
+fn ideal_bond_angle(mol: &Molecule3D, u: usize) -> f64 {
+    let mut doubles = 0usize;
+    let mut has_triple = false;
+    for &(_, bid) in &mol.adj[u] {
+        match mol.bonds[bid].order {
+            BondOrder::Double => doubles += 1,
+            BondOrder::Triple => has_triple = true,
+            _ => {}
+        }
+    }
+    if has_triple || doubles >= 2 {
+        PI
+    } else if doubles == 1 || mol.atoms[u].aromatic {
+        2.0 * PI / 3.0
+    } else {
+        1.910_633_236_249_019 // acos(-1/3)
+    }
+}
+
+/// A unit vector perpendicular to `e`, chosen deterministically and rotated by `phase` about `e`
+/// so that successive centres along a chain do not all land in the same plane.
+fn perpendicular_to(e: [f64; 3], phase: f64) -> [f64; 3] {
+    let arb = if e[2].abs() < 0.8 {
+        [0.0, 0.0, 1.0]
+    } else {
+        [0.0, 1.0, 0.0]
+    };
+    let t1 = norm3(cross3(e, arb));
+    let t2 = cross3(e, t1);
+    norm3([
+        t1[0] * phase.cos() + t2[0] * phase.sin(),
+        t1[1] * phase.cos() + t2[1] * phase.sin(),
+        t1[2] * phase.cos() + t2[2] * phase.sin(),
+    ])
+}
+
+/// The next bond direction at a centre that already points along `known`, such that it makes the
+/// ideal angle `theta` with the existing bonds.
+///
+/// The builder used to spread every unplaced neighbour inside a fixed 41 degree cone around the
+/// average opposite direction, whatever the geometry. That left sp3 carbons close to planar: the
+/// signed volume of the four neighbours of alanine's alpha carbon came out at 0.025 A^3 where an
+/// ideal tetrahedron gives 10.4, so the centre had almost no handedness to speak of and bond
+/// angles were far from 109.5 degrees.
+fn next_bond_direction(known: &[[f64; 3]], theta: f64, phase: f64) -> [f64; 3] {
+    match known.len() {
+        0 => [1.0, 0.0, 0.0],
+        1 => {
+            let e = known[0];
+            let t = perpendicular_to(e, phase);
+            let (s, c) = theta.sin_cos();
+            norm3([
+                e[0] * c + t[0] * s,
+                e[1] * c + t[1] * s,
+                e[2] * c + t[2] * s,
+            ])
+        }
+        2 => {
+            let (e0, e1) = (known[0], known[1]);
+            let sum = [e0[0] + e1[0], e0[1] + e1[1], e0[2] + e1[2]];
+            let mag2 = sum[0] * sum[0] + sum[1] * sum[1] + sum[2] * sum[2];
+            if mag2 < 1e-12 {
+                // The two existing bonds are collinear and opposite: any perpendicular will do.
+                return perpendicular_to(e0, phase);
+            }
+            let bis = norm3([-sum[0], -sum[1], -sum[2]]);
+            let perp = norm3(cross3(e0, e1));
+            let c0 = bis[0] * e0[0] + bis[1] * e0[1] + bis[2] * e0[2];
+            if c0.abs() < 1e-9 {
+                return bis;
+            }
+            let cb = (theta.cos() / c0).clamp(-1.0, 1.0);
+            let sb = (1.0 - cb * cb).max(0.0).sqrt();
+            norm3([
+                bis[0] * cb + perp[0] * sb,
+                bis[1] * cb + perp[1] * sb,
+                bis[2] * cb + perp[2] * sb,
+            ])
+        }
+        _ => {
+            let mut sum = [0.0_f64; 3];
+            for e in known {
+                for k in 0..3 {
+                    sum[k] += e[k];
+                }
+            }
+            norm3([-sum[0], -sum[1], -sum[2]])
+        }
+    }
+}
+
+/// Whether a ring has an sp3 portion that should pucker out of plane.
+///
+/// Looser than [`ring_is_saturated`], which a fused ring can never satisfy: the two atoms a
+/// tetralin shares with its benzene are aromatic and the bond between them is an aromatic bond,
+/// so the saturated half would be treated as flat. What matters for geometry is whether the ring
+/// atoms that are *not* part of an aromatic system are sp3, and whether there are enough of them
+/// to pucker.
+fn ring_has_sp3_portion(mol: &Molecule3D, ring: &[usize]) -> bool {
+    let free: Vec<usize> = ring
+        .iter()
+        .copied()
+        .filter(|&v| !mol.atoms[v].aromatic)
+        .collect();
+    if free.len() < 2 {
+        return false;
+    }
+    free.iter().all(|&v| {
+        !mol.adj[v]
+            .iter()
+            .any(|&(_, bid)| mol.bonds[bid].order == BondOrder::Double)
+    })
+}
+
+/// Restores the pucker of saturated rings after the relaxation pass.
+///
+/// An isolated cyclohexane comes out of ring placement as a chair and stays one, but in a fused
+/// system (tetralin, indane, tetrahydroisoquinoline, chromane) the two atoms shared with the
+/// aromatic partner are pinned in its plane, and the bond-length relaxation then flattens the
+/// saturated half as well. Flat is the wrong answer: a saturated six-ring fused to a benzene
+/// adopts a half-chair, and the two carbons furthest from the fusion sit ~0.25 A out of the
+/// aromatic plane.
+///
+/// The displacement alternates around the ring, which is what a chair is, and is damped to zero
+/// at atoms that belong to an aromatic ring, which really are coplanar. Bond lengths are restored
+/// by the relaxation steps that follow this call.
+fn pucker_saturated_rings(mol: &Molecule3D, pos: &mut [[f64; 3]]) {
+    for ring in &mol.rings {
+        let n = ring.len();
+        if !(5..=8).contains(&n) || !ring_has_sp3_portion(mol, ring) {
+            continue;
+        }
+        let amplitude = if n.is_multiple_of(2) { 0.25 } else { 0.28 };
+        // Mean plane of the ring: centroid plus the Newell normal.
+        let mut cen = [0.0_f64; 3];
+        for &v in ring {
+            for k in 0..3 {
+                cen[k] += pos[v][k] / n as f64;
+            }
+        }
+        let mut normal = [0.0_f64; 3];
+        for i in 0..n {
+            let a = pos[ring[i]];
+            let b = pos[ring[(i + 1) % n]];
+            normal[0] += (a[1] - cen[1]) * (b[2] - cen[2]) - (a[2] - cen[2]) * (b[1] - cen[1]);
+            normal[1] += (a[2] - cen[2]) * (b[0] - cen[0]) - (a[0] - cen[0]) * (b[2] - cen[2]);
+            normal[2] += (a[0] - cen[0]) * (b[1] - cen[1]) - (a[1] - cen[1]) * (b[0] - cen[0]);
+        }
+        let nl = (normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2]).sqrt();
+        if nl < 1e-6 {
+            continue;
+        }
+        for component in normal.iter_mut() {
+            *component /= nl;
+        }
+
+        // Ring distance from each position to the nearest atom pinned flat by an aromatic ring.
+        let pinned: Vec<bool> = ring.iter().map(|&v| mol.atoms[v].aromatic).collect();
+        let any_pinned = pinned.iter().any(|&b| b);
+        let damping: Vec<f64> = (0..n)
+            .map(|i| {
+                if !any_pinned {
+                    return 1.0;
+                }
+                let d = (0..n)
+                    .filter(|&j| pinned[j])
+                    .map(|j| {
+                        let f = (i as isize - j as isize).unsigned_abs();
+                        f.min(n - f)
+                    })
+                    .min()
+                    .unwrap_or(0);
+                (d as f64 / 2.0).min(1.0)
+            })
+            .collect();
+
+        // An odd ring cannot alternate consistently all the way round, so it takes an envelope:
+        // one flap atom out of the plane of the rest.
+        let flap = (0..n)
+            .filter(|&i| !pinned[i])
+            .max_by(|&a, &b| damping[a].total_cmp(&damping[b]));
+        for i in 0..n {
+            let v = ring[i];
+            if pinned[i] {
+                continue;
+            }
+            let target = if n.is_multiple_of(2) {
+                let sign = if i.is_multiple_of(2) { 1.0 } else { -1.0 };
+                sign * amplitude * damping[i]
+            } else if Some(i) == flap {
+                amplitude * 1.6
+            } else {
+                0.0
+            };
+            let current = (pos[v][0] - cen[0]) * normal[0]
+                + (pos[v][1] - cen[1]) * normal[1]
+                + (pos[v][2] - cen[2]) * normal[2];
+            let delta = target - current;
+            for k in 0..3 {
+                pos[v][k] += delta * normal[k];
+            }
+        }
+    }
+}
+
+/// Ideal length of a bond between two elements at a given bond order, in angstroms.
+///
+/// Built from the Cordero/Pyykko single-bond covalent radii already in `element_covalent_radius`
+/// (their sum reproduces C-C 1.52, C-N 1.47, C-O 1.42, C-S 1.81, C-Cl 1.78 and C-I 2.15), minus a
+/// bond-order shortening: -0.19 A for a double bond, -0.32 A for a triple bond and -0.12 A for an
+/// aromatic bond, with explicit values for the two common cases those corrections get wrong.
+///
+/// The 3D builder previously used a single constant per bond order -- 1.50 A for *every* single
+/// bond regardless of the elements, and 1.34 A for every double bond -- so C-O came out 0.07 A too
+/// long, C-N 0.03 A too long and every carbonyl C=O 0.11 A too long. Those errors go straight into
+/// the docked pose, the van der Waals term and the H-bond geometry.
+pub fn ideal_bond_length(el_a: &str, el_b: &str, order: BondOrder) -> f64 {
+    let a = normalize_element(el_a);
+    let b = normalize_element(el_b);
+    let (lo, hi) = if a <= b {
+        (a.as_str(), b.as_str())
+    } else {
+        (b.as_str(), a.as_str())
+    };
+    match (lo, hi, order) {
+        ("O", "P", BondOrder::Double) => return 1.48,
+        ("O", "S", BondOrder::Double) => return 1.44,
+        ("N", "O", BondOrder::Double) => return 1.21,
+        _ => {}
+    }
+    let base = element_covalent_radius(lo) + element_covalent_radius(hi);
+    let shortening = match order {
+        BondOrder::Single => 0.0,
+        BondOrder::Aromatic => 0.12,
+        BondOrder::Double => 0.19,
+        BondOrder::Triple => 0.32,
+    };
+    (base - shortening).max(0.7)
+}
+
+/// A ring is saturated (and therefore puckered, not planar) when no atom of it is aromatic and no
+/// bond *within* the ring is double or aromatic.
+fn ring_is_saturated(mol: &Molecule3D, ring: &[usize]) -> bool {
+    let n = ring.len();
+    if ring.iter().any(|&v| mol.atoms[v].aromatic) {
+        return false;
+    }
+    !(0..n).any(|w| {
+        let (u, v) = (ring[w], ring[(w + 1) % n]);
+        mol.adj[u]
+            .iter()
+            .find(|&&(nb, _)| nb == v)
+            .is_some_and(|&(_, bid)| {
+                matches!(
+                    mol.bonds[bid].order,
+                    BondOrder::Double | BondOrder::Aromatic
+                )
+            })
+    })
+}
+
+/// Mean ideal length of the bonds that make up a ring.
+fn ring_bond_length(mol: &Molecule3D, ring: &[usize]) -> f64 {
+    let n = ring.len();
+    let mut sum = 0.0;
+    for w in 0..n {
+        let (u, v) = (ring[w], ring[(w + 1) % n]);
+        let order = mol.adj[u]
+            .iter()
+            .find(|&&(nb, _)| nb == v)
+            .map_or(BondOrder::Single, |&(_, bid)| mol.bonds[bid].order);
+        sum += ideal_bond_length(&mol.atoms[u].element, &mol.atoms[v].element, order);
+    }
+    sum / n as f64
+}
+
+/// Rotate every rotatable bond of `mol` by the given angles (radians), applied root-to-leaf so
+/// that a parent torsion carries its whole distal branch. `angles` is indexed in the same order
+/// as `mol.rotatable_bonds`; a shorter slice is cycled and extra entries are ignored.
+///
+/// The anchor side of each bond never moves, so the rigid core keeps its crystallographic
+/// coordinates and only the distal branches are re-posed.
+pub fn apply_torsion_angles(mol: &mut Molecule3D, angles: &[f64]) {
+    if angles.is_empty() || mol.rotatable_bonds.is_empty() {
+        return;
+    }
+    let bonds = mol.rotatable_bonds.clone();
+    for (k, rb) in bonds.iter().enumerate() {
+        let theta = angles[k % angles.len()];
+        if !theta.is_finite() || theta == 0.0 {
+            continue;
+        }
+        if rb.u >= mol.atoms.len() || rb.v >= mol.atoms.len() {
+            continue;
+        }
+        let a = mol.atoms[rb.u].coords;
+        let b = mol.atoms[rb.v].coords;
+        let axis = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+        if axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2] < 1e-18 {
+            continue;
+        }
+        let k_axis = norm3(axis);
+        let (s, c) = theta.sin_cos();
+        let one_c = 1.0 - c;
+        for &m in &rb.moving_atoms {
+            if m >= mol.atoms.len() || m == rb.v {
+                continue;
+            }
+            let p = mol.atoms[m].coords;
+            let r = [p[0] - b[0], p[1] - b[1], p[2] - b[2]];
+            let kxr = cross3(k_axis, r);
+            let kdr = k_axis[0] * r[0] + k_axis[1] * r[1] + k_axis[2] * r[2];
+            mol.atoms[m].coords = [
+                b[0] + r[0] * c + kxr[0] * s + k_axis[0] * kdr * one_c,
+                b[1] + r[1] * c + kxr[1] * s + k_axis[1] * kdr * one_c,
+                b[2] + r[2] * c + kxr[2] * s + k_axis[2] * kdr * one_c,
+            ];
+        }
+    }
+}
+
+/// Deterministic splitmix64, used so torsion randomization is reproducible without pulling an
+/// RNG dependency into this layer.
+fn splitmix64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// Replace every torsion of `mol` by an angle drawn uniformly from `[-PI, PI)`, as happens when a
+/// ligand arrives from a SMILES embedding rather than from its crystal pose. Returns the angles
+/// applied. Deterministic for a given `seed`.
+pub fn randomize_torsions(mol: &mut Molecule3D, seed: u64) -> Vec<f64> {
+    let mut st = seed ^ 0x5DEE_CE66_D1FA_B0C5;
+    let angles: Vec<f64> = (0..mol.rotatable_bonds.len())
+        .map(|_| {
+            let u = (splitmix64(&mut st) >> 11) as f64 / ((1u64 << 53) as f64);
+            (u - 0.5) * 2.0 * PI
+        })
+        .collect();
+    apply_torsion_angles(mol, &angles);
+    angles
 }

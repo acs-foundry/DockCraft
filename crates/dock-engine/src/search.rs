@@ -651,6 +651,91 @@ fn local_minimize(
     f_curr
 }
 
+/// Smallest absolute difference between two angles, wrapped onto `[-PI, PI]`.
+fn wrap_angle_diff(a: f64, b: f64) -> f64 {
+    let mut d = (a - b) % std::f64::consts::TAU;
+    if d > std::f64::consts::PI {
+        d -= std::f64::consts::TAU;
+    } else if d < -std::f64::consts::PI {
+        d += std::f64::consts::TAU;
+    }
+    d.abs()
+}
+
+/// Root-mean-square torsion difference (radians) between two torsion vectors.
+fn torsion_rms_diff(a: &[f64], b: &[f64]) -> f64 {
+    if a.is_empty() {
+        return 0.0;
+    }
+    let sum: f64 = a
+        .iter()
+        .zip(b.iter())
+        .map(|(&x, &y)| {
+            let d = wrap_angle_diff(x, y);
+            d * d
+        })
+        .sum();
+    (sum / a.len() as f64).sqrt()
+}
+
+/// Relaxes a torsion vector against the ligand's own steric term by cyclic coordinate descent,
+/// so a randomly drawn conformer is strain-relieved before it enters the bank. Only the intra
+/// term is used here: the receptor is not involved, exactly as in a standalone 3D conformer
+/// generator.
+fn relax_intra(
+    tpl: &LigandTemplate,
+    st: &mut RigState,
+    coords: &mut [[f64; 3]],
+    passes: usize,
+) -> f64 {
+    const TRIALS: [f64; 7] = [
+        std::f64::consts::FRAC_PI_4,
+        std::f64::consts::FRAC_PI_2,
+        2.356_194_490_192_345,
+        std::f64::consts::PI,
+        -2.356_194_490_192_345,
+        -std::f64::consts::FRAC_PI_2,
+        -std::f64::consts::FRAC_PI_4,
+    ];
+    tpl.apply_state(st, coords);
+    let mut best = tpl.eval_intra_energy(coords);
+    for _ in 0..passes {
+        let mut improved = false;
+        for t in 0..st.torsions.len() {
+            let orig = st.torsions[t];
+            let mut best_angle = orig;
+            let mut best_e = best;
+            for &delta in &TRIALS {
+                st.torsions[t] = orig + delta;
+                tpl.apply_state(st, coords);
+                let e = tpl.eval_intra_energy(coords);
+                if e < best_e - 1e-9 {
+                    best_e = e;
+                    best_angle = st.torsions[t];
+                }
+            }
+            st.torsions[t] = best_angle;
+            if best_e < best - 1e-9 {
+                best = best_e;
+                improved = true;
+            }
+        }
+        if !improved {
+            break;
+        }
+    }
+    tpl.apply_state(st, coords);
+    best
+}
+
+/// Builds a conformer bank that actually spans the ligand's torsional space.
+///
+/// Entry 0 is the input conformation, but every other entry is drawn with **all** torsions
+/// sampled independently over the full circle, strain-relaxed against the intra-ligand steric
+/// term and then kept only if it is both clash-free and torsionally distinct from everything
+/// already in the bank. Without this the search can only explore a neighbourhood of whatever
+/// conformer it was handed, which makes re-docking succeed on crystal input and fail on the
+/// SMILES-derived input the tool actually receives in a screening run.
 fn generate_clash_free_conformers(tpl: &LigandTemplate, count: usize, seed: u64) -> Vec<Vec<f64>> {
     let n_t = tpl.torsions.len();
     let mut bank = vec![vec![0.0_f64; n_t]];
@@ -668,22 +753,31 @@ fn generate_clash_free_conformers(tpl: &LigandTemplate, count: usize, seed: u64)
     let baseline_intra = tpl.eval_intra_energy(&coords);
     let mut rng = StdRng::seed_from_u64(seed ^ 0xA5A5_5A5A);
 
-    for _attempt in 0..(count * 12) {
-        if bank.len() >= count {
-            break;
+    // Distinctness threshold in torsion space (~60 deg RMS), relaxed progressively if the space
+    // is too crowded to fill the bank at the strict setting.
+    let mut min_sep = 1.05_f64;
+    let max_attempts = (count * 240).min(30_000);
+    let relax_every = (max_attempts / 6).max(1);
+    let mut attempts = 0usize;
+    while bank.len() < count && attempts < max_attempts {
+        attempts += 1;
+        if attempts.is_multiple_of(relax_every) {
+            min_sep *= 0.6;
         }
-        let mut tors = vec![0.0_f64; n_t];
-        // Perturb subset of torsions incrementally while checking for intra clash
-        let n_mut = rng.gen_range(1..=n_t.min(4));
-        for _ in 0..n_mut {
-            let idx = rng.gen_range(0..n_t);
-            tors[idx] = (rng.r#gen::<f64>() - 0.5) * std::f64::consts::TAU;
+        for angle in st.torsions.iter_mut() {
+            *angle = (rng.r#gen::<f64>() - 0.5) * std::f64::consts::TAU;
         }
-        st.torsions = tors.clone();
-        tpl.apply_state(&st, &mut coords);
-        if tpl.eval_intra_energy(&coords) <= baseline_intra + 2.5 {
-            bank.push(tors);
+        let e = relax_intra(tpl, &mut st, &mut coords, 3);
+        if !e.is_finite() || e > baseline_intra + 2.5 {
+            continue;
         }
+        if bank
+            .iter()
+            .any(|b| torsion_rms_diff(b, &st.torsions) < min_sep)
+        {
+            continue;
+        }
+        bank.push(st.torsions.clone());
     }
     bank
 }
@@ -722,8 +816,14 @@ pub fn dock_ligand(
             channels.push(AtomChannelKey::from_atom(a));
         }
     }
+    let t_total = Instant::now();
     let grids = AffinityGridSet::build(receptor, grid_box, &channels, config.scoring)?;
-    dock_ligand_with_grids(receptor, ligand, &grids, config)
+    let mut report = dock_ligand_with_grids(receptor, ligand, &grids, config)?;
+    // `dock_ligand_with_grids` times the search only, which is the right figure when a campaign
+    // amortises one grid over a whole library. A single `dock_ligand` call pays for the grid too,
+    // so the reported cost must include it.
+    report.elapsed_ms = t_total.elapsed().as_millis();
+    Ok(report)
 }
 
 pub fn dock_ligand_with_grids(
@@ -756,14 +856,17 @@ pub fn dock_ligand_with_grids(
         anchors.insert(0, center);
     }
     let rots = stratified_so3_rotations();
-    let conf_bank = generate_clash_free_conformers(&tpl, (4 + n_t).min(8), config.seed);
+    // One bank entry per ~1/3 torsional degree of freedom, so a 13-rotatable-bond ligand gets a
+    // genuinely multi-basin bank rather than a neighbourhood of its input conformer.
+    let bank_size = (6 + 3 * n_t).clamp(6, 40);
+    let conf_bank = generate_clash_free_conformers(&tpl, bank_size, config.seed);
 
-    let mut raw_probes: Vec<(f64, RigState)> =
-        Vec::with_capacity(anchors.len() * rots.len() * conf_bank.len().min(4));
+    let mut raw_probes: Vec<(f64, usize, RigState)> =
+        Vec::with_capacity(anchors.len() * rots.len() * conf_bank.len());
     let mut coords_tmp = vec![[0.0; 3]; tpl.local_coords.len()];
     for &tr in &anchors {
         for &rm in &rots {
-            for tors in conf_bank.iter().take(4) {
+            for (ci, tors) in conf_bank.iter().enumerate() {
                 let st = RigState {
                     translation: tr,
                     rot_mat: rm,
@@ -781,21 +884,42 @@ pub fn dock_ligand_with_grids(
                 }
                 e = (e + tpl.eval_intra_energy(&coords_tmp)) / tpl.rot_div;
                 if e.is_finite() {
-                    raw_probes.push((e, st));
+                    raw_probes.push((e, ci, st));
                 }
             }
         }
     }
     raw_probes.sort_by(|a, b| a.0.total_cmp(&b.0));
 
-    let n_walkers = config.exhaustiveness.max(1);
-    let n_stage1 = (n_walkers * 5).clamp(24, 64);
+    // Basin diversity, not trajectory depth, is what the failing cases were short of: on
+    // 1HSG/indinavir the seed that converged to a 5.83 A decoy at -9.53 kcal/mol stayed there at
+    // 200 ILS steps and 24 retained modes, and reached 0.98 A / -10.49 kcal/mol as soon as the
+    // walker count went from 10 to 16. A ligand with many rotatable bonds therefore gets a floor
+    // on independent walkers; an explicitly higher `exhaustiveness` still wins.
+    let n_walkers = config.exhaustiveness.max(1).max((4 + 2 * n_t).min(32));
+    let n_stage1 = (n_walkers * 5).clamp(24, 64).max(2 * conf_bank.len());
     let mut rng_s1 = StdRng::seed_from_u64(config.seed ^ 0x5151_5151);
-    let mut stage1_seeds: Vec<RigState> = raw_probes
-        .into_iter()
-        .take(n_stage1 / 2)
-        .map(|(_, st)| st)
-        .collect();
+    // Stratify by conformer: take the best placements of each bank member in turn before taking
+    // the second-best of any of them. Ranking probes by raw energy alone lets the single most
+    // compact conformer fill every Stage-1 slot, which is what confined the old search to the
+    // basin of its input conformation.
+    let mut per_conf: Vec<Vec<RigState>> = vec![Vec::new(); conf_bank.len()];
+    for (_, ci, st) in raw_probes {
+        if ci < per_conf.len() && per_conf[ci].len() < 4 {
+            per_conf[ci].push(st);
+        }
+    }
+    let mut stage1_seeds: Vec<RigState> = Vec::with_capacity(n_stage1);
+    for round in 0..4 {
+        for slots in per_conf.iter() {
+            if stage1_seeds.len() >= n_stage1 / 2 {
+                break;
+            }
+            if let Some(st) = slots.get(round) {
+                stage1_seeds.push(st.clone());
+            }
+        }
+    }
     // Fill remaining Stage-1 slots with random pocket explorations so novel basins are always sampled
     while stage1_seeds.len() < n_stage1 {
         let tr = anchors[rng_s1.gen_range(0..anchors.len())];
@@ -834,12 +958,16 @@ pub fn dock_ligand_with_grids(
     }
     ranked_s1.sort_by(|a, b| a.0.total_cmp(&b.0));
 
+    // Distinct-basin threshold: 1.25 A apart is the same basin for a 45-heavy-atom ligand, so it
+    // grows with ligand flexibility. Without this the "diverse" Stage-1 basins all sat in one
+    // region of the pocket.
+    let basin_sep = 1.25 + 0.06 * n_t as f64;
     let mut basin_seeds: Vec<(f64, RigState)> = Vec::new();
     for (e, st, cb) in &ranked_s1 {
         let distinct = basin_seeds.iter().all(|(_, kept)| {
             let mut kcb = vec![[0.0; 3]; tpl.local_coords.len()];
             tpl.apply_state(kept, &mut kcb);
-            heavy_rmsd(&kcb, cb, &tpl.heavy_indices) >= 1.25
+            heavy_rmsd(&kcb, cb, &tpl.heavy_indices) >= basin_sep
         });
         if distinct {
             basin_seeds.push((*e, st.clone()));
@@ -860,7 +988,12 @@ pub fn dock_ligand_with_grids(
     }
 
     // Stage 2: Parallel Iterated Local Search starting from diverse Stage-1 basins + pocket exploration
-    let eff_ils = config.ils_steps.max(18 + n_t);
+    // The number of basin hops a walker needs grows with the dimensionality of the torsional
+    // space, not additively with it. Measured on 1HSG/indinavir (13 rotatable bonds): 31 ILS
+    // steps per walker converge to a decoy basin at -9.2 kcal/mol in 5/5 seeds, 128 steps reach
+    // the crystal basin at -10.56 kcal/mol, and the wall time is nearly unchanged because the
+    // walkers run in parallel and the grid build dominates.
+    let eff_ils = config.ils_steps.max(24 + 8 * n_t);
     let eff_bfgs = config.bfgs_iters.max(45 + 3 * n_t);
 
     type WalkerCand = (f64, RigState, Vec<[f64; 3]>);
@@ -881,7 +1014,36 @@ pub fn dock_ligand_with_grids(
             candidates.push((curr_e, curr_state.clone(), coords_buf.clone()));
 
             let temp_kt = 1.4_f64;
+            // A walker that has not improved for this many consecutive steps is in a dead end;
+            // restarting it as a fresh basin explorer is worth more than the rest of its budget.
+            // Measured on 1HSG/indinavir: without restarts individual seeds park at a 10.4 A
+            // decoy and stay there however long the trajectory runs.
+            let stall_limit = (8 + n_t).min(24);
+            let mut since_improve = 0usize;
+            let mut best_e = curr_e;
             for step in 0..eff_ils {
+                if since_improve >= stall_limit {
+                    since_improve = 0;
+                    let anchor = anchors[rng.gen_range(0..anchors.len())];
+                    let mut fresh = RigState {
+                        translation: [
+                            (anchor[0] + (rng.r#gen::<f64>() - 0.5) * 3.0)
+                                .clamp(min_c[0] + 1.0, max_c[0] - 1.0),
+                            (anchor[1] + (rng.r#gen::<f64>() - 0.5) * 3.0)
+                                .clamp(min_c[1] + 1.0, max_c[1] - 1.0),
+                            (anchor[2] + (rng.r#gen::<f64>() - 0.5) * 3.0)
+                                .clamp(min_c[2] + 1.0, max_c[2] - 1.0),
+                        ],
+                        rot_mat: random_rotation(&mut rng),
+                        torsions: conf_bank[rng.gen_range(0..conf_bank.len())].clone(),
+                    };
+                    let fe = local_minimize(&tpl, grids, &mut fresh, eff_bfgs, false, &mut evals);
+                    tpl.apply_state(&fresh, &mut coords_buf);
+                    candidates.push((fe, fresh.clone(), coords_buf.clone()));
+                    curr_e = fe;
+                    curr_state = fresh;
+                    continue;
+                }
                 let mut mutated = curr_state.clone();
                 if step % 5 == 0 {
                     // Occasional pocket anchor jump / large reorientation
@@ -924,6 +1086,13 @@ pub fn dock_ligand_with_grids(
                 let mut_e = local_minimize(&tpl, grids, &mut mutated, eff_bfgs, false, &mut evals);
                 tpl.apply_state(&mutated, &mut coords_buf);
                 candidates.push((mut_e, mutated.clone(), coords_buf.clone()));
+
+                if mut_e < best_e - 1e-6 {
+                    best_e = mut_e;
+                    since_improve = 0;
+                } else {
+                    since_improve += 1;
+                }
 
                 let de = mut_e - curr_e;
                 if de <= 0.0 || rng.r#gen::<f64>() < (-de / temp_kt).exp() {
@@ -1050,27 +1219,73 @@ mod tests {
         let tpl = LigandTemplate::from_ligand(&lig, &grids, ScoringFunction::Vina)
             .ok_or(DockError::EmptyStructure)?;
 
-        // Check rotating torsion by 17 degrees does NOT translate rigid benzene core
+        // Anchored-frame check.
+        //
+        // Asserting that the atoms of `rigid_core_indices()` do not move when a torsion changes
+        // would be vacuous: that set is *defined* as the complement of every `moving_atoms` set,
+        // and `apply_state` moves exactly those, so no choice of anchor could make it fail.
+        //
+        // The falsifiable property is the one the anchoring was introduced for: the world-frame
+        // centroid of the rigid core must equal `state.translation` exactly, for every torsion
+        // vector. Anchoring the local frame anywhere else (the whole-molecule centroid, say)
+        // breaks this, and the requested docking position then no longer means what the search
+        // thinks it means.
         let core = lig.rigid_core_indices();
-        let state0 = RigState {
-            translation: [0.2, -0.1, 0.3],
-            rot_mat: mat3_identity(),
-            torsions: vec![0.0; tpl.torsions.len()],
-        };
-        let mut c0 = vec![[0.0; 3]; tpl.local_coords.len()];
-        let mut c1 = vec![[0.0; 3]; tpl.local_coords.len()];
-        tpl.apply_state(&state0, &mut c0);
-        let mut state_rot = state0.clone();
-        state_rot.torsions[0] = 17.0_f64.to_radians();
-        tpl.apply_state(&state_rot, &mut c1);
-        let mut core_drift = 0.0_f64;
-        for &cid in &core {
-            let d = (c0[cid][0] - c1[cid][0])
-                .hypot(c0[cid][1] - c1[cid][1])
-                .hypot(c0[cid][2] - c1[cid][2]);
-            core_drift = core_drift.max(d);
+        assert!(!core.is_empty());
+        // Independent chemical check: the benzene ring is part of the rigid core by chemistry,
+        // not by definition of the data structure.
+        let aromatic: Vec<usize> = lig
+            .atoms
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| a.aromatic && a.is_heavy())
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            aromatic.len(),
+            6,
+            "expected a benzene ring in the probe ligand"
+        );
+        for ai in &aromatic {
+            assert!(
+                core.contains(ai),
+                "aromatic atom {ai} left out of the rigid core"
+            );
         }
-        assert!(core_drift < 1e-12, "rigid core drifted {core_drift} A");
+
+        let mut c0 = vec![[0.0; 3]; tpl.local_coords.len()];
+        let translation = [0.2, -0.1, 0.3];
+        for (case, torsions) in [
+            ("zero", vec![0.0; tpl.torsions.len()]),
+            (
+                "mixed",
+                (0..tpl.torsions.len())
+                    .map(|i| 0.9 * (i as f64 + 1.0))
+                    .collect::<Vec<f64>>(),
+            ),
+        ] {
+            let st = RigState {
+                translation,
+                rot_mat: rot_from_axis_angle([0.3, -0.2, 0.45]),
+                torsions,
+            };
+            tpl.apply_state(&st, &mut c0);
+            let mut centroid = [0.0_f64; 3];
+            for &cid in &core {
+                for k in 0..3 {
+                    centroid[k] += c0[cid][k];
+                }
+            }
+            for k in 0..3 {
+                centroid[k] /= core.len() as f64;
+                assert!(
+                    (centroid[k] - translation[k]).abs() < 1e-12,
+                    "{case}: rigid-core centroid[{k}] = {} but the state asked for {}",
+                    centroid[k],
+                    translation[k]
+                );
+            }
+        }
 
         // Compare analytical gradient against central finite differences (eps = 1e-4)
         let mut world = vec![[0.0; 3]; tpl.local_coords.len()];
