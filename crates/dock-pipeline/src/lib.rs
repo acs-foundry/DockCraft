@@ -2,6 +2,7 @@
 
 pub mod admet;
 pub mod campaign;
+pub mod chimerax;
 pub mod export;
 pub mod sandbox;
 
@@ -9,11 +10,15 @@ pub use admet::{AdmetProfile, detect_sibling_clis, evaluate_admet};
 pub use campaign::{
     CampaignError, CampaignReport, EnrichmentMetrics, LigandInputRecord, ScreenedCandidate,
     campaign_report_to_csv, compute_enrichment_metrics, compute_mpo_score,
-    load_ligand_library_bytes, run_screening_campaign,
+    load_ligand_library_bytes, measured_pic50_of, run_screening_campaign,
+};
+pub use chimerax::{
+    ChimeraXError, ChimeraXSceneBundle, default_chimerax_export_dir, is_chimerax_available,
+    launch_chimerax_for_scene, write_chimerax_session_bundle,
 };
 pub use export::{
-    InteropSceneBundle, SceneExportRequest, build_chymera_export, build_molcraft_export,
-    write_sandboxed_scene_package,
+    InteropSceneBundle, SceneExportRequest, build_chimerax_export, build_pymol_export,
+    canonical_export_target, write_sandboxed_scene_package,
 };
 pub use sandbox::{
     DEFAULT_MAX_FILE_BYTES, MAX_ZIP_DECOMPRESSED_BYTES, PathSandbox, SandboxError,

@@ -44,6 +44,12 @@ pub struct ScreenedCandidate {
     pub rank: usize,
     pub name: String,
     pub is_active: Option<bool>,
+    /// Measured potency carried over from the input library (a ChemCraft SAR row, or an SDF
+    /// `> <pIC50>` tag). The pipeline parsed these and then dropped them, so a run against a
+    /// library with real affinities could not be checked against them.
+    pub measured_pic50: Option<f64>,
+    /// Everything else the input library carried for this compound, untouched.
+    pub source_properties: std::collections::BTreeMap<String, String>,
     pub best_affinity_kcal: f64,
     pub hyde_delta_g_kcal: f64,
     pub estimated_ki_nm: f64,
@@ -233,11 +239,102 @@ fn load_csv_smiles(
     Ok(out)
 }
 
+/// Pulls one ligand out of a ChemCraft-shaped JSON row.
+///
+/// Accepts `canonical_smiles` (what a real `SarRow` carries) as well as the looser `smiles` used by
+/// hand-written libraries, and carries the row's measured data through on the molecule's own
+/// property map: `pIC50`, `Series`, and anything under `properties`. Those are the columns that
+/// make a screening run checkable against measured affinity instead of against a guess.
+fn push_chemcraft_row(item: &serde_json::Value, idx: usize, out: &mut Vec<LigandInputRecord>) {
+    let Some(smi) = item
+        .get("canonical_smiles")
+        .or_else(|| item.get("smiles"))
+        .and_then(|v| v.as_str())
+    else {
+        return;
+    };
+    let name = item
+        .get("name")
+        .or_else(|| item.get("id"))
+        .and_then(|v| v.as_str())
+        .map_or_else(|| format!("cc_{}", idx + 1), ToString::to_string);
+
+    let Ok(mut mol) = parse_smiles_to_3d(smi, Some(&name)) else {
+        return;
+    };
+
+    // Free-form property bag from the ChemCraft row.
+    if let Some(props) = item.get("properties").and_then(|v| v.as_object()) {
+        for (k, v) in props {
+            let text = v
+                .as_str()
+                .map_or_else(|| v.to_string(), ToString::to_string);
+            mol.properties.insert(k.clone(), text);
+        }
+    }
+    // Typed columns of `SarRow`, which win over anything of the same name in the bag.
+    if let Some(pic50) = item.get("pic50").and_then(serde_json::Value::as_f64) {
+        mol.properties
+            .insert("pIC50".to_string(), pic50.to_string());
+    }
+    if let Some(series) = item.get("series").and_then(|v| v.as_str()) {
+        mol.properties
+            .insert("Series".to_string(), series.to_string());
+    }
+
+    let is_active = item
+        .get("is_active")
+        .and_then(serde_json::Value::as_bool)
+        .or_else(|| {
+            item.get("active")
+                .and_then(|v| v.as_str())
+                .and_then(parse_bool_flag)
+        })
+        .or_else(|| {
+            mol.properties
+                .get("IS_ACTIVE")
+                .or_else(|| mol.properties.get("active"))
+                .and_then(|v| parse_bool_flag(v))
+        });
+
+    out.push(LigandInputRecord {
+        name,
+        molecule: mol,
+        is_active,
+    });
+}
+
+/// Extracts ligands from the JSON inside a `.chemcraft` archive.
+///
+/// A genuine ChemCraft project serialises `ChemCraftDocument` into `manifest.json` as
+/// `{format, version, canvas_mol, reaction_arrows, sar_table: {rows: [...]}, sar_filter}`. This
+/// function used to look only for a top-level `molecules` / `rows` / `compounds` key, none of which
+/// a real document has, so feeding DockCraft an actual ChemCraft project failed with
+/// "no valid ligands in input library" and the integration only ever worked with a hand-written
+/// JSON that ChemCraft does not produce.
 fn extract_chemcraft_json_mols(
     val: &serde_json::Value,
     limit: usize,
     out: &mut Vec<LigandInputRecord>,
 ) {
+    // 1. A real ChemCraft project: the SAR table rows.
+    if let Some(rows) = val
+        .get("sar_table")
+        .and_then(|t| t.get("rows"))
+        .and_then(|v| v.as_array())
+    {
+        for (idx, item) in rows.iter().enumerate() {
+            if out.len() >= limit {
+                return;
+            }
+            push_chemcraft_row(item, idx, out);
+        }
+        if !out.is_empty() {
+            return;
+        }
+    }
+
+    // 2. Looser shapes: a bare list, or a document keyed by `molecules` / `rows` / `compounds`.
     let arr = val
         .get("molecules")
         .or_else(|| val.get("rows"))
@@ -251,32 +348,31 @@ fn extract_chemcraft_json_mols(
         if out.len() >= limit {
             break;
         }
-        let smi = item
-            .get("smiles")
-            .or_else(|| item.get("canonical_smiles"))
-            .and_then(|v| v.as_str());
-        let Some(smi) = smi else {
-            continue;
-        };
-        let name = item
-            .get("name")
-            .or_else(|| item.get("id"))
-            .and_then(|v| v.as_str())
-            .unwrap_or(&format!("cc_{}", idx + 1))
-            .to_string();
-        let is_active = item.get("is_active").and_then(|v| v.as_bool()).or_else(|| {
-            item.get("active")
-                .and_then(|v| v.as_str())
-                .and_then(parse_bool_flag)
-        });
-        if let Ok(mol) = parse_smiles_to_3d(smi, Some(&name)) {
-            out.push(LigandInputRecord {
-                name,
-                molecule: mol,
-                is_active,
-            });
+        push_chemcraft_row(item, idx, out);
+    }
+}
+
+/// Reads a measured pIC50 off a molecule's property map, however the source spelled it.
+#[must_use]
+pub fn measured_pic50_of(mol: &Molecule3D) -> Option<f64> {
+    for key in ["pIC50", "pic50", "PIC50", "pChEMBL", "pActivity"] {
+        if let Some(v) = mol.properties.get(key)
+            && let Ok(x) = v.trim().parse::<f64>()
+            && x.is_finite()
+        {
+            return Some(x);
         }
     }
+    // IC50 in nanomolar converts cleanly: pIC50 = 9 - log10(IC50_nM).
+    for key in ["IC50_nM", "IC50_nm", "ic50_nm"] {
+        if let Some(v) = mol.properties.get(key)
+            && let Ok(nm) = v.trim().parse::<f64>()
+            && nm > 0.0
+        {
+            return Some(9.0 - nm.log10());
+        }
+    }
+    None
 }
 
 #[must_use]
@@ -393,6 +489,8 @@ pub fn run_screening_campaign(
                 rank: 0,
                 name: item.name.clone(),
                 is_active: item.is_active,
+                measured_pic50: measured_pic50_of(&item.molecule),
+                source_properties: item.molecule.properties.clone(),
                 best_affinity_kcal: best_pose.affinity_kcal_mol,
                 hyde_delta_g_kcal: hyde.total_delta_g_kcal,
                 estimated_ki_nm: hyde.estimated_ki_nm,
@@ -426,7 +524,7 @@ pub fn run_screening_campaign(
 #[must_use]
 pub fn campaign_report_to_csv(report: &CampaignReport) -> String {
     let mut out = String::from(
-        "rank,name,is_active,affinity_kcal,hyde_delta_g_kcal,ki_nm,ligand_efficiency,mpo_score,mw,clogp,tpsa,lipinski_violations,admet_score,pains_alerts\n",
+        "rank,name,is_active,measured_pic50,affinity_kcal,hyde_delta_g_kcal,ki_nm,ligand_efficiency,mpo_score,mw,clogp,tpsa,lipinski_violations,admet_score,pains_alerts\n",
     );
     for c in &report.results {
         let act = match c.is_active {
@@ -435,11 +533,15 @@ pub fn campaign_report_to_csv(report: &CampaignReport) -> String {
             None => "",
         };
         let pains = c.admet.pains_alerts.join("|");
+        let pic50 = c
+            .measured_pic50
+            .map_or_else(String::new, |v| format!("{v:.3}"));
         out.push_str(&format!(
-            "{},{},{},{:.3},{:.3},{:.2},{:.3},{:.3},{:.2},{:.2},{:.1},{},{:.1},{}\n",
+            "{},{},{},{},{:.3},{:.3},{:.2},{:.3},{:.3},{:.2},{:.2},{:.1},{},{:.1},{}\n",
             c.rank,
             c.name.replace(',', "_"),
             act,
+            pic50,
             c.best_affinity_kcal,
             c.hyde_delta_g_kcal,
             c.estimated_ki_nm,

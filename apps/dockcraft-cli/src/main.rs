@@ -7,8 +7,9 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand, ValueEnum};
 use dock_engine::{DockingConfig, ScoringFunction};
 use dock_pipeline::{
-    DEFAULT_MAX_FILE_BYTES, PathSandbox, campaign_report_to_csv, load_ligand_library_bytes,
-    run_screening_campaign,
+    DEFAULT_MAX_FILE_BYTES, PathSandbox, campaign_report_to_csv, is_chimerax_available,
+    launch_chimerax_for_scene, load_ligand_library_bytes, run_screening_campaign,
+    write_chimerax_session_bundle,
 };
 use hyde_scorer::score_pose_hyde;
 use pocket_detect::GridBox;
@@ -77,6 +78,23 @@ enum Commands {
         receptor: PathBuf,
         #[arg(long)]
         ligand: PathBuf,
+    },
+    /// Write a self-contained UCSF ChimeraX scene (.cxc + receptor.pdb + ligand.sdf) into the
+    /// export directory ChimeraX's sandbox can read, and optionally launch ChimeraX on it
+    Chimerax {
+        #[arg(long)]
+        receptor: PathBuf,
+        #[arg(long)]
+        ligand: PathBuf,
+        /// Name of the scene subdirectory; defaults to the ligand's own name
+        #[arg(long)]
+        name: Option<String>,
+        /// Export root override. Default: $XDG_DATA_HOME/ChimeraX/dockcraft_export
+        #[arg(long)]
+        out_dir: Option<PathBuf>,
+        /// Spawn `chimerax` on the scene once it is written
+        #[arg(long)]
+        launch: bool,
     },
     /// Start the hardened JSON-RPC 2.0 MCP server
     Mcp {
@@ -182,6 +200,45 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             struct_core::perceive_all(&mut lig);
             let hyde = score_pose_hyde(&rec, &lig)?;
             println!("{}", serde_json::to_string_pretty(&hyde)?);
+        }
+        Commands::Chimerax {
+            receptor,
+            ligand,
+            name,
+            out_dir,
+            launch,
+        } => {
+            let rec = read_receptor_file(&receptor, true)?;
+            let lig_raw = std::fs::read_to_string(&ligand)?;
+            let mut ligs = parse_sdf_3d_with_limit(&lig_raw, 1);
+            let mut lig = ligs.pop().ok_or("empty ligand SDF")??;
+            struct_core::perceive_all(&mut lig);
+            let hyde = score_pose_hyde(&rec, &lig)?;
+            let complex_name = name.unwrap_or_else(|| {
+                if lig.name.trim().is_empty() {
+                    "DockCraftComplex".to_string()
+                } else {
+                    lig.name.clone()
+                }
+            });
+            let bundle = if launch {
+                launch_chimerax_for_scene(&complex_name, &rec, &lig, &hyde, out_dir.as_deref())?
+            } else {
+                write_chimerax_session_bundle(&complex_name, &rec, &lig, &hyde, out_dir.as_deref())?
+            };
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "scene_dir": bundle.scene_dir.display().to_string(),
+                    "script": bundle.script_path.display().to_string(),
+                    "receptor": bundle.receptor_path.display().to_string(),
+                    "ligand": bundle.ligand_path.display().to_string(),
+                    "bundle": bundle.bundle_path.display().to_string(),
+                    "chimerax_command": bundle.open_command,
+                    "chimerax_on_path": is_chimerax_available(),
+                    "launched": launch,
+                }))?
+            );
         }
         Commands::Mcp {
             read_root,

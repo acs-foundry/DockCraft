@@ -30,16 +30,14 @@ pub struct InteropSceneBundle {
 }
 
 #[must_use]
-pub fn build_molcraft_export(
+pub fn build_pymol_export(
     complex_name: &str,
     receptor: &Molecule3D,
     ligand: &Molecule3D,
     hyde: &HydeReport,
 ) -> (String, InteropSceneBundle) {
     let mut pml = String::new();
-    pml.push_str(&format!(
-        "# DockCraft -> MolCraft export ({complex_name})\n"
-    ));
+    pml.push_str(&format!("# DockCraft -> PyMOL export ({complex_name})\n"));
     pml.push_str("load receptor.pdb, receptor\n");
     pml.push_str("load ligand.sdf, ligand\n");
     pml.push_str("show cartoon, receptor\n");
@@ -71,12 +69,12 @@ pub fn build_molcraft_export(
     }
     pml.push_str("zoom ligand, 6.0\n");
 
-    let bundle = make_bundle("MolCraft", complex_name, receptor, ligand, hyde);
+    let bundle = make_bundle("PyMOL", complex_name, receptor, ligand, hyde);
     (pml, bundle)
 }
 
 #[must_use]
-pub fn build_chymera_export(
+pub fn build_chimerax_export(
     complex_name: &str,
     receptor: &Molecule3D,
     ligand: &Molecule3D,
@@ -84,7 +82,7 @@ pub fn build_chymera_export(
 ) -> (String, InteropSceneBundle) {
     let mut cxc = String::new();
     cxc.push_str(&format!(
-        "# DockCraft -> ChimeraX/Chymera (.cxc) script ({complex_name})\n"
+        "# DockCraft -> UCSF ChimeraX (.cxc) script ({complex_name})\n"
     ));
     cxc.push_str("open receptor.pdb\n");
     cxc.push_str("open ligand.sdf\n");
@@ -113,8 +111,20 @@ pub fn build_chymera_export(
     }
     cxc.push_str("view #2\n");
 
-    let bundle = make_bundle("Chymera", complex_name, receptor, ligand, hyde);
+    let bundle = make_bundle("ChimeraX", complex_name, receptor, ligand, hyde);
     (cxc, bundle)
+}
+
+/// Accepted export targets, with the former misspellings kept as aliases so the MCP contract and
+/// any saved call do not break. `molcraft` never named a real program -- the script it produces is
+/// PyMOL -- and `chymera` is ChimeraX misspelled.
+#[must_use]
+pub fn canonical_export_target(raw: &str) -> Option<&'static str> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "chimerax" | "chymera" => Some("chimerax"),
+        "pymol" | "molcraft" => Some("pymol"),
+        _ => None,
+    }
 }
 
 pub struct SceneExportRequest<'a> {
@@ -124,8 +134,9 @@ pub struct SceneExportRequest<'a> {
     pub out_bundle_path: Option<&'a Path>,
 }
 
-/// Writes the full self-contained scene directory (`script`, `receptor.pdb`, `ligand.sdf`, optional JSON bundle)
-/// through the `openat2` sandbox so ChimeraX / MolCraft never encounter missing `receptor.pdb` / `ligand.sdf`.
+/// Writes the full self-contained scene directory (`script`, `receptor.pdb`, `ligand.sdf`, optional
+/// JSON bundle) through the `openat2` sandbox so ChimeraX / PyMOL never encounter a missing
+/// `receptor.pdb` or `ligand.sdf`.
 pub fn write_sandboxed_scene_package(
     sandbox: &PathSandbox,
     req: &SceneExportRequest<'_>,
@@ -133,10 +144,10 @@ pub fn write_sandboxed_scene_package(
     ligand: &Molecule3D,
     hyde: &HydeReport,
 ) -> Result<Vec<String>, SandboxError> {
-    let (script_text, bundle) = if req.target == "chymera" {
-        build_chymera_export(req.complex_name, receptor, ligand, hyde)
+    let (script_text, bundle) = if canonical_export_target(req.target) == Some("chimerax") {
+        build_chimerax_export(req.complex_name, receptor, ligand, hyde)
     } else {
-        build_molcraft_export(req.complex_name, receptor, ligand, hyde)
+        build_pymol_export(req.complex_name, receptor, ligand, hyde)
     };
 
     let parent_dir = req

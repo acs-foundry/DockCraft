@@ -5,7 +5,7 @@ use std::sync::{Arc, RwLock};
 
 use dock_engine::{DockingConfig, DockingPose, ScoringFunction, dock_ligand};
 use dock_pipeline::{
-    AdmetProfile, CampaignReport, LigandInputRecord, build_chymera_export, build_molcraft_export,
+    AdmetProfile, CampaignReport, LigandInputRecord, build_chimerax_export, build_pymol_export,
     evaluate_admet, load_ligand_library_bytes, run_screening_campaign,
 };
 use dock_viewport::{
@@ -379,17 +379,17 @@ impl DockCraftApp {
         }
     }
 
-    fn export_interop(&mut self, target_molcraft: bool) {
+    fn export_interop(&mut self, target_pymol: bool) {
         let (Some(rec), Some(lig), Some(hyde)) = (&self.receptor, &self.ligand, &self.hyde_report)
         else {
             self.status_line = "Score a complex before exporting.".to_string();
             return;
         };
         let dir = Path::new(self.export_dir_input.trim());
-        if target_molcraft {
-            let (pml, bundle) = build_molcraft_export(&lig.name, rec, lig, hyde);
+        if target_pymol {
+            let (pml, bundle) = build_pymol_export(&lig.name, rec, lig, hyde);
             let p1 = dir.join("dockcraft_scene.pml");
-            let p2 = dir.join("dockcraft_scene.molcraft.json");
+            let p2 = dir.join("dockcraft_scene.pymol.json");
             let p_rec = dir.join("receptor.pdb");
             let p_lig = dir.join("ligand.sdf");
             let ok = std::fs::write(&p_rec, &bundle.receptor_pdb).is_ok()
@@ -399,14 +399,14 @@ impl DockCraftApp {
                     .map(|js| std::fs::write(&p2, js).is_ok())
                     .unwrap_or(false);
             self.status_line = if ok {
-                format!("Exported MolCraft bundle to {}", dir.display())
+                format!("Exported PyMOL bundle to {}", dir.display())
             } else {
-                "MolCraft export failed".to_string()
+                "PyMOL export failed".to_string()
             };
         } else {
-            let (cxc, bundle) = build_chymera_export(&lig.name, rec, lig, hyde);
+            let (cxc, bundle) = build_chimerax_export(&lig.name, rec, lig, hyde);
             let p1 = dir.join("dockcraft_scene.cxc");
-            let p2 = dir.join("dockcraft_scene.chymera.json");
+            let p2 = dir.join("dockcraft_scene.chimerax.json");
             let p_rec = dir.join("receptor.pdb");
             let p_lig = dir.join("ligand.sdf");
             let ok = std::fs::write(&p_rec, &bundle.receptor_pdb).is_ok()
@@ -416,9 +416,9 @@ impl DockCraftApp {
                     .map(|js| std::fs::write(&p2, js).is_ok())
                     .unwrap_or(false);
             self.status_line = if ok {
-                format!("Exported Chymera bundle to {}", dir.display())
+                format!("Exported ChimeraX bundle to {}", dir.display())
             } else {
-                "Chymera export failed".to_string()
+                "ChimeraX export failed".to_string()
             };
         }
     }
@@ -512,10 +512,10 @@ impl eframe::App for DockCraftApp {
                     self.scene_dirty = true;
                 }
                 ui.separator();
-                if ui.button("-> MolCraft").clicked() {
+                if ui.button("-> PyMOL").clicked() {
                     self.export_interop(true);
                 }
-                if ui.button("-> Chymera").clicked() {
+                if ui.button("-> ChimeraX").clicked() {
                     self.export_interop(false);
                 }
                 if ui.button("Cmd (Ctrl+K)").clicked() {

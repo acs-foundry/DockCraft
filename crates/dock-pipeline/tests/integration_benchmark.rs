@@ -4,7 +4,7 @@ use std::path::Path;
 
 use dock_engine::{DockingConfig, ScoringFunction, dock_ligand};
 use dock_pipeline::{
-    build_chymera_export, build_molcraft_export, evaluate_admet, load_ligand_library_bytes,
+    build_chimerax_export, build_pymol_export, evaluate_admet, load_ligand_library_bytes,
     run_screening_campaign,
 };
 use hyde_scorer::{SubstituentPreset, mutate_and_minimize_in_pocket, score_pose_hyde};
@@ -129,9 +129,9 @@ fn redocks_real_rcsb_benchmarks_from_9_angstroms_with_native_torsions()
         let hyde = score_pose_hyde(&rec, &top.molecule)?;
         assert_eq!(hyde.atom_scores.len(), top.molecule.heavy_atom_count());
 
-        let (pml, mol_bundle) = build_molcraft_export(rec_file, &rec, &top.molecule, &hyde);
+        let (pml, mol_bundle) = build_pymol_export(rec_file, &rec, &top.molecule, &hyde);
         assert!(pml.contains("load receptor.pdb") && !mol_bundle.atom_annotations.is_empty());
-        let (cxc, chy_bundle) = build_chymera_export(rec_file, &rec, &top.molecule, &hyde);
+        let (cxc, chy_bundle) = build_chimerax_export(rec_file, &rec, &top.molecule, &hyde);
         assert!(cxc.contains("open receptor.pdb") && !chy_bundle.ligand_sdf.is_empty());
     }
 

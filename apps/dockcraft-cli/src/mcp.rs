@@ -9,7 +9,8 @@ use std::time::{Duration, Instant};
 use dock_engine::{DockingConfig, ScoringFunction, dock_ligand};
 use dock_pipeline::{
     DEFAULT_MAX_FILE_BYTES, PathSandbox, SceneExportRequest, campaign_report_to_csv,
-    load_ligand_library_bytes, run_screening_campaign, write_sandboxed_scene_package,
+    canonical_export_target, load_ligand_library_bytes, run_screening_campaign,
+    write_chimerax_session_bundle, write_sandboxed_scene_package,
 };
 use hyde_scorer::{SubstituentPreset, mutate_and_minimize_in_pocket, score_pose_hyde};
 use pocket_detect::{GridBox, PocketDetectConfig, detect_pockets};
@@ -194,16 +195,18 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "export_complex",
-            "description": "Exports the docked complex and HYDE annotations to MolCraft (.pml/.molcraft.json) or Chymera (.cxc/.chymera.json) inside write_root.",
+            "description": "Exports the docked complex and HYDE annotations as a ChimeraX scene (.cxc) or a PyMOL script (.pml) inside write_root. With chimerax_session=true the scene goes instead to the ChimeraX export directory, which is the only place ChimeraX's Flatpak sandbox can read it; out_script_path is then ignored. The legacy target names 'chymera' and 'molcraft' are still accepted.",
             "inputSchema": {
                 "type": "object",
-                "required": ["receptor_path", "ligand_path", "target", "out_script_path"],
+                "required": ["receptor_path", "ligand_path", "target"],
                 "properties": {
                     "receptor_path": { "type": "string" },
                     "ligand_path": { "type": "string" },
-                    "target": { "type": "string", "enum": ["molcraft", "chymera", "pdb", "sdf"] },
+                    "target": { "type": "string", "enum": ["chimerax", "pymol", "chymera", "molcraft", "pdb", "sdf"] },
                     "out_script_path": { "type": "string" },
-                    "out_bundle_path": { "type": "string" }
+                    "out_bundle_path": { "type": "string" },
+                    "chimerax_session": { "type": "boolean" },
+                    "complex_name": { "type": "string" }
                 }
             },
             "outputSchema": {
@@ -451,10 +454,20 @@ fn handle_tool_call(
                 .get("target")
                 .and_then(|v| v.as_str())
                 .ok_or((-32602, "missing 'target'".to_string()))?;
-            let out_script = args
-                .get("out_script_path")
-                .and_then(|v| v.as_str())
-                .ok_or((-32602, "missing 'out_script_path'".to_string()))?;
+            let chimerax_session = args
+                .get("chimerax_session")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            // The ChimeraX session path owns its own directory, so it does not need a caller path
+            // and must not take one: the whole point is that the scene lands inside the export
+            // root that ChimeraX's sandbox allows.
+            let out_script = if chimerax_session {
+                ""
+            } else {
+                args.get("out_script_path")
+                    .and_then(|v| v.as_str())
+                    .ok_or((-32602, "missing 'out_script_path'".to_string()))?
+            };
 
             let rec_raw = sandbox
                 .read_string(Path::new(rec_path))
@@ -464,8 +477,34 @@ fn handle_tool_call(
             let lig = parse_single_ligand(sandbox, args).map_err(|e| (-32602, e))?;
             let hyde = score_pose_hyde(&rec, &lig).map_err(|e| (-32000, e.to_string()))?;
 
-            let written = match target {
-                "molcraft" | "chymera" => write_sandboxed_scene_package(
+            if chimerax_session {
+                if canonical_export_target(target) != Some("chimerax") {
+                    return Err((
+                        -32602,
+                        format!("chimerax_session requires target 'chimerax', got '{target}'"),
+                    ));
+                }
+                let complex_name = args
+                    .get("complex_name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("DockCraftComplex");
+                let bundle = write_chimerax_session_bundle(complex_name, &rec, &lig, &hyde, None)
+                    .map_err(|e| (-32000, e.to_string()))?;
+                return Ok(json!({
+                    "target": "chimerax",
+                    "written_files": [
+                        bundle.script_path.display().to_string(),
+                        bundle.receptor_path.display().to_string(),
+                        bundle.ligand_path.display().to_string(),
+                        bundle.bundle_path.display().to_string(),
+                    ],
+                    "scene_dir": bundle.scene_dir.display().to_string(),
+                    "chimerax_command": bundle.open_command,
+                }));
+            }
+
+            let written = match canonical_export_target(target).unwrap_or(target) {
+                "chimerax" | "pymol" => write_sandboxed_scene_package(
                     sandbox,
                     &SceneExportRequest {
                         target,
