@@ -86,6 +86,12 @@ The human-chosen box costs nothing in accuracy against a box centred on the answ
 
 **The command vocabulary sent to ChimeraX is closed.** A ChimeraX command is arbitrary code in ChimeraX's process -- `runscript` executes Python -- so `ChimeraXCommand` is an enum rendered from typed parts, there is no `run(&str)` in the public surface, the host is fixed to 127.0.0.1 in code, and every path a command can name is checked to live under the export root before the request is sent.
 
+### Sending results back to ChemCraft
+
+`dockcraft-cli screen --sidecar` also writes a versioned `*.dockcraft.json` next to the docked poses, under `$XDG_DATA_HOME/ChemCraft/dockcraft_results`, mirroring the `$XDG_DATA_HOME/DockCraft/chemcraft_handoff` directory ChemCraft uses for the other direction. `chemcraft-cli dock-results` folds it back into a project's SAR table under `DockCraft_*` keys, joining on the SAR row id and falling back to the canonical SMILES, so matched molecular pairs and activity cliffs can be computed on a docking score beside the measured one.
+
+DockCraft deliberately does not write a `.chemcraft` project: that would mean fabricating ChemCraft's internal types and the two schemas would drift apart. Each tool writes only its own format, and the merge belongs to whoever owns the document.
+
 ### Known limitations
 
 - Pocket detection ranks by druggability, not by the site you want. Measured against the native ligand's centroid, the best automatic pocket is 7.9 A off on 3PTB and 11.2 A off on 3ERT. Either give the engine a `GridBox` you have chosen, or point at the site in ChimeraX and let DockCraft take the box from your selection (see below).
