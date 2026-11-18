@@ -3,6 +3,7 @@
 pub mod admet;
 pub mod campaign;
 pub mod chimerax;
+pub mod chimerax_rest;
 pub mod export;
 pub mod sandbox;
 
@@ -13,8 +14,12 @@ pub use campaign::{
     load_ligand_library_bytes, measured_pic50_of, run_screening_campaign,
 };
 pub use chimerax::{
-    ChimeraXError, ChimeraXSceneBundle, default_chimerax_export_dir, is_chimerax_available,
-    launch_chimerax_for_scene, write_chimerax_session_bundle,
+    ChimeraXError, ChimeraXSceneBundle, SelectionBox, default_chimerax_export_dir,
+    grid_box_from_chimerax_selection, is_chimerax_available, launch_chimerax_for_scene,
+    write_chimerax_session_bundle,
+};
+pub use chimerax_rest::{
+    ChimeraXCommand, ChimeraXReply, ChimeraXRest, DEFAULT_REST_PORT, RestError,
 };
 pub use export::{
     InteropSceneBundle, SceneExportRequest, build_chimerax_export, build_pymol_export,

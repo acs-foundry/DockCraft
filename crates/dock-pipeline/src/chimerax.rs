@@ -33,6 +33,10 @@ pub enum ChimeraXError {
     Sandbox(#[from] SandboxError),
     #[error("could not launch `chimerax` (scene written to {scene_dir}): {msg}")]
     Launch { scene_dir: String, msg: String },
+    #[error("live ChimeraX channel: {0}")]
+    Rest(String),
+    #[error("nothing is selected in ChimeraX; pick the binding-site residues first")]
+    EmptySelection,
 }
 
 /// Where a scene was written, and the command that makes ChimeraX show it.
@@ -176,4 +180,113 @@ pub fn launch_chimerax_for_scene(
             msg: e.to_string(),
         })?;
     Ok(bundle)
+}
+
+/// A docking box derived from what the person has selected in ChimeraX.
+#[derive(Debug, Clone)]
+pub struct SelectionBox {
+    pub grid_box: pocket_detect::GridBox,
+    /// Residues ChimeraX reported as selected, as `A:189 ASP`.
+    pub residues: Vec<String>,
+    pub heavy_atoms: usize,
+    /// Where the selection's PDB was written, kept for inspection.
+    pub selection_pdb: PathBuf,
+}
+
+/// Builds a docking box from the current ChimeraX selection.
+///
+/// This is the answer to the pocket detector picking the wrong site: it ranks cavities by
+/// druggability, and on 3ERT the best-scoring one sits 22 A from the estrogen site. A person
+/// looking at the structure already knows where the site is, so let them point at it.
+///
+/// The selection is pulled across as a PDB written by ChimeraX into the export root and parsed
+/// here, rather than scraped out of `info selection` text: the parser already exists and is
+/// tested, and a format is a better interface than a log.
+///
+/// `padding` is added around the selected atoms' bounding box. Around a binding-site residue
+/// shell, 4-5 A is a reasonable starting point.
+pub fn grid_box_from_chimerax_selection(
+    client: &crate::chimerax_rest::ChimeraXRest,
+    scene_dir: &Path,
+    padding: f64,
+) -> Result<SelectionBox, ChimeraXError> {
+    use crate::chimerax_rest::ChimeraXCommand;
+
+    let selection_pdb = scene_dir.join("selection.pdb");
+    let _ = std::fs::remove_file(&selection_pdb);
+
+    let info = client
+        .send(&ChimeraXCommand::InfoSelection)
+        .map_err(|e| ChimeraXError::Rest(e.to_string()))?;
+    let mut residues: Vec<String> = info
+        .notes
+        .iter()
+        .flat_map(|note| note.lines())
+        .filter_map(parse_residue_line)
+        .collect();
+    residues.sort_unstable();
+    residues.dedup();
+    if residues.is_empty() {
+        return Err(ChimeraXError::EmptySelection);
+    }
+
+    client
+        .send(&ChimeraXCommand::SaveSelectionPdb(selection_pdb.clone()))
+        .map_err(|e| ChimeraXError::Rest(e.to_string()))?;
+
+    let text = std::fs::read_to_string(&selection_pdb).map_err(|e| ChimeraXError::Directory {
+        dir: selection_pdb.display().to_string(),
+        msg: e.to_string(),
+    })?;
+    let selection = struct_core::parse_pdb(&text, true)
+        .map_err(|e| ChimeraXError::Rest(format!("could not parse the selection PDB: {e}")))?;
+
+    let heavy: Vec<[f64; 3]> = selection
+        .atoms
+        .iter()
+        .filter(|a| a.is_heavy())
+        .map(|a| a.coords)
+        .collect();
+    if heavy.is_empty() {
+        return Err(ChimeraXError::EmptySelection);
+    }
+
+    let mut lo = [f64::INFINITY; 3];
+    let mut hi = [f64::NEG_INFINITY; 3];
+    for p in &heavy {
+        for k in 0..3 {
+            lo[k] = lo[k].min(p[k]);
+            hi[k] = hi[k].max(p[k]);
+        }
+    }
+    let center = [
+        (lo[0] + hi[0]) * 0.5,
+        (lo[1] + hi[1]) * 0.5,
+        (lo[2] + hi[2]) * 0.5,
+    ];
+    let size = [
+        (hi[0] - lo[0]) + 2.0 * padding,
+        (hi[1] - lo[1]) + 2.0 * padding,
+        (hi[2] - lo[2]) + 2.0 * padding,
+    ];
+    let grid_box = pocket_detect::GridBox::from_center_size(center, size, 0.375)
+        .map_err(|e| ChimeraXError::Rest(e.to_string()))?;
+
+    Ok(SelectionBox {
+        grid_box,
+        residues,
+        heavy_atoms: heavy.len(),
+        selection_pdb,
+    })
+}
+
+/// Pulls `A:189 ASP` out of a ChimeraX `info selection level residue` line, which reads
+/// `residue id #1/A:189 name ASP index 170`.
+fn parse_residue_line(line: &str) -> Option<String> {
+    let rest = line.trim().strip_prefix("residue id ")?;
+    let mut parts = rest.split_whitespace();
+    let spec = parts.next()?;
+    let chain_res = spec.split('/').nth(1)?;
+    let name = rest.split(" name ").nth(1)?.split_whitespace().next()?;
+    Some(format!("{chain_res} {name}"))
 }

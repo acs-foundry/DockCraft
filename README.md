@@ -62,9 +62,33 @@ Twenty hand-picked compounds are a sanity check, not a validation: a real one ne
 
 `crates/dock-pipeline/tests/affinity_accuracy.rs`. **The reported kcal/mol values are scores, not predicted affinities, and `estimated_ki_nm` is derived from one of them rather than measured.** Against published affinities for the four benchmark complexes the mean absolute error is 4.25 kcal/mol for Vina (worst 10.69) and 3.60 for HYDE (worst 6.98), dominated by streptavidin-biotin, which is outside the applicability domain of every empirical scoring function. Excluding it, both are around 2-2.5 kcal/mol, which is still three orders of magnitude in Ki. Both rank the micromolar complex last. Four complexes cannot establish a correlation and none is claimed.
 
+### Taking the docking box from a ChimeraX selection
+
+Open the receptor, select the binding-site residues on screen, and let DockCraft read the selection back over ChimeraX's own REST remote control:
+
+```bash
+dockcraft-cli chimerax --receptor receptor.pdb --ligand pose.sdf --name MySite --launch
+# inside ChimeraX, once per session:
+#   remotecontrol rest start port 60958 json true
+#   select /A:346,347,350,353,387,388,391,394,404,421,424,428,521,524,525,528
+dockcraft-cli screen --receptor receptor.pdb --library lib.sdf --out out.csv \
+                     --box-from-chimerax --box-padding 5
+```
+
+Measured on 2026-11-18 with 3 randomized-torsion seeds per box:
+
+| | Selection box centre vs native | Docking into the selection box | Docking into a box centred on the answer |
+|---|---|---|---|
+| 3PTB | 4.56 A | 3/3 under 2 A, mean **1.120 A** | 3/3, mean 1.129 A |
+| 3ERT | 2.48 A | 3/3 under 2 A, mean **1.521 A** | 3/3, mean 1.491 A |
+
+The human-chosen box costs nothing in accuracy against a box centred on the answer, and unlike that box it does not need to know the answer in advance. `crates/dock-pipeline/tests/live_chimerax_selection.rs` reproduces it.
+
+**The command vocabulary sent to ChimeraX is closed.** A ChimeraX command is arbitrary code in ChimeraX's process -- `runscript` executes Python -- so `ChimeraXCommand` is an enum rendered from typed parts, there is no `run(&str)` in the public surface, the host is fixed to 127.0.0.1 in code, and every path a command can name is checked to live under the export root before the request is sent.
+
 ### Known limitations
 
-- Pocket detection ranks by druggability, not by the site you want: on 3ERT the top-scoring pocket is 22 A from the estrogen site. Give the engine a `GridBox` you have chosen, or check which pocket you got.
+- Pocket detection ranks by druggability, not by the site you want. Measured against the native ligand's centroid, the best automatic pocket is 7.9 A off on 3PTB and 11.2 A off on 3ERT. Either give the engine a `GridBox` you have chosen, or point at the site in ChimeraX and let DockCraft take the box from your selection (see below).
 - Ring perception covers 3 to 8 members. Macrocycles are not perceived as rings.
 - Double-bond (`/`, `\\`) stereochemistry in SMILES is parsed and ignored; only tetrahedral `@`/`@@` is honoured.
 - HYDE is a per-atom interaction decomposition for inspection. Do not read its total as an affinity.

@@ -7,7 +7,8 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand, ValueEnum};
 use dock_engine::{DockingConfig, ScoringFunction};
 use dock_pipeline::{
-    DEFAULT_MAX_FILE_BYTES, PathSandbox, campaign_report_to_csv, is_chimerax_available,
+    ChimeraXRest, DEFAULT_MAX_FILE_BYTES, PathSandbox, campaign_report_to_csv,
+    default_chimerax_export_dir, grid_box_from_chimerax_selection, is_chimerax_available,
     launch_chimerax_for_scene, load_ligand_library_bytes, run_screening_campaign,
     write_chimerax_session_bundle,
 };
@@ -65,6 +66,13 @@ enum Commands {
         center: Vec<f64>,
         #[arg(long, value_delimiter = ',')]
         size: Vec<f64>,
+        /// Take the box from what is selected right now in a running ChimeraX, instead of
+        /// --center/--size. Select the binding-site residues on screen first.
+        #[arg(long)]
+        box_from_chimerax: bool,
+        /// Padding in angstroms around the selected atoms when --box-from-chimerax is used
+        #[arg(long, default_value_t = 5.0)]
+        box_padding: f64,
         #[arg(long, value_enum, default_value_t = CliScoring::Vina)]
         scoring: CliScoring,
         #[arg(long, default_value_t = 6)]
@@ -155,19 +163,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             out,
             center,
             size,
+            box_from_chimerax,
+            box_padding,
             scoring,
             exhaustiveness,
             max_ligands,
         } => {
-            if center.len() != 3 || size.len() != 3 {
-                return Err("--center and --size must be comma-separated 3-vectors x,y,z".into());
-            }
             let rec = read_receptor_file(&receptor, true)?;
-            let gbox = GridBox::from_center_size(
-                [center[0], center[1], center[2]],
-                [size[0], size[1], size[2]],
-                0.375,
-            )?;
+            let gbox = if box_from_chimerax {
+                let root = default_chimerax_export_dir();
+                std::fs::create_dir_all(&root)?;
+                let client = ChimeraXRest::with_default_port(root.clone());
+                let selection = grid_box_from_chimerax_selection(&client, &root, box_padding)?;
+                eprintln!(
+                    "Box from the ChimeraX selection: {} residues ({}), {} heavy atoms, centre [{:.2}, {:.2}, {:.2}], size [{:.1}, {:.1}, {:.1}]",
+                    selection.residues.len(),
+                    selection.residues.join(", "),
+                    selection.heavy_atoms,
+                    selection.grid_box.center[0],
+                    selection.grid_box.center[1],
+                    selection.grid_box.center[2],
+                    selection.grid_box.size[0],
+                    selection.grid_box.size[1],
+                    selection.grid_box.size[2],
+                );
+                selection.grid_box
+            } else {
+                if center.len() != 3 || size.len() != 3 {
+                    return Err(
+                        "--center and --size must be comma-separated 3-vectors x,y,z,                          or pass --box-from-chimerax"
+                            .into(),
+                    );
+                }
+                GridBox::from_center_size(
+                    [center[0], center[1], center[2]],
+                    [size[0], size[1], size[2]],
+                    0.375,
+                )?
+            };
             let bytes = std::fs::read(&library)?;
             let ext = library
                 .extension()
