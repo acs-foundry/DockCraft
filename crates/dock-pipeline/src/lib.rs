@@ -5,6 +5,7 @@ pub mod campaign;
 pub mod chimerax;
 pub mod chimerax_rest;
 pub mod export;
+pub mod results_sidecar;
 pub mod sandbox;
 
 pub use admet::{AdmetProfile, detect_sibling_clis, evaluate_admet};
@@ -24,6 +25,10 @@ pub use chimerax_rest::{
 pub use export::{
     InteropSceneBundle, SceneExportRequest, build_chimerax_export, build_pymol_export,
     canonical_export_target, write_sandboxed_scene_package,
+};
+pub use results_sidecar::{
+    ResultsSidecar, SIDECAR_FORMAT, SIDECAR_VERSION, SidecarError, SidecarRow, SidecarRun,
+    default_chemcraft_results_dir, write_results_sidecar,
 };
 pub use sandbox::{
     DEFAULT_MAX_FILE_BYTES, MAX_ZIP_DECOMPRESSED_BYTES, PathSandbox, SandboxError,

@@ -8,9 +8,9 @@ use clap::{Parser, Subcommand, ValueEnum};
 use dock_engine::{DockingConfig, ScoringFunction};
 use dock_pipeline::{
     ChimeraXRest, DEFAULT_MAX_FILE_BYTES, PathSandbox, campaign_report_to_csv,
-    default_chimerax_export_dir, grid_box_from_chimerax_selection, is_chimerax_available,
-    launch_chimerax_for_scene, load_ligand_library_bytes, run_screening_campaign,
-    write_chimerax_session_bundle,
+    default_chemcraft_results_dir, default_chimerax_export_dir, grid_box_from_chimerax_selection,
+    is_chimerax_available, launch_chimerax_for_scene, load_ligand_library_bytes,
+    run_screening_campaign, write_chimerax_session_bundle, write_results_sidecar,
 };
 use hyde_scorer::score_pose_hyde;
 use pocket_detect::GridBox;
@@ -79,6 +79,14 @@ enum Commands {
         exhaustiveness: usize,
         #[arg(long, default_value_t = 1000)]
         max_ligands: usize,
+        /// Also write a `*.dockcraft.json` results sidecar plus the docked poses, for ChemCraft
+        /// to fold back into its SAR table. Default directory:
+        /// $XDG_DATA_HOME/ChemCraft/dockcraft_results
+        #[arg(long)]
+        sidecar: bool,
+        /// Directory for the sidecar, overriding the default
+        #[arg(long)]
+        sidecar_dir: Option<PathBuf>,
     },
     /// Score a docked complex with Vina + HYDE per-atom desolvation/H-bond/steric breakdown
     ScorePose {
@@ -168,6 +176,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             scoring,
             exhaustiveness,
             max_ligands,
+            sidecar,
+            sidecar_dir,
         } => {
             let rec = read_receptor_file(&receptor, true)?;
             let gbox = if box_from_chimerax {
@@ -218,6 +228,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             let report = run_screening_campaign(&rec, &gbox, &lib, &cfg)?;
             std::fs::write(&out, campaign_report_to_csv(&report))?;
+
+            if sidecar {
+                let dir = sidecar_dir.unwrap_or_else(default_chemcraft_results_dir);
+                std::fs::create_dir_all(&dir)?;
+                let stem = library
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("screening");
+                let receptor_name = receptor
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("receptor");
+                let scoring_name = match scoring {
+                    CliScoring::Vina => "vina",
+                    CliScoring::Vinardo => "vinardo",
+                    CliScoring::Hybrid => "dockcraft-hybrid",
+                };
+                let path = write_results_sidecar(
+                    &report,
+                    receptor_name,
+                    &gbox,
+                    scoring_name,
+                    exhaustiveness,
+                    &dir,
+                    stem,
+                )?;
+                eprintln!("Results sidecar for ChemCraft: {}", path.display());
+            }
             println!(
                 "Screened {} compounds in {} ms -> {}",
                 report.results.len(),

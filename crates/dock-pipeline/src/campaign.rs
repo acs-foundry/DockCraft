@@ -263,6 +263,15 @@ fn push_chemcraft_row(item: &serde_json::Value, idx: usize, out: &mut Vec<Ligand
         return;
     };
 
+    // Keys for matching the results back to the row they came from. ChemCraft owns the canonical
+    // spelling of a structure, so its own string is the join key, with the row id as a tiebreaker.
+    mol.properties
+        .insert("ChemCraft_canonical_smiles".to_string(), smi.to_string());
+    if let Some(id) = item.get("id").and_then(serde_json::Value::as_u64) {
+        mol.properties
+            .insert("ChemCraft_row_id".to_string(), id.to_string());
+    }
+
     // Free-form property bag from the ChemCraft row.
     if let Some(props) = item.get("properties").and_then(|v| v.as_object()) {
         for (k, v) in props {

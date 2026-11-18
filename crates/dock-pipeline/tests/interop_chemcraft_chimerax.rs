@@ -195,3 +195,91 @@ fn pymol_and_chimerax_scripts_are_each_in_their_own_language()
     );
     Ok(())
 }
+
+#[test]
+fn results_sidecar_round_trips_the_join_keys_back_to_chemcraft()
+-> Result<(), Box<dyn std::error::Error>> {
+    use dock_pipeline::{
+        ResultsSidecar, SIDECAR_FORMAT, default_chemcraft_results_dir, run_screening_campaign,
+        write_results_sidecar,
+    };
+
+    // The results directory mirrors ChemCraft's own handoff directory, so the pair is symmetric.
+    let default_dir = default_chemcraft_results_dir().display().to_string();
+    assert!(
+        default_dir.contains("ChemCraft") && default_dir.ends_with("dockcraft_results"),
+        "unexpected results directory {default_dir}"
+    );
+
+    let rec_raw = std::fs::read_to_string(fixture("docking_benchmark/3ptb_trypsin.pdb"))?;
+    let mut rec = parse_pdb(&rec_raw, true)?;
+    prepare_receptor(&mut rec, true);
+    let lig_raw = std::fs::read_to_string(fixture("docking_benchmark/3ptb_benzamidine.sdf"))?;
+    let mut ben = parse_sdf_3d_with_limit(&lig_raw, 1)
+        .pop()
+        .ok_or("missing ligand")??;
+    perceive_all(&mut ben);
+    let gbox = pocket_detect::GridBox::from_ligand(&ben, 5.0)?;
+
+    let raw = std::fs::read(fixture("interop/trypsin_s1_series.chemcraft"))?;
+    let lib = load_ligand_library_bytes("chemcraft", &raw, 100)?;
+
+    let cfg = dock_engine::DockingConfig {
+        scoring: dock_engine::ScoringFunction::Vina,
+        exhaustiveness: 4,
+        ils_steps: 10,
+        bfgs_iters: 20,
+        ..Default::default()
+    };
+    let report = run_screening_campaign(&rec, &gbox, &lib, &cfg)?;
+
+    let tmp = std::env::temp_dir().join(format!("dockcraft_sidecar_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp)?;
+    let path = write_results_sidecar(&report, "3PTB", &gbox, "vina", 4, &tmp, "trypsin_s1")?;
+
+    let sidecar: ResultsSidecar = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+    assert_eq!(sidecar.format, SIDECAR_FORMAT);
+    assert_eq!(sidecar.rows.len(), 5);
+
+    for row in &sidecar.rows {
+        // The join key has to be ChemCraft's own canonical spelling, not one DockCraft invented:
+        // a merge that matched on anything else would silently drop rows.
+        assert!(
+            !row.canonical_smiles.is_empty(),
+            "{}: no canonical SMILES to join on",
+            row.name
+        );
+        assert!(
+            row.source_row_id.is_some(),
+            "{}: the SAR row id was not carried through",
+            row.name
+        );
+        // The measured potency goes back out untouched, so a reader can line computed against
+        // measured without a second lookup.
+        assert!(
+            row.measured_pic50.is_some(),
+            "{}: the measured pIC50 was lost on the return leg",
+            row.name
+        );
+        // Poses are referenced relatively, so the directory can be moved or copied whole.
+        assert!(!row.pose_sdf.starts_with('/'), "pose path is absolute");
+        let pose = tmp.join(&row.pose_sdf);
+        assert!(pose.is_file(), "{} was not written", pose.display());
+        let text = std::fs::read_to_string(&pose)?;
+        assert!(text.contains("$$$$"), "{}: not an SDF", pose.display());
+    }
+
+    let ids: Vec<u64> = sidecar
+        .rows
+        .iter()
+        .filter_map(|r| r.source_row_id)
+        .collect();
+    let mut sorted = ids.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(sorted.len(), ids.len(), "row ids are not unique: {ids:?}");
+
+    let _ = std::fs::remove_dir_all(&tmp);
+    Ok(())
+}
