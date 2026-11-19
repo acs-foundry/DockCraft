@@ -8,14 +8,22 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use struct_core::{MAX_LIGAND_ATOMS, Molecule3D};
+use struct_core::{MAX_LIGAND_ATOMS, Molecule3D, metal_chelation_tier};
 
 use crate::DockError;
+use crate::constraints::{
+    DockingConstraint, ResolvedConstraint, eval_constraints_and_grad, extract_flexible_sidechains,
+    resolve_constraints,
+};
 use crate::grid::{AffinityGridSet, AtomChannelKey};
 use crate::vina::{
     ScoreBreakdown, ScoringFunction, are_topologically_close, rotatable_penalty_divisor,
-    score_complex, vina_vdw_radius,
+    score_complex_with_options, vina_vdw_radius,
 };
+
+fn default_true() -> bool {
+    true
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DockingConfig {
@@ -26,6 +34,15 @@ pub struct DockingConfig {
     pub bfgs_iters: usize,
     pub min_rmsd_cluster: f64,
     pub seed: u64,
+    /// Enable AutoDock4Zn-inspired catalytic metal coordination when receptor has Zn/Mg/Fe/Mn/Ca.
+    #[serde(default = "default_true")]
+    pub metal_coordination: bool,
+    /// Optional pharmacophore spheres, template core tethers, or covalent warhead attachment.
+    #[serde(default)]
+    pub constraints: Vec<DockingConstraint>,
+    /// Optional flexible receptor sidechain residue specs (e.g. `"A:ASP189"`, `"A:TRP79"`).
+    #[serde(default)]
+    pub flex_residues: Vec<String>,
 }
 
 impl Default for DockingConfig {
@@ -38,6 +55,9 @@ impl Default for DockingConfig {
             bfgs_iters: 48,
             min_rmsd_cluster: 1.5,
             seed: 20_261_117,
+            metal_coordination: true,
+            constraints: Vec::new(),
+            flex_residues: Vec::new(),
         }
     }
 }
@@ -61,6 +81,9 @@ pub struct DockingReport {
     pub poses: Vec<DockingPose>,
     pub elapsed_ms: u128,
     pub total_evaluations: usize,
+    /// Adapted receptor coordinates when `flex_residues` is non-empty.
+    #[serde(default)]
+    pub flex_receptor: Option<Molecule3D>,
 }
 
 #[derive(Debug, Clone)]
@@ -69,9 +92,11 @@ struct LigandTemplate {
     heavy_indices: Vec<usize>,
     heavy_channels: Vec<usize>,
     heavy_charges: Vec<f64>,
+    heavy_tiers: Vec<u8>,
     intra_pairs: Vec<(usize, usize, f64)>, // (heavy_i, heavy_j, r_opt)
     torsions: Vec<(usize, usize, Vec<usize>)>, // (u, v, moving_atoms) sorted root-to-leaf
     rot_div: f64,
+    constraints: Vec<ResolvedConstraint>,
 }
 
 #[derive(Debug, Clone)]
@@ -235,10 +260,20 @@ fn random_rotation(rng: &mut StdRng) -> [[f64; 3]; 3] {
 }
 
 impl LigandTemplate {
+    #[allow(dead_code)]
     fn from_ligand(
         ligand: &Molecule3D,
         grids: &AffinityGridSet,
         sf: ScoringFunction,
+    ) -> Option<Self> {
+        Self::from_ligand_with_constraints(ligand, grids, sf, Vec::new())
+    }
+
+    fn from_ligand_with_constraints(
+        ligand: &Molecule3D,
+        grids: &AffinityGridSet,
+        sf: ScoringFunction,
+        constraints: Vec<ResolvedConstraint>,
     ) -> Option<Self> {
         let core_ids = ligand.rigid_core_indices();
         if core_ids.is_empty() {
@@ -274,13 +309,21 @@ impl LigandTemplate {
         let mut heavy_indices = Vec::new();
         let mut heavy_channels = Vec::new();
         let mut heavy_charges = Vec::new();
+        let mut heavy_tiers = Vec::new();
         let mut heavy_radii = Vec::new();
         for (i, a) in ligand.atoms.iter().enumerate() {
             if a.is_heavy() {
-                let ch = grids.channel_index(AtomChannelKey::from_atom(a))?;
+                let tier = if grids.metal_coordination {
+                    metal_chelation_tier(ligand, i)
+                } else {
+                    0
+                };
+                let key = AtomChannelKey::from_mol_atom(ligand, i, grids.metal_coordination);
+                let ch = grids.channel_index(key)?;
                 heavy_indices.push(i);
                 heavy_channels.push(ch);
                 heavy_charges.push(a.charge);
+                heavy_tiers.push(tier);
                 heavy_radii.push(vina_vdw_radius(a.ad4_type, sf));
             }
         }
@@ -312,9 +355,11 @@ impl LigandTemplate {
             heavy_indices,
             heavy_channels,
             heavy_charges,
+            heavy_tiers,
             intra_pairs,
             torsions,
             rot_div,
+            constraints,
         })
     }
 
@@ -434,8 +479,10 @@ impl LigandTemplate {
             }
         }
 
+        let e_cons = eval_constraints_and_grad(&self.constraints, world_coords, Some(atom_grads));
+
         let inv_div = 1.0 / self.rot_div;
-        let energy = (e_inter + e_intra) * inv_div;
+        let energy = (e_inter + e_intra + e_cons) * inv_div;
 
         let mut g_trans = [0.0_f64; 3];
         let mut g_omega = [0.0_f64; 3];
@@ -810,14 +857,37 @@ pub fn dock_ligand(
             limit: MAX_LIGAND_ATOMS,
         });
     }
+    let enable_metal =
+        config.metal_coordination || config.scoring == ScoringFunction::DockCraftHybrid;
     let mut channels = Vec::with_capacity(ligand.atoms.len());
-    for a in &ligand.atoms {
+    for (i, a) in ligand.atoms.iter().enumerate() {
         if a.is_heavy() {
-            channels.push(AtomChannelKey::from_atom(a));
+            channels.push(AtomChannelKey::from_mol_atom(ligand, i, enable_metal));
+        }
+    }
+    let (_, mut excluded) = extract_flexible_sidechains(receptor, &config.flex_residues);
+    let mut has_exclusions = excluded.iter().any(|&x| x);
+    for c in &config.constraints {
+        if let Some((cov_r, _)) = c.covalent_pair()
+            && cov_r < excluded.len()
+        {
+            excluded[cov_r] = true;
+            has_exclusions = true;
         }
     }
     let t_total = Instant::now();
-    let grids = AffinityGridSet::build(receptor, grid_box, &channels, config.scoring)?;
+    let grids = AffinityGridSet::build_with_options(
+        receptor,
+        grid_box,
+        &channels,
+        config.scoring,
+        enable_metal,
+        if has_exclusions {
+            Some(excluded.as_slice())
+        } else {
+            None
+        },
+    )?;
     let mut report = dock_ligand_with_grids(receptor, ligand, &grids, config)?;
     // `dock_ligand_with_grids` times the search only, which is the right figure when a campaign
     // amortises one grid over a whole library. A single `dock_ligand` call pays for the grid too,
@@ -839,17 +909,48 @@ pub fn dock_ligand_with_grids(
         });
     }
     let start = Instant::now();
-    let tpl = LigandTemplate::from_ligand(ligand, grids, config.scoring)
-        .ok_or(DockError::EmptyStructure)?;
+    let enable_metal = grids.metal_coordination
+        || config.metal_coordination
+        || config.scoring == ScoringFunction::DockCraftHybrid;
+    let resolved_constraints = resolve_constraints(receptor, ligand, &config.constraints);
+    let covalent_pair = config
+        .constraints
+        .iter()
+        .find_map(DockingConstraint::covalent_pair);
+    let (flex_sidechains, _) = extract_flexible_sidechains(receptor, &config.flex_residues);
+
+    let tpl = LigandTemplate::from_ligand_with_constraints(
+        ligand,
+        grids,
+        config.scoring,
+        resolved_constraints,
+    )
+    .ok_or(DockError::EmptyStructure)?;
 
     let min_c = grids.grid_box.min_corner();
     let max_c = grids.grid_box.max_corner();
     let center = grids.grid_box.center;
     let n_t = tpl.torsions.len();
 
-    // Stage 1: fast rigid+conformer coarse grid scan across ALL (anchor x 24 SO(3) x conformer) combos,
-    // then L-BFGS minimize top diverse candidates in parallel.
-    let mut anchors = grids.cavity_anchor_points(8);
+    // Stage 1: fast rigid+conformer coarse grid scan across spatially diverse anchors (up to 16,
+    // plus priority constraint/covalent/metal targets) x 24 SO(3) x conformer bank.
+    let mut anchors = grids.cavity_anchor_points(16);
+    for rc in &tpl.constraints {
+        match rc {
+            ResolvedConstraint::Pharmacophore { center: c, .. } => anchors.insert(0, *c),
+            ResolvedConstraint::Covalent { rec_coords, .. } => anchors.insert(0, *rec_coords),
+            ResolvedConstraint::CoreTether { atom_targets, .. } if !atom_targets.is_empty() => {
+                let mut s = [0.0; 3];
+                for &(_, p) in atom_targets {
+                    for k in 0..3 {
+                        s[k] += p[k] / (atom_targets.len() as f64);
+                    }
+                }
+                anchors.insert(0, s);
+            }
+            _ => {}
+        }
+    }
     if !anchors.iter().any(|p| {
         (p[0] - center[0]).powi(2) + (p[1] - center[1]).powi(2) + (p[2] - center[2]).powi(2) < 1.5
     }) {
@@ -861,10 +962,10 @@ pub fn dock_ligand_with_grids(
     let bank_size = (6 + 3 * n_t).clamp(6, 40);
     let conf_bank = generate_clash_free_conformers(&tpl, bank_size, config.seed);
 
-    let mut raw_probes: Vec<(f64, usize, RigState)> =
+    let mut raw_probes: Vec<(f64, usize, usize, RigState)> =
         Vec::with_capacity(anchors.len() * rots.len() * conf_bank.len());
     let mut coords_tmp = vec![[0.0; 3]; tpl.local_coords.len()];
-    for &tr in &anchors {
+    for (ai_idx, &tr) in anchors.iter().enumerate() {
         for &rm in &rots {
             for (ci, tors) in conf_bank.iter().enumerate() {
                 let st = RigState {
@@ -882,37 +983,37 @@ pub fn dock_ligand_with_grids(
                     );
                     e += ae;
                 }
-                e = (e + tpl.eval_intra_energy(&coords_tmp)) / tpl.rot_div;
+                let e_cons = eval_constraints_and_grad(&tpl.constraints, &coords_tmp, None);
+                e = (e + tpl.eval_intra_energy(&coords_tmp) + e_cons) / tpl.rot_div;
                 if e.is_finite() {
-                    raw_probes.push((e, ci, st));
+                    raw_probes.push((e, ai_idx, ci, st));
                 }
             }
         }
     }
     raw_probes.sort_by(|a, b| a.0.total_cmp(&b.0));
 
-    // Basin diversity, not trajectory depth, is what the failing cases were short of: on
-    // 1HSG/indinavir the seed that converged to a 5.83 A decoy at -9.53 kcal/mol stayed there at
-    // 200 ILS steps and 24 retained modes, and reached 0.98 A / -10.49 kcal/mol as soon as the
-    // walker count went from 10 to 16. A ligand with many rotatable bonds therefore gets a floor
-    // on independent walkers; an explicitly higher `exhaustiveness` still wins.
-    let n_walkers = config.exhaustiveness.max(1).max((4 + 2 * n_t).min(32));
-    let n_stage1 = (n_walkers * 5).clamp(24, 64).max(2 * conf_bank.len());
+    let n_walkers = config.exhaustiveness.max(1).max((6 + 2 * n_t).min(32));
+    let n_stage1 = (n_walkers * 5).clamp(32, 80).max(2 * conf_bank.len());
     let mut rng_s1 = StdRng::seed_from_u64(config.seed ^ 0x5151_5151);
-    // Stratify by conformer: take the best placements of each bank member in turn before taking
-    // the second-best of any of them. Ranking probes by raw energy alone lets the single most
-    // compact conformer fill every Stage-1 slot, which is what confined the old search to the
-    // basin of its input conformation.
+    // Stratify Stage-1 seeds across conformer bank members + top-3 orientations from each of
+    // the top-4 deepest cavity/constraint anchors so tight buried pockets are never starved
+    // while broad multi-subpocket clefts stay uniformly covered.
+    let top_anchor_slots = anchors.len().min(4);
+    let mut per_anchor: Vec<Vec<RigState>> = vec![Vec::new(); top_anchor_slots];
     let mut per_conf: Vec<Vec<RigState>> = vec![Vec::new(); conf_bank.len()];
-    for (_, ci, st) in raw_probes {
+    for (_, ai_idx, ci, st) in raw_probes {
+        if ai_idx < top_anchor_slots && per_anchor[ai_idx].len() < 3 {
+            per_anchor[ai_idx].push(st.clone());
+        }
         if ci < per_conf.len() && per_conf[ci].len() < 4 {
             per_conf[ci].push(st);
         }
     }
     let mut stage1_seeds: Vec<RigState> = Vec::with_capacity(n_stage1);
-    for round in 0..4 {
-        for slots in per_conf.iter() {
-            if stage1_seeds.len() >= n_stage1 / 2 {
+    for round in 0..3 {
+        for slots in &per_anchor {
+            if stage1_seeds.len() >= n_stage1 / 4 {
                 break;
             }
             if let Some(st) = slots.get(round) {
@@ -920,7 +1021,17 @@ pub fn dock_ligand_with_grids(
             }
         }
     }
-    // Fill remaining Stage-1 slots with random pocket explorations so novel basins are always sampled
+    for round in 0..4 {
+        for slots in &per_conf {
+            if stage1_seeds.len() >= (n_stage1 * 2) / 3 {
+                break;
+            }
+            if let Some(st) = slots.get(round) {
+                stage1_seeds.push(st.clone());
+            }
+        }
+    }
+    // Fill remaining Stage-1 slots uniformly across all cavity anchors so broad clefts are fully explored
     while stage1_seeds.len() < n_stage1 {
         let tr = anchors[rng_s1.gen_range(0..anchors.len())];
         let tors = conf_bank[rng_s1.gen_range(0..conf_bank.len())].clone();
@@ -958,9 +1069,6 @@ pub fn dock_ligand_with_grids(
     }
     ranked_s1.sort_by(|a, b| a.0.total_cmp(&b.0));
 
-    // Distinct-basin threshold: 1.25 A apart is the same basin for a 45-heavy-atom ligand, so it
-    // grows with ligand flexibility. Without this the "diverse" Stage-1 basins all sat in one
-    // region of the pocket.
     let basin_sep = 1.25 + 0.06 * n_t as f64;
     let mut basin_seeds: Vec<(f64, RigState)> = Vec::new();
     for (e, st, cb) in &ranked_s1 {
@@ -987,14 +1095,12 @@ pub fn dock_ligand_with_grids(
         ));
     }
 
-    // Stage 2: Parallel Iterated Local Search starting from diverse Stage-1 basins + pocket exploration
-    // The number of basin hops a walker needs grows with the dimensionality of the torsional
-    // space, not additively with it. Measured on 1HSG/indinavir (13 rotatable bonds): 31 ILS
-    // steps per walker converge to a decoy basin at -9.2 kcal/mol in 5/5 seeds, 128 steps reach
-    // the crystal basin at -10.56 kcal/mol, and the wall time is nearly unchanged because the
-    // walkers run in parallel and the grid build dominates.
-    let eff_ils = config.ils_steps.max(24 + 8 * n_t);
-    let eff_bfgs = config.bfgs_iters.max(45 + 3 * n_t);
+    // Stage 2: Parallel Vina-style Single-DOF Iterated Local Search starting from diverse Stage-1 basins.
+    // Mutating ONE degree of freedom at a time (translation OR rotation OR a single torsion) lets
+    // elongated multi-ring ligands (e.g. Imatinib 1IEP, Erlotinib 1M17, ESR1 modulators) thread
+    // smoothly down narrow kinase/steroid channels without simultaneously slamming into pocket walls.
+    let eff_ils = config.ils_steps.max(36 + 11 * n_t);
+    let eff_bfgs = config.bfgs_iters.max(48 + 3 * n_t);
 
     type WalkerCand = (f64, RigState, Vec<[f64; 3]>);
     let walker_results: Vec<(Vec<WalkerCand>, usize)> = (0..n_walkers)
@@ -1013,12 +1119,8 @@ pub fn dock_ligand_with_grids(
             tpl.apply_state(&curr_state, &mut coords_buf);
             candidates.push((curr_e, curr_state.clone(), coords_buf.clone()));
 
-            let temp_kt = 1.4_f64;
-            // A walker that has not improved for this many consecutive steps is in a dead end;
-            // restarting it as a fresh basin explorer is worth more than the rest of its budget.
-            // Measured on 1HSG/indinavir: without restarts individual seeds park at a 10.4 A
-            // decoy and stay there however long the trajectory runs.
-            let stall_limit = (8 + n_t).min(24);
+            let temp_kt = 1.25_f64;
+            let stall_limit = (12 + n_t).min(28);
             let mut since_improve = 0usize;
             let mut best_e = curr_e;
             for step in 0..eff_ils {
@@ -1045,41 +1147,65 @@ pub fn dock_ligand_with_grids(
                     continue;
                 }
                 let mut mutated = curr_state.clone();
-                if step % 5 == 0 {
-                    // Occasional pocket anchor jump / large reorientation
+                let u_move: f64 = rng.r#gen();
+                if step > 0 && step % 20 == 0 {
+                    // Periodic pocket anchor jump without interrupting short multi-torsion descents
                     let anchor = anchors[rng.gen_range(0..anchors.len())];
                     mutated.translation = [
-                        (anchor[0] + (rng.r#gen::<f64>() - 0.5) * 2.2)
+                        (anchor[0] + (rng.r#gen::<f64>() - 0.5) * 2.4)
                             .clamp(min_c[0] + 1.0, max_c[0] - 1.0),
-                        (anchor[1] + (rng.r#gen::<f64>() - 0.5) * 2.2)
+                        (anchor[1] + (rng.r#gen::<f64>() - 0.5) * 2.4)
                             .clamp(min_c[1] + 1.0, max_c[1] - 1.0),
-                        (anchor[2] + (rng.r#gen::<f64>() - 0.5) * 2.2)
+                        (anchor[2] + (rng.r#gen::<f64>() - 0.5) * 2.4)
                             .clamp(min_c[2] + 1.0, max_c[2] - 1.0),
                     ];
                     mutated.rot_mat = random_rotation(&mut rng);
                     if n_t > 0 {
                         mutated.torsions = conf_bank[rng.gen_range(0..conf_bank.len())].clone();
                     }
-                } else {
-                    let amp = if step % 3 == 0 { 1.8 } else { 0.9 };
-                    for k in 0..3 {
-                        mutated.translation[k] = (mutated.translation[k]
-                            + (rng.r#gen::<f64>() - 0.5) * 2.0 * amp)
-                            .clamp(min_c[k] + 1.0, max_c[k] - 1.0);
-                    }
-                    let rot_kick = [
-                        (rng.r#gen::<f64>() - 0.5) * 1.1,
-                        (rng.r#gen::<f64>() - 0.5) * 1.1,
-                        (rng.r#gen::<f64>() - 0.5) * 1.1,
-                    ];
-                    mutated.rot_mat = mat3_mul(rot_from_axis_angle(rot_kick), mutated.rot_mat);
-                    if n_t > 0 {
-                        let k_tors = rng.gen_range(1..=n_t.min(3));
-                        for _ in 0..k_tors {
-                            let tidx = rng.gen_range(0..n_t);
+                } else if u_move < 0.72 {
+                    // Official AutoDock Vina single-DOF move: mutate ONLY translation OR rotation OR ONE torsion
+                    let which = rng.gen_range(0..(2 + n_t));
+                    if which == 0 {
+                        let amp = 2.0_f64;
+                        for k in 0..3 {
+                            mutated.translation[k] = (mutated.translation[k]
+                                + (rng.r#gen::<f64>() - 0.5) * 2.0 * amp)
+                                .clamp(min_c[k] + 1.0, max_c[k] - 1.0);
+                        }
+                    } else if which == 1 {
+                        let rot_kick = [
+                            (rng.r#gen::<f64>() - 0.5) * 1.6,
+                            (rng.r#gen::<f64>() - 0.5) * 1.6,
+                            (rng.r#gen::<f64>() - 0.5) * 1.6,
+                        ];
+                        mutated.rot_mat = mat3_mul(rot_from_axis_angle(rot_kick), mutated.rot_mat);
+                    } else {
+                        let tidx = which - 2;
+                        if rng.r#gen::<f64>() < 0.5 {
+                            mutated.torsions[tidx] =
+                                (rng.r#gen::<f64>() - 0.5) * std::f64::consts::TAU;
+                        } else {
                             mutated.torsions[tidx] +=
                                 (rng.r#gen::<f64>() - 0.5) * std::f64::consts::PI;
                         }
+                    }
+                } else {
+                    // Gentle coupled local move for concerted pocket settlement
+                    for k in 0..3 {
+                        mutated.translation[k] = (mutated.translation[k]
+                            + (rng.r#gen::<f64>() - 0.5) * 1.4)
+                            .clamp(min_c[k] + 1.0, max_c[k] - 1.0);
+                    }
+                    let rot_kick = [
+                        (rng.r#gen::<f64>() - 0.5) * 0.65,
+                        (rng.r#gen::<f64>() - 0.5) * 0.65,
+                        (rng.r#gen::<f64>() - 0.5) * 0.65,
+                    ];
+                    mutated.rot_mat = mat3_mul(rot_from_axis_angle(rot_kick), mutated.rot_mat);
+                    if n_t > 0 {
+                        let tidx = rng.gen_range(0..n_t);
+                        mutated.torsions[tidx] += (rng.r#gen::<f64>() - 0.5) * 1.2;
                     }
                 }
 
@@ -1118,7 +1244,8 @@ pub fn dock_ligand_with_grids(
 
     all_candidates.sort_by(|a, b| a.0.total_cmp(&b.0));
 
-    // RMSD clustering + deep Stage-3 L-BFGS polish + exact pairwise re-scoring
+    // Stage 3: RMSD clustering + deep L-BFGS polish + optional flexible sidechain rotamer optimization
+    // + exact pairwise re-scoring + symmetry-aware deduplication.
     let mut cluster_states: Vec<(RigState, Vec<[f64; 3]>)> = Vec::new();
     for (_grid_e, mut st, mut coords) in all_candidates {
         let distinct = cluster_states.iter().all(|(_, kept)| {
@@ -1126,7 +1253,7 @@ pub fn dock_ligand_with_grids(
         });
         if distinct {
             let mut polish_ev = 0usize;
-            let _ = local_minimize(&tpl, grids, &mut st, 45, false, &mut polish_ev);
+            let _ = local_minimize(&tpl, grids, &mut st, 50, false, &mut polish_ev);
             total_evals += polish_ev;
             tpl.apply_state(&st, &mut coords);
             cluster_states.push((st, coords));
@@ -1136,31 +1263,71 @@ pub fn dock_ligand_with_grids(
         }
     }
 
-    let mut exact_poses: Vec<(f64, Molecule3D, ScoreBreakdown)> =
+    let mut exact_poses: Vec<(f64, f64, Molecule3D, ScoreBreakdown, Option<Molecule3D>)> =
         Vec::with_capacity(cluster_states.len());
     for (_, coords) in cluster_states {
         let mut mol = ligand.clone();
         for (atom, c) in mol.atoms.iter_mut().zip(coords.iter()) {
             atom.coords = *c;
         }
-        let bd = score_complex(receptor, &mol, config.scoring);
-        exact_poses.push((bd.total_affinity_kcal, mol, bd));
+        let adapted_rec = if !flex_sidechains.is_empty() {
+            let mut rec_copy = receptor.clone();
+            for sc in &flex_sidechains {
+                let best_angs = sc.optimize_rotamer(
+                    &rec_copy,
+                    &mol,
+                    &tpl.heavy_indices,
+                    &tpl.heavy_tiers,
+                    &coords,
+                    config.scoring,
+                    enable_metal,
+                );
+                let moved = sc.posed_distal_atoms(&best_angs);
+                for (li, moved_atom) in sc.rec_atom_indices.iter().skip(2).zip(moved.iter()) {
+                    if let Some(target_atom) = rec_copy.atoms.get_mut(*li) {
+                        target_atom.coords = moved_atom.coords;
+                    }
+                }
+            }
+            Some(rec_copy)
+        } else {
+            None
+        };
+        let eval_rec = adapted_rec.as_ref().unwrap_or(receptor);
+        let bd =
+            score_complex_with_options(eval_rec, &mol, config.scoring, enable_metal, covalent_pair);
+        let e_cons = eval_constraints_and_grad(&tpl.constraints, &coords, None);
+        // Rank by exact affinity + mild internal steric penalty + any constraint violation penalty
+        let sort_key = bd.total_affinity_kcal + (0.35 * bd.intra_kcal + e_cons) / tpl.rot_div;
+        exact_poses.push((sort_key, bd.total_affinity_kcal, mol, bd, adapted_rec));
     }
 
     exact_poses.sort_by(|a, b| a.0.total_cmp(&b.0));
-    exact_poses.truncate(config.num_modes);
 
-    let best_coords: Option<Vec<[f64; 3]>> = exact_poses
-        .first()
-        .map(|p| p.1.atoms.iter().map(|a| a.coords).collect());
+    // Final symmetry-aware deduplication so symmetric phenyl/carboxylate flips collapse cleanly
+    let mut deduped: Vec<(f64, Molecule3D, ScoreBreakdown, Option<Molecule3D>)> =
+        Vec::with_capacity(config.num_modes);
+    for (_, aff, mol, bd, rec_opt) in exact_poses {
+        let is_distinct = deduped.iter().all(|(_, kept, _, _)| {
+            kept.rmsd_heavy_symmetric(&mol).unwrap_or(99.0) >= config.min_rmsd_cluster * 0.75
+        });
+        if is_distinct {
+            deduped.push((aff, mol, bd, rec_opt));
+            if deduped.len() >= config.num_modes {
+                break;
+            }
+        }
+    }
 
-    let poses = exact_poses
+    let best_mol = deduped.first().map(|p| p.1.clone());
+    let best_flex_rec = deduped.first().and_then(|p| p.3.clone());
+
+    let poses = deduped
         .into_iter()
         .enumerate()
-        .map(|(i, (aff, mut mol, bd))| {
-            let rmsd_to_best = if let Some(ref ref_c) = best_coords {
-                let c: Vec<[f64; 3]> = mol.atoms.iter().map(|a| a.coords).collect();
-                heavy_rmsd(ref_c, &c, &tpl.heavy_indices)
+        .map(|(i, (aff, mut mol, bd, _))| {
+            let rmsd_to_best = if let Some(ref best) = best_mol {
+                best.rmsd_heavy_symmetric(&mol).unwrap_or(0.0)
             } else {
                 0.0
             };
@@ -1182,6 +1349,7 @@ pub fn dock_ligand_with_grids(
         poses,
         elapsed_ms: start.elapsed().as_millis(),
         total_evaluations: total_evals,
+        flex_receptor: best_flex_rec,
     })
 }
 
@@ -1386,6 +1554,7 @@ mod tests {
             a.hydrophobic = false;
             a
         });
+        let h4 = native.add_atom(Atom3D::new(6, "H", [-1.0, 2.2, 0.0]));
         native
             .add_bond(a0, a1, BondOrder::Single)
             .ok_or(DockError::EmptyStructure)?;
@@ -1397,6 +1566,9 @@ mod tests {
             .ok_or(DockError::EmptyStructure)?;
         native
             .add_bond(a1, a4, BondOrder::Single)
+            .ok_or(DockError::EmptyStructure)?;
+        native
+            .add_bond(a4, h4, BondOrder::Single)
             .ok_or(DockError::EmptyStructure)?;
         assign_ad4_types_and_flags(&mut native);
         build_rotatable_bonds(&mut native);

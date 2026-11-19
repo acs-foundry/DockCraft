@@ -4,11 +4,15 @@ use std::sync::{Arc, RwLock};
 
 use bytemuck::{Pod, Zeroable};
 use egui_wgpu::{Callback, CallbackResources, CallbackTrait, ScreenDescriptor, wgpu};
-use hyde_scorer::{HydeReport, InteractionKind};
+use hyde_scorer::{HydeReport, InteractionKind, TorsionStatus};
 use pocket_detect::{BindingPocket, GridBox};
 use serde::{Deserialize, Serialize};
 use struct_core::Molecule3D;
 use wgpu::util::DeviceExt;
+
+fn default_true_vp() -> bool {
+    true
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ViewportOptions {
@@ -18,6 +22,13 @@ pub struct ViewportOptions {
     pub show_hyde_coronas: bool,
     pub show_interactions: bool,
     pub show_grid_box: bool,
+    #[serde(default = "default_true_vp")]
+    pub show_torsion_lights: bool,
+    #[serde(default = "default_true_vp")]
+    pub show_waters_metals: bool,
+    /// Optional 3D pharmacophore constraint spheres `(center, radius, rgba)` rendered in the viewport.
+    #[serde(default)]
+    pub pharmacophore_spheres: Vec<([f64; 3], f64, [f32; 4])>,
     pub background_rgba: [f32; 4],
 }
 
@@ -30,6 +41,9 @@ impl Default for ViewportOptions {
             show_hyde_coronas: true,
             show_interactions: true,
             show_grid_box: true,
+            show_torsion_lights: true,
+            show_waters_metals: true,
+            pharmacophore_spheres: Vec::new(),
             background_rgba: [0.075, 0.09, 0.12, 1.0],
         }
     }
@@ -412,6 +426,30 @@ pub fn build_dock_scene(
                 }
             }
         }
+        if opts.show_waters_metals {
+            for a in &rec.atoms {
+                if !a.is_heavy() {
+                    continue;
+                }
+                let p = f64_to_f32_3(a.coords);
+                if a.ad4_type.is_metal() {
+                    scene.opaque_spheres.push(SphereInstance {
+                        pos_rad: [p[0], p[1], p[2], 0.68],
+                        color: [0.76, 0.64, 0.96, 1.0],
+                    });
+                } else if a.element == "O"
+                    && matches!(
+                        a.res_name.trim().to_ascii_uppercase().as_str(),
+                        "HOH" | "WAT" | "DOD"
+                    )
+                {
+                    scene.opaque_spheres.push(SphereInstance {
+                        pos_rad: [p[0], p[1], p[2], 0.40],
+                        color: [0.22, 0.78, 0.98, 1.0],
+                    });
+                }
+            }
+        }
     }
 
     if let Some(lig) = ligand {
@@ -479,6 +517,32 @@ pub fn build_dock_scene(
                 }
             }
         }
+        if opts.show_torsion_lights
+            && let (Some(lig), Some(tors)) = (ligand, rep.torsion_report.as_ref())
+        {
+            for alert in &tors.torsions {
+                if let (Some(au), Some(av)) =
+                    (lig.atoms.get(alert.atom_u), lig.atoms.get(alert.atom_v))
+                {
+                    let p0 = f64_to_f32_3(au.coords);
+                    let p1 = f64_to_f32_3(av.coords);
+                    let mid = [
+                        0.5 * (p0[0] + p1[0]),
+                        0.5 * (p0[1] + p1[1]),
+                        0.5 * (p0[2] + p1[2]),
+                    ];
+                    let col = match alert.status {
+                        TorsionStatus::Green => [0.14, 0.88, 0.36, 0.95],
+                        TorsionStatus::Yellow => [0.98, 0.80, 0.14, 0.95],
+                        TorsionStatus::Red => [0.96, 0.18, 0.22, 0.98],
+                    };
+                    scene.opaque_spheres.push(SphereInstance {
+                        pos_rad: [mid[0], mid[1], mid[2], 0.27],
+                        color: col,
+                    });
+                }
+            }
+        }
         if opts.show_interactions
             && let (Some(rec), Some(lig)) = (receptor, ligand)
         {
@@ -495,12 +559,26 @@ pub fn build_dock_scene(
                         InteractionKind::PiPiStacking => [0.76, 0.42, 0.96, 0.90],
                         InteractionKind::CationPi => [0.95, 0.55, 0.22, 0.90],
                         InteractionKind::HalogenBond => [0.45, 0.95, 0.35, 0.95],
+                        InteractionKind::MetalCoordination => [0.98, 0.38, 0.92, 0.98],
+                        InteractionKind::WaterBridge => [0.35, 0.78, 1.0, 0.95],
                         InteractionKind::HydrophobicContact => continue,
                     };
                     push_dashed_line(&mut scene.lines, a, b, col, 9);
                 }
             }
         }
+    }
+
+    for &(center, radius, color) in &opts.pharmacophore_spheres {
+        scene.translucent_coronas.push(SphereInstance {
+            pos_rad: [
+                center[0] as f32,
+                center[1] as f32,
+                center[2] as f32,
+                radius as f32,
+            ],
+            color,
+        });
     }
 
     if opts.show_grid_box

@@ -569,7 +569,7 @@ dependencies = [
 
 [[package]]
 name = "dock-engine"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "pocket-detect",
  "rand",
@@ -581,7 +581,7 @@ dependencies = [
 
 [[package]]
 name = "dock-pipeline"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "csv",
  "dock-engine",
@@ -598,7 +598,7 @@ dependencies = [
 
 [[package]]
 name = "dock-viewport"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytemuck",
  "egui",
@@ -612,7 +612,7 @@ dependencies = [
 
 [[package]]
 name = "dockcraft"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "dock-engine",
  "dock-pipeline",
@@ -621,13 +621,14 @@ dependencies = [
  "egui",
  "hyde-scorer",
  "pocket-detect",
+ "serde",
  "serde_json",
  "struct-core",
 ]
 
 [[package]]
 name = "dockcraft-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "dock-engine",
@@ -1169,7 +1170,7 @@ checksum = "dfa686283ad6dd069f105e5ab091b04c62850d3e4cf5d67debad1933f55023df"
 
 [[package]]
 name = "hyde-scorer"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "pocket-detect",
  "serde",
@@ -2064,8 +2065,9 @@ dependencies = [
 
 [[package]]
 name = "pocket-detect"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
+ "rayon",
  "serde",
  "struct-core",
  "thiserror 2.0.21",
@@ -2555,7 +2557,7 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 
 [[package]]
 name = "struct-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "thiserror 2.0.21",

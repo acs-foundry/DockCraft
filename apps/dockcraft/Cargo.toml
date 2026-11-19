@@ -17,4 +17,5 @@ dock-viewport = { path = "../../crates/dock-viewport" }
 dock-pipeline = { path = "../../crates/dock-pipeline" }
 egui = { workspace = true }
 eframe = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }

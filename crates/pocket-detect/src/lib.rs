@@ -2,8 +2,9 @@
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use struct_core::{Atom3D, Molecule3D};
+use struct_core::{Ad4Type, Atom3D, Molecule3D};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -171,11 +172,11 @@ pub struct PocketDetectConfig {
 impl Default for PocketDetectConfig {
     fn default() -> Self {
         Self {
-            grid_step: 1.2,
-            probe_radius: 1.5,
-            max_receptor_dist: 7.5,
-            min_enclosed_rays: 9,
-            min_pocket_points: 10,
+            grid_step: 1.0,
+            probe_radius: 1.4,
+            max_receptor_dist: 6.2,
+            min_enclosed_rays: 15,
+            min_pocket_points: 12,
             box_padding: 6.0,
             box_spacing: 0.375,
         }
@@ -236,48 +237,52 @@ fn dist2(a: [f64; 3], b: [f64; 3]) -> f64 {
     dx * dx + dy * dy + dz * dz
 }
 
-/// 14 unit directions: 6 cardinal axes + 8 cube diagonals.
-fn enclosure_directions() -> [[f64; 3]; 14] {
-    let inv_sqrt3 = 1.0 / 3.0_f64.sqrt();
-    [
-        [1.0, 0.0, 0.0],
-        [-1.0, 0.0, 0.0],
-        [0.0, 1.0, 0.0],
-        [0.0, -1.0, 0.0],
-        [0.0, 0.0, 1.0],
-        [0.0, 0.0, -1.0],
-        [inv_sqrt3, inv_sqrt3, inv_sqrt3],
-        [inv_sqrt3, inv_sqrt3, -inv_sqrt3],
-        [inv_sqrt3, -inv_sqrt3, inv_sqrt3],
-        [inv_sqrt3, -inv_sqrt3, -inv_sqrt3],
-        [-inv_sqrt3, inv_sqrt3, inv_sqrt3],
-        [-inv_sqrt3, inv_sqrt3, -inv_sqrt3],
-        [-inv_sqrt3, -inv_sqrt3, inv_sqrt3],
-        [-inv_sqrt3, -inv_sqrt3, -inv_sqrt3],
-    ]
+/// 13 opposing integer lattice ray pairs (3 cardinal + 6 face-diagonals + 4 body-diagonals = 26 rays)
+/// implementing LIGSITE-csc Protein-Solvent-Protein (PSP) burial events on the 3D occupancy grid.
+const PSP_AXIS_PAIRS: [[i32; 3]; 13] = [
+    [1, 0, 0],
+    [0, 1, 0],
+    [0, 0, 1],
+    [1, 1, 0],
+    [1, -1, 0],
+    [1, 0, 1],
+    [1, 0, -1],
+    [0, 1, 1],
+    [0, 1, -1],
+    [1, 1, 1],
+    [1, 1, -1],
+    [1, -1, 1],
+    [1, -1, -1],
+];
+
+fn is_catalytic_metal(a: &Atom3D) -> bool {
+    matches!(
+        a.ad4_type,
+        Ad4Type::Zn | Ad4Type::Mg | Ad4Type::Fe | Ad4Type::Ca | Ad4Type::Mn
+    ) || matches!(a.element.as_str(), "Zn" | "Mg" | "Fe" | "Ca" | "Mn" | "Cu")
 }
 
-fn ray_hits_receptor(
-    origin: [f64; 3],
-    dir: [f64; 3],
-    max_dist: f64,
-    nearby: &[usize],
-    heavy_atoms: &[&Atom3D],
+#[inline]
+fn ray_hits_solid(
+    occ: &[u8],
+    dims: [usize; 3],
+    start: [i32; 3],
+    dir: [i32; 3],
+    max_steps: i32,
 ) -> bool {
-    for &idx in nearby {
-        let a = heavy_atoms[idx];
-        let oc = [
-            a.coords[0] - origin[0],
-            a.coords[1] - origin[1],
-            a.coords[2] - origin[2],
-        ];
-        let proj = oc[0] * dir[0] + oc[1] * dir[1] + oc[2] * dir[2];
-        if proj <= 0.5 || proj > max_dist {
-            continue;
+    let [nx, ny, nz] = [dims[0] as i32, dims[1] as i32, dims[2] as i32];
+    let mut x = start[0];
+    let mut y = start[1];
+    let mut z = start[2];
+    for _ in 0..max_steps {
+        x += dir[0];
+        y += dir[1];
+        z += dir[2];
+        if x < 0 || x >= nx || y < 0 || y >= ny || z < 0 || z >= nz {
+            return false;
         }
-        let perp2 = (oc[0] * oc[0] + oc[1] * oc[1] + oc[2] * oc[2]) - proj * proj;
-        let hit_r = a.ad4_type.vina_radius() + 0.9;
-        if perp2 <= hit_r * hit_r {
+        let idx = ((x as usize) * dims[1] + (y as usize)) * dims[2] + (z as usize);
+        if occ[idx] != 0 {
             return true;
         }
     }
@@ -348,8 +353,12 @@ pub fn detect_pockets(
 ) -> Result<Vec<BindingPocket>, PocketError> {
     let mut heavy_orig_idx = Vec::new();
     let mut heavy_atoms = Vec::new();
+    let mut metal_coords: Vec<[f64; 3]> = Vec::new();
     for (idx, atom) in receptor.atoms.iter().enumerate() {
         if atom.is_heavy() {
+            if is_catalytic_metal(atom) {
+                metal_coords.push(atom.coords);
+            }
             heavy_orig_idx.push(idx);
             heavy_atoms.push(atom);
         }
@@ -367,75 +376,231 @@ pub fn detect_pockets(
         }
     }
 
-    let step = config.grid_step.max(0.6);
-    let ray_horizon = 11.0;
-    let hash = SpatialHash::new(&heavy_atoms, 4.0);
-    let dirs = enclosure_directions();
+    let step = config.grid_step.clamp(0.6, 2.0);
+    // Keep grid bounded for very large multi-domain assemblies while staying at 1.0 A for normal receptors
+    let span = [
+        max_c[0] - min_c[0] + 4.0,
+        max_c[1] - min_c[1] + 4.0,
+        max_c[2] - min_c[2] + 4.0,
+    ];
+    let eff_step = {
+        let raw_voxels = (span[0] / step) * (span[1] / step) * (span[2] / step);
+        if raw_voxels > 1_800_000.0 {
+            step * (raw_voxels / 1_800_000.0).cbrt()
+        } else {
+            step
+        }
+    };
+    let origin = [min_c[0] - 2.0, min_c[1] - 2.0, min_c[2] - 2.0];
+    let nx = ((span[0] / eff_step).ceil() as usize).max(3) + 1;
+    let ny = ((span[1] / eff_step).ceil() as usize).max(3) + 1;
+    let nz = ((span[2] / eff_step).ceil() as usize).max(3) + 1;
+    let dims = [nx, ny, nz];
+    let n_vox = nx * ny * nz;
 
-    type CavityVoxel = ((i32, i32, i32), [f64; 3], usize);
-    let mut cavity_voxels: Vec<CavityVoxel> = Vec::new();
-    let nx = ((max_c[0] - min_c[0]) / step).ceil() as i32;
-    let ny = ((max_c[1] - min_c[1]) / step).ceil() as i32;
-    let nz = ((max_c[2] - min_c[2]) / step).ceil() as i32;
+    // 1. Build 3D protein occupancy grid (`occ = 1` solid protein, `near_prot = 1` within max_receptor_dist)
+    let mut occ = vec![0u8; n_vox];
+    let mut near_prot = vec![0u8; n_vox];
+    let probe_pad = (config.probe_radius * 0.62).clamp(0.65, 1.15);
+    let max_rec_d = config.max_receptor_dist.clamp(4.0, 8.5);
+    let max_rec_d2 = max_rec_d * max_rec_d;
 
-    for ix in 0..=nx {
-        let x = min_c[0] + ix as f64 * step;
-        for iy in 0..=ny {
-            let y = min_c[1] + iy as f64 * step;
-            for iz in 0..=nz {
-                let z = min_c[2] + iz as f64 * step;
-                let p = [x, y, z];
+    for atom in &heavy_atoms {
+        let solid_r = if is_catalytic_metal(atom) {
+            1.65
+        } else {
+            atom.ad4_type.vina_radius() + probe_pad
+        };
+        let solid_r2 = solid_r * solid_r;
+        let reach_r = max_rec_d.max(solid_r);
+        let r_vox = (reach_r / eff_step).ceil() as isize;
+        let cx = ((atom.coords[0] - origin[0]) / eff_step).round() as isize;
+        let cy = ((atom.coords[1] - origin[1]) / eff_step).round() as isize;
+        let cz = ((atom.coords[2] - origin[2]) / eff_step).round() as isize;
 
-                let nearby = hash.query_radius(&heavy_atoms, p, ray_horizon);
-                if nearby.is_empty() {
+        let x0 = (cx - r_vox).max(0) as usize;
+        let x1 = (cx + r_vox).min(nx as isize - 1) as usize;
+        let y0 = (cy - r_vox).max(0) as usize;
+        let y1 = (cy + r_vox).min(ny as isize - 1) as usize;
+        let z0 = (cz - r_vox).max(0) as usize;
+        let z1 = (cz + r_vox).min(nz as isize - 1) as usize;
+
+        for ix in x0..=x1 {
+            let dx = origin[0] + ix as f64 * eff_step - atom.coords[0];
+            let dx2 = dx * dx;
+            if dx2 > max_rec_d2 {
+                continue;
+            }
+            for iy in y0..=y1 {
+                let dy = origin[1] + iy as f64 * eff_step - atom.coords[1];
+                let dxy2 = dx2 + dy * dy;
+                if dxy2 > max_rec_d2 {
                     continue;
                 }
-
-                let mut clashes = false;
-                let mut min_surface_dist = f64::INFINITY;
-                for &idx in &nearby {
-                    let a = heavy_atoms[idx];
-                    let d = dist2(p, a.coords).sqrt();
-                    let min_allowed = a.ad4_type.vina_radius() + config.probe_radius * 0.65;
-                    if d < min_allowed {
-                        clashes = true;
-                        break;
+                let row = (ix * ny + iy) * nz;
+                for iz in z0..=z1 {
+                    let dz = origin[2] + iz as f64 * eff_step - atom.coords[2];
+                    let d2 = dxy2 + dz * dz;
+                    if d2 <= max_rec_d2 {
+                        let vidx = row + iz;
+                        near_prot[vidx] = 1;
+                        if d2 <= solid_r2 {
+                            occ[vidx] = 1;
+                        }
                     }
-                    min_surface_dist = min_surface_dist.min(d);
-                }
-                if clashes || min_surface_dist > config.max_receptor_dist {
-                    continue;
-                }
-
-                let enclosed = dirs
-                    .iter()
-                    .filter(|&&dir| ray_hits_receptor(p, dir, ray_horizon, &nearby, &heavy_atoms))
-                    .count();
-                if enclosed >= config.min_enclosed_rays {
-                    cavity_voxels.push(((ix, iy, iz), p, enclosed));
                 }
             }
         }
     }
 
-    let mut voxel_map: HashMap<(i32, i32, i32), usize> = HashMap::new();
-    for (idx, &(ijk, _, _)) in cavity_voxels.iter().enumerate() {
-        voxel_map.insert(ijk, idx);
+    // 2. Parallel 26-ray / 13-PSP burial evaluation across empty voxels adjacent to protein
+    let ray_horizon_a = 13.5_f64;
+    let max_steps_cardinal = (ray_horizon_a / eff_step).ceil() as i32;
+    let max_steps_diag2 = (ray_horizon_a / (eff_step * std::f64::consts::SQRT_2)).ceil() as i32;
+    let max_steps_diag3 = (ray_horizon_a / (eff_step * 3.0_f64.sqrt())).ceil() as i32;
+    let min_rays = config.min_enclosed_rays.clamp(10, 24);
+    let min_psp = 4usize;
+
+    #[derive(Clone, Copy)]
+    struct CavityVoxel {
+        ijk: (i32, i32, i32),
+        pos: [f64; 3],
+        psp: u8,
+        rays: u8,
+        near_metal: bool,
     }
 
-    let mut visited = vec![false; cavity_voxels.len()];
-    let mut clusters: Vec<Vec<usize>> = Vec::new();
+    let cavity_voxels: Vec<CavityVoxel> = (1..nx.saturating_sub(1))
+        .into_par_iter()
+        .flat_map_iter(|ix| {
+            let mut slice_out = Vec::new();
+            let x = origin[0] + ix as f64 * eff_step;
+            for iy in 1..ny.saturating_sub(1) {
+                let y = origin[1] + iy as f64 * eff_step;
+                let row = (ix * ny + iy) * nz;
+                for iz in 1..nz.saturating_sub(1) {
+                    let vidx = row + iz;
+                    if occ[vidx] != 0 || near_prot[vidx] == 0 {
+                        continue;
+                    }
+                    let start = [ix as i32, iy as i32, iz as i32];
+                    let mut psp = 0u8;
+                    let mut rays = 0u8;
+                    for &d in &PSP_AXIS_PAIRS {
+                        let norm_sq = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+                        let steps = match norm_sq {
+                            1 => max_steps_cardinal,
+                            2 => max_steps_diag2,
+                            _ => max_steps_diag3,
+                        };
+                        let h_pos = ray_hits_solid(&occ, dims, start, d, steps);
+                        let h_neg = ray_hits_solid(&occ, dims, start, [-d[0], -d[1], -d[2]], steps);
+                        if h_pos {
+                            rays += 1;
+                        }
+                        if h_neg {
+                            rays += 1;
+                        }
+                        if h_pos && h_neg {
+                            psp += 1;
+                        }
+                    }
+                    let z = origin[2] + iz as f64 * eff_step;
+                    let pos = [x, y, z];
+                    let near_metal = metal_coords.iter().any(|&m| dist2(pos, m) <= 5.5 * 5.5);
 
+                    let passes = (usize::from(psp) >= min_psp && usize::from(rays) >= min_rays)
+                        || (near_metal && psp >= 3 && rays >= 12);
+                    if passes {
+                        slice_out.push(CavityVoxel {
+                            ijk: (ix as i32, iy as i32, iz as i32),
+                            pos,
+                            psp,
+                            rays,
+                            near_metal,
+                        });
+                    }
+                }
+            }
+            slice_out
+        })
+        .collect();
+
+    if cavity_voxels.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // 3. Core-seeded cavity separation (prevents merging separate pockets through thin surface necks)
+    let mut voxel_map: HashMap<(i32, i32, i32), usize> =
+        HashMap::with_capacity(cavity_voxels.len() * 2);
+    for (idx, v) in cavity_voxels.iter().enumerate() {
+        voxel_map.insert(v.ijk, idx);
+    }
+
+    // Core voxels have strong multi-axis PSP burial (psp >= 6 and rays >= 18) or catalytic metal proximity
+    let is_core: Vec<bool> = cavity_voxels
+        .iter()
+        .map(|v| (v.psp >= 6 && v.rays >= 18) || (v.near_metal && v.psp >= 4 && v.rays >= 14))
+        .collect();
+
+    let mut label = vec![usize::MAX; cavity_voxels.len()];
+    let mut clusters: Vec<Vec<usize>> = Vec::new();
+    const FACE6: [(i32, i32, i32); 6] = [
+        (1, 0, 0),
+        (-1, 0, 0),
+        (0, 1, 0),
+        (0, -1, 0),
+        (0, 0, 1),
+        (0, 0, -1),
+    ];
+
+    // Step 3a: 6-connected components of deep cores
+    let mut core_visited = vec![false; cavity_voxels.len()];
     for start in 0..cavity_voxels.len() {
-        if visited[start] {
+        if !is_core[start] || core_visited[start] {
             continue;
         }
-        visited[start] = true;
-        let mut queue = VecDeque::from([start]);
-        let mut cluster = Vec::new();
-        while let Some(curr) = queue.pop_front() {
-            cluster.push(curr);
-            let (cx, cy, cz) = cavity_voxels[curr].0;
+        core_visited[start] = true;
+        let mut q = VecDeque::from([start]);
+        let mut comp = Vec::new();
+        let mut has_metal = false;
+        while let Some(cur) = q.pop_front() {
+            comp.push(cur);
+            has_metal |= cavity_voxels[cur].near_metal;
+            let (cx, cy, cz) = cavity_voxels[cur].ijk;
+            for &(dx, dy, dz) in &FACE6 {
+                if let Some(&nbr) = voxel_map.get(&(cx + dx, cy + dy, cz + dz))
+                    && is_core[nbr]
+                    && !core_visited[nbr]
+                {
+                    core_visited[nbr] = true;
+                    q.push_back(nbr);
+                }
+            }
+        }
+        let min_core_pts = if has_metal { 4 } else { 6 };
+        if comp.len() >= min_core_pts {
+            let cid = clusters.len();
+            for &vidx in &comp {
+                label[vidx] = cid;
+            }
+            clusters.push(comp);
+        }
+    }
+
+    // Step 3b: Multi-source BFS growth from deep cores up to 3 shells (~3 A) into surrounding cavity voxels
+    if !clusters.is_empty() {
+        let mut grow_q: VecDeque<(usize, usize, u8)> = VecDeque::new();
+        for (cid, comp) in clusters.iter().enumerate() {
+            for &vidx in comp {
+                grow_q.push_back((vidx, cid, 0));
+            }
+        }
+        while let Some((cur, cid, shell)) = grow_q.pop_front() {
+            if shell >= 2 {
+                continue;
+            }
+            let (cx, cy, cz) = cavity_voxels[cur].ijk;
             for dx in -1..=1 {
                 for dy in -1..=1 {
                     for dz in -1..=1 {
@@ -443,49 +608,128 @@ pub fn detect_pockets(
                             continue;
                         }
                         if let Some(&nbr) = voxel_map.get(&(cx + dx, cy + dy, cz + dz))
-                            && !visited[nbr]
+                            && label[nbr] == usize::MAX
                         {
-                            visited[nbr] = true;
-                            queue.push_back(nbr);
+                            label[nbr] = cid;
+                            clusters[cid].push(nbr);
+                            grow_q.push_back((nbr, cid, shell + 1));
                         }
                     }
                 }
             }
         }
-        if cluster.len() >= config.min_pocket_points {
-            clusters.push(cluster);
+    }
+
+    // Step 3c: Any remaining unassigned cavity clusters (handles shallower open clefts / bromodomains)
+    for start in 0..cavity_voxels.len() {
+        if label[start] != usize::MAX {
+            continue;
+        }
+        let cid = clusters.len();
+        label[start] = cid;
+        let mut q = VecDeque::from([start]);
+        let mut comp = Vec::new();
+        while let Some(cur) = q.pop_front() {
+            comp.push(cur);
+            let (cx, cy, cz) = cavity_voxels[cur].ijk;
+            for &(dx, dy, dz) in &FACE6 {
+                if let Some(&nbr) = voxel_map.get(&(cx + dx, cy + dy, cz + dz))
+                    && label[nbr] == usize::MAX
+                {
+                    label[nbr] = cid;
+                    q.push_back(nbr);
+                }
+            }
+        }
+        if comp.len() >= config.min_pocket_points {
+            clusters.push(comp);
         }
     }
 
-    let voxel_vol = step * step * step;
-    let mut pockets = Vec::with_capacity(clusters.len());
+    // Filter clusters below min_pocket_points (keep metal-bearing sites down to 6 voxels)
+    clusters.retain(|comp| {
+        let has_metal = comp.iter().any(|&v| cavity_voxels[v].near_metal);
+        comp.len()
+            >= if has_metal {
+                6
+            } else {
+                config.min_pocket_points
+            }
+    });
+
+    let hash = SpatialHash::new(&heavy_atoms, 4.0);
+    let voxel_vol = eff_step * eff_step * eff_step;
+    let mut scored_pockets: Vec<(f64, BindingPocket)> = Vec::with_capacity(clusters.len());
 
     for (cid, cluster) in clusters.into_iter().enumerate() {
         let mut pts = Vec::with_capacity(cluster.len());
-        let mut sum = [0.0_f64; 3];
-        let mut sum_enclosure = 0usize;
+        let mut sum_rays = 0.0_f64;
+        let mut psp_vals = Vec::with_capacity(cluster.len());
         let mut min_p = [f64::INFINITY; 3];
         let mut max_p = [f64::NEG_INFINITY; 3];
         let mut lining_heavy_set = BTreeSet::new();
+        let mut has_metal = false;
+        let mut core_voxel_count = 0usize;
 
         for &vidx in &cluster {
-            let (_, p, enc) = cavity_voxels[vidx];
-            pts.push(p);
-            sum_enclosure += enc;
-            for k in 0..3 {
-                sum[k] += p[k];
-                min_p[k] = min_p[k].min(p[k]);
-                max_p[k] = max_p[k].max(p[k]);
+            let v = cavity_voxels[vidx];
+            pts.push(v.pos);
+            let psp_f = f64::from(v.psp);
+            let rays_f = f64::from(v.rays);
+            psp_vals.push(psp_f);
+            sum_rays += rays_f;
+            has_metal |= v.near_metal;
+            if is_core[vidx] {
+                core_voxel_count += 1;
             }
-            for n_idx in hash.query_radius(&heavy_atoms, p, 4.6) {
+            for k in 0..3 {
+                min_p[k] = min_p[k].min(v.pos[k]);
+                max_p[k] = max_p[k].max(v.pos[k]);
+            }
+            for n_idx in hash.query_radius(&heavy_atoms, v.pos, 4.5) {
                 lining_heavy_set.insert(n_idx);
             }
         }
 
         let n = pts.len() as f64;
-        let center = [sum[0] / n, sum[1] / n, sum[2] / n];
         let volume_a3 = n * voxel_vol;
-        let buriedness = (sum_enclosure as f64 / (n * 14.0)).clamp(0.0, 1.0);
+
+        psp_vals.sort_by(f64::total_cmp);
+        let q65_idx = ((psp_vals.len() * 65) / 100).min(psp_vals.len().saturating_sub(1));
+        let q85_idx = ((psp_vals.len() * 85) / 100).min(psp_vals.len().saturating_sub(1));
+        let psp_cut = psp_vals[q65_idx];
+        let core_depth = (psp_vals[q85_idx] / 13.0).clamp(0.0, 1.0);
+        let mean_psp = (psp_vals.iter().sum::<f64>() / (n * 13.0)).clamp(0.0, 1.0);
+        let mean_rays = (sum_rays / (n * 26.0)).clamp(0.0, 1.0);
+        let buriedness = (0.55 * mean_rays + 0.45 * mean_psp).clamp(0.0, 1.0);
+
+        // Anchor pocket center on the deepest top-35% buried core voxels (plus metal proximity)
+        // so wide kinase/protease mouths never pull the centroid away from the catalytic core.
+        let mut w_sum = 0.0_f64;
+        let mut w_pos = [0.0_f64; 3];
+        for &vidx in &cluster {
+            let v = cavity_voxels[vidx];
+            let psp_f = f64::from(v.psp);
+            if psp_f < psp_cut && !v.near_metal {
+                continue;
+            }
+            let w = (psp_f * psp_f * psp_f).max(1.0) * if v.near_metal { 4.0 } else { 1.0 };
+            w_sum += w;
+            for k in 0..3 {
+                w_pos[k] += v.pos[k] * w;
+            }
+        }
+        let center = if w_sum > 1e-6 {
+            [w_pos[0] / w_sum, w_pos[1] / w_sum, w_pos[2] / w_sum]
+        } else {
+            let mut s = [0.0; 3];
+            for p in &pts {
+                for k in 0..3 {
+                    s[k] += p[k];
+                }
+            }
+            [s[0] / n, s[1] / n, s[2] / n]
+        };
 
         let lining_heavy_vec: Vec<usize> = lining_heavy_set.iter().copied().collect();
         let sasa_a2 = compute_sasa_fibonacci(&heavy_atoms, &lining_heavy_vec, config.probe_radius);
@@ -498,6 +742,9 @@ pub fn detect_pockets(
         for &h_idx in &lining_heavy_vec {
             let atom = heavy_atoms[h_idx];
             lining_atom_indices.push(heavy_orig_idx[h_idx]);
+            if is_catalytic_metal(atom) {
+                has_metal = true;
+            }
             residues.insert(ResidueTag {
                 chain_id: atom.chain_id.to_string(),
                 res_seq: atom.res_seq,
@@ -515,13 +762,38 @@ pub fn detect_pockets(
         let hydrophobicity = apolar_count as f64 / total_lining;
         let hbond_capacity = polar_count as f64 / total_lining;
 
-        let vol_score = (volume_a3 / 450.0).clamp(0.0, 1.0);
-        let polarity_balance = 1.0 - (hydrophobicity - 0.62).abs();
-        let druggability_score = (0.38 * buriedness
-            + 0.30 * vol_score
-            + 0.22 * polarity_balance.clamp(0.0, 1.0)
-            + 0.10 * hbond_capacity.min(0.45) / 0.45)
+        // SiteMap / DoGSiteScorer-inspired druggability & active-site ranking:
+        // Deeply buried large active sites (150-3000 A3) outrank small incidental packing voids;
+        // only shallow surface grooves (buriedness < 0.58) are penalized for excess size.
+        let vol_rise = ((volume_a3 - 40.0) / 260.0).clamp(0.0, 1.0);
+        let shallow_pen = if buriedness < 0.58 && volume_a3 > 1600.0 {
+            1.0 / (1.0 + (volume_a3 - 1600.0) / 1000.0)
+        } else {
+            1.0 / (1.0 + ((volume_a3 - 3800.0).max(0.0) / 2500.0))
+        };
+        let vol_drug = (vol_rise * shallow_pen).clamp(0.0, 1.0);
+
+        // Protein active-site lining (including backbone N/C/O) typically shows 0.28-0.55 apolar fraction
+        let polarity_balance = (1.0 - (hydrophobicity - 0.42).abs() * 1.6).clamp(0.0, 1.0);
+        let hbond_term = (hbond_capacity / 0.35).clamp(0.0, 1.0);
+        let metal_flag = if has_metal { 1.0 } else { 0.0 };
+
+        let druggability_score = (0.30 * buriedness
+            + 0.24 * core_depth
+            + 0.22 * vol_drug
+            + 0.14 * polarity_balance
+            + 0.06 * hbond_term
+            + 0.04 * metal_flag)
             .clamp(0.0, 1.0);
+
+        // SiteMap SiteScore-style ranking: sqrt(effective core size) * burial^1.5 + druggability + metal
+        let eff_core_vol = ((core_voxel_count.max(1) as f64) * voxel_vol).min(2400.0);
+        let site_size = (eff_core_vol.sqrt() / 32.0).clamp(0.15, 1.55);
+        let burial_weight = buriedness.powf(1.4) * (0.55 + 0.45 * core_depth);
+        let rank_score = 0.55 * druggability_score
+            + 0.95 * site_size * burial_weight
+            + 0.12 * polarity_balance
+            + if has_metal { 0.40 } else { 0.0 };
 
         let box_size = [
             ((max_p[0] - min_p[0]) + 2.0 * config.box_padding).clamp(16.0, 42.0),
@@ -530,28 +802,28 @@ pub fn detect_pockets(
         ];
         let grid_box = GridBox::from_center_size(center, box_size, config.box_spacing)?;
 
-        pockets.push(BindingPocket {
-            id: cid + 1,
-            rank: 0,
-            center,
-            grid_box,
-            volume_a3,
-            sasa_a2,
-            buriedness,
-            hydrophobicity,
-            hbond_capacity,
-            druggability_score,
-            probe_points: pts,
-            lining_residues: residues.into_iter().collect(),
-            lining_atom_indices,
-        });
+        scored_pockets.push((
+            rank_score,
+            BindingPocket {
+                id: cid + 1,
+                rank: 0,
+                center,
+                grid_box,
+                volume_a3,
+                sasa_a2,
+                buriedness,
+                hydrophobicity,
+                hbond_capacity,
+                druggability_score,
+                probe_points: pts,
+                lining_residues: residues.into_iter().collect(),
+                lining_atom_indices,
+            },
+        ));
     }
 
-    pockets.sort_by(|a, b| {
-        let sa = a.druggability_score * a.volume_a3.cbrt();
-        let sb = b.druggability_score * b.volume_a3.cbrt();
-        sb.total_cmp(&sa)
-    });
+    scored_pockets.sort_by(|a, b| b.0.total_cmp(&a.0));
+    let mut pockets: Vec<BindingPocket> = scored_pockets.into_iter().map(|(_, p)| p).collect();
     for (rank, p) in pockets.iter_mut().enumerate() {
         p.rank = rank + 1;
     }

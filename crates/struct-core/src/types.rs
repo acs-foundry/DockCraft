@@ -113,11 +113,26 @@ impl Ad4Type {
     }
 
     pub fn is_donor_heavy(self) -> bool {
-        matches!(self, Self::N | Self::NA | Self::NS | Self::OA | Self::SA)
+        matches!(
+            self,
+            Self::N
+                | Self::NA
+                | Self::NS
+                | Self::OA
+                | Self::Zn
+                | Self::Mg
+                | Self::Fe
+                | Self::Ca
+                | Self::Mn
+        )
     }
 
     pub fn is_acceptor(self) -> bool {
-        matches!(self, Self::NA | Self::NS | Self::OA | Self::OS | Self::SA)
+        matches!(self, Self::NA | Self::NS | Self::OA | Self::OS)
+    }
+
+    pub fn is_metal(self) -> bool {
+        matches!(self, Self::Zn | Self::Mg | Self::Fe | Self::Ca | Self::Mn)
     }
 
     pub fn is_heavy(self) -> bool {
@@ -538,6 +553,251 @@ impl Molecule3D {
         Some((sum_sq / (h1.len() as f64)).sqrt())
     }
 
+    /// Symmetry-aware heavy-atom RMSD (Å) in-place (no superposition), minimizing over
+    /// heavy-atom graph automorphisms (e.g. flipped phenyl, carboxylate, amidinium, t-Bu, CF3).
+    pub fn rmsd_heavy_symmetric(&self, other: &Self) -> Option<f64> {
+        let direct = self.rmsd_heavy(other)?;
+        let heavy_a: Vec<usize> = self
+            .atoms
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| a.is_heavy())
+            .map(|(i, _)| i)
+            .collect();
+        let heavy_b: Vec<usize> = other
+            .atoms
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| a.is_heavy())
+            .map(|(i, _)| i)
+            .collect();
+        let n = heavy_a.len();
+        if n == 0
+            || n != heavy_b.len()
+            || n > 128
+            || self.bonds.is_empty()
+            || other.bonds.is_empty()
+        {
+            return Some(direct);
+        }
+
+        // Build compact heavy-atom adjacency graphs + invariant signatures
+        let mut idx_a = vec![usize::MAX; self.atoms.len()];
+        for (pos, &ai) in heavy_a.iter().enumerate() {
+            idx_a[ai] = pos;
+        }
+        let mut idx_b = vec![usize::MAX; other.atoms.len()];
+        for (pos, &bi) in heavy_b.iter().enumerate() {
+            idx_b[bi] = pos;
+        }
+
+        let mut adj_a: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for (u, &ai) in heavy_a.iter().enumerate() {
+            for &(nb, _) in &self.adj[ai] {
+                if idx_a[nb] != usize::MAX {
+                    adj_a[u].push(idx_a[nb]);
+                }
+            }
+            adj_a[u].sort_unstable();
+        }
+        let mut adj_b: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for (u, &bi) in heavy_b.iter().enumerate() {
+            for &(nb, _) in &other.adj[bi] {
+                if idx_b[nb] != usize::MAX {
+                    adj_b[u].push(idx_b[nb]);
+                }
+            }
+            adj_b[u].sort_unstable();
+        }
+
+        // 2-hop element+degree signature (Weisfeiler-Lehman refinement) to prune automorphism search fast
+        let build_sig = |mol: &Self, heavy: &[usize], adj: &[Vec<usize>]| -> Vec<u64> {
+            let mut h: Vec<u64> = heavy
+                .iter()
+                .enumerate()
+                .map(|(u, &ai)| {
+                    let z = u64::from(element_atomic_number(&mol.atoms[ai].element));
+                    let deg = adj[u].len() as u64;
+                    let arom = u64::from(mol.atoms[ai].aromatic);
+                    (z << 16) ^ (deg << 8) ^ arom
+                })
+                .collect();
+            for _ in 0..3 {
+                let mut next = Vec::with_capacity(n);
+                for u in 0..n {
+                    let mut nbs: Vec<u64> = adj[u].iter().map(|&v| h[v]).collect();
+                    nbs.sort_unstable();
+                    let mut acc = h[u].wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                    for s in nbs {
+                        acc = acc.rotate_left(7) ^ s.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                    }
+                    next.push(acc);
+                }
+                h = next;
+            }
+            h
+        };
+
+        let sig_a = build_sig(self, &heavy_a, &adj_a);
+        let sig_b = build_sig(other, &heavy_b, &adj_b);
+
+        let coords_a: Vec<[f64; 3]> = heavy_a.iter().map(|&i| self.atoms[i].coords).collect();
+        let coords_b: Vec<[f64; 3]> = heavy_b.iter().map(|&i| other.atoms[i].coords).collect();
+
+        // Candidate list per node u in A: nodes v in B with identical WL signature
+        let mut cands: Vec<Vec<usize>> = (0..n)
+            .map(|u| {
+                let mut list: Vec<usize> = (0..n).filter(|&v| sig_a[u] == sig_b[v]).collect();
+                // Order candidates by closeness to coords_a[u] so branch-and-bound prunes instantly
+                list.sort_by(|&v1, &v2| {
+                    let d1 = (coords_a[u][0] - coords_b[v1][0]).powi(2)
+                        + (coords_a[u][1] - coords_b[v1][1]).powi(2)
+                        + (coords_a[u][2] - coords_b[v1][2]).powi(2);
+                    let d2 = (coords_a[u][0] - coords_b[v2][0]).powi(2)
+                        + (coords_a[u][1] - coords_b[v2][1]).powi(2)
+                        + (coords_a[u][2] - coords_b[v2][2]).powi(2);
+                    d1.total_cmp(&d2)
+                });
+                list
+            })
+            .collect();
+        if cands.iter().any(Vec::is_empty) {
+            return Some(direct);
+        }
+
+        // Order traversal: fewest candidates first, then connected to already-ordered nodes
+        let mut order: Vec<usize> = Vec::with_capacity(n);
+        let mut in_order = vec![false; n];
+        for _ in 0..n {
+            let mut best_u = usize::MAX;
+            let mut best_key = (usize::MAX, 0usize);
+            for u in 0..n {
+                if in_order[u] {
+                    continue;
+                }
+                let placed_nbs = adj_a[u].iter().filter(|&&nb| in_order[nb]).count();
+                let key = (cands[u].len(), usize::MAX - placed_nbs);
+                if best_u == usize::MAX || key < best_key {
+                    best_u = u;
+                    best_key = key;
+                }
+            }
+            in_order[best_u] = true;
+            order.push(best_u);
+        }
+
+        let mut pos_in_order = vec![0usize; n];
+        for (p, &u) in order.iter().enumerate() {
+            pos_in_order[u] = p;
+        }
+        // Precompute already-placed neighbors of each depth step
+        let prev_nbs: Vec<Vec<usize>> = order
+            .iter()
+            .enumerate()
+            .map(|(depth, &u)| {
+                adj_a[u]
+                    .iter()
+                    .copied()
+                    .filter(|&nb| pos_in_order[nb] < depth)
+                    .collect()
+            })
+            .collect();
+
+        let mut mapping = vec![usize::MAX; n];
+        let mut used_b = vec![false; n];
+        let mut best_sq = direct * direct * (n as f64);
+        let mut nodes_visited = 0usize;
+        const MAX_NODES: usize = 8_000;
+
+        #[allow(clippy::too_many_arguments)]
+        fn dfs(
+            depth: usize,
+            acc_sq: f64,
+            order: &[usize],
+            prev_nbs: &[Vec<usize>],
+            cands: &[Vec<usize>],
+            adj_b: &[Vec<usize>],
+            coords_a: &[[f64; 3]],
+            coords_b: &[[f64; 3]],
+            mapping: &mut [usize],
+            used_b: &mut [bool],
+            best_sq: &mut f64,
+            nodes_visited: &mut usize,
+        ) {
+            if *nodes_visited >= MAX_NODES || acc_sq >= *best_sq {
+                return;
+            }
+            *nodes_visited += 1;
+            if depth == order.len() {
+                if acc_sq < *best_sq {
+                    *best_sq = acc_sq;
+                }
+                return;
+            }
+            let u = order[depth];
+            for &v in &cands[u] {
+                if used_b[v] {
+                    continue;
+                }
+                // Check graph adjacency consistency with all previously mapped neighbors of u
+                let mut ok = true;
+                for &pu in &prev_nbs[depth] {
+                    let pv = mapping[pu];
+                    if adj_b[v].binary_search(&pv).is_err() {
+                        ok = false;
+                        break;
+                    }
+                }
+                if !ok {
+                    continue;
+                }
+                let d2 = (coords_a[u][0] - coords_b[v][0]).powi(2)
+                    + (coords_a[u][1] - coords_b[v][1]).powi(2)
+                    + (coords_a[u][2] - coords_b[v][2]).powi(2);
+                if acc_sq + d2 >= *best_sq {
+                    continue;
+                }
+                mapping[u] = v;
+                used_b[v] = true;
+                dfs(
+                    depth + 1,
+                    acc_sq + d2,
+                    order,
+                    prev_nbs,
+                    cands,
+                    adj_b,
+                    coords_a,
+                    coords_b,
+                    mapping,
+                    used_b,
+                    best_sq,
+                    nodes_visited,
+                );
+                used_b[v] = false;
+                mapping[u] = usize::MAX;
+            }
+        }
+
+        // Suppress unused mut warning on cands
+        let cands_ref: &[Vec<usize>] = &cands;
+        dfs(
+            0,
+            0.0,
+            &order,
+            &prev_nbs,
+            cands_ref,
+            &adj_b,
+            &coords_a,
+            &coords_b,
+            &mut mapping,
+            &mut used_b,
+            &mut best_sq,
+            &mut nodes_visited,
+        );
+        let _ = &mut cands;
+        Some((best_sq / (n as f64)).sqrt())
+    }
+
     /// Distance-based covalent bond inference via spatial grid (`O(N)` for large proteins).
     pub fn infer_bonds_by_distance(&mut self) {
         if !self.bonds.is_empty() || self.atoms.len() <= 1 {
@@ -546,6 +806,9 @@ impl Molecule3D {
         let cell_size = 2.4_f64;
         let mut grid: BTreeMap<(i32, i32, i32), Vec<usize>> = BTreeMap::new();
         for (i, a) in self.atoms.iter().enumerate() {
+            if a.ad4_type.is_metal() {
+                continue;
+            }
             let key = (
                 (a.coords[0] / cell_size).floor() as i32,
                 (a.coords[1] / cell_size).floor() as i32,
@@ -556,6 +819,9 @@ impl Molecule3D {
 
         let mut new_edges: Vec<(usize, usize)> = Vec::new();
         for (i, a) in self.atoms.iter().enumerate() {
+            if a.ad4_type.is_metal() {
+                continue;
+            }
             let ri = element_covalent_radius(&a.element);
             let gx = (a.coords[0] / cell_size).floor() as i32;
             let gy = (a.coords[1] / cell_size).floor() as i32;
@@ -591,21 +857,16 @@ impl Molecule3D {
         }
     }
 
-    /// Detect small 5/6-membered rings via shortest-path BFS per bond (fast even for large proteins).
-    /// Smallest-cycle ring perception, 3 to 8 members.
-    ///
-    /// The BFS is run once per bond and keeps the shortest path back, so each bond contributes
-    /// the smallest ring it belongs to and a fused system still yields its individual rings
-    /// rather than the perimeter. The limit used to be 6, which left seven- and eight-membered
-    /// rings -- dibenzazepines, benzodiazepines, azepines, caprolactams, cyclooctanes --
-    /// completely invisible: they were never placed as rings by the 3D builder, so the structure
-    /// closed on itself and imipramine came out with two heavy atoms 2.0 A apart.
+    /// Smallest-cycle ring perception: 3..=24 members (incl. macrocycles) for ligands (`n <= 250`),
+    /// 3..=8 members for large proteins (`n > 250`) to keep receptor perception O(N).
     pub fn detect_small_rings(&mut self) {
         self.rings.clear();
         let n = self.atoms.len();
         if n < 3 || self.bonds.len() < 3 {
             return;
         }
+        let max_ring: usize = if n <= 250 { 24 } else { 8 };
+        let max_depth = (max_ring - 1) as u8;
         let mut seen_sets: std::collections::BTreeSet<Vec<usize>> =
             std::collections::BTreeSet::new();
         for (bid, b) in self.bonds.iter().enumerate() {
@@ -617,8 +878,8 @@ impl Molecule3D {
             visited.insert(b.u, (usize::MAX, 0));
             q.push_back(b.u);
             while let Some(cur) = q.pop_front() {
-                let d_cur = visited.get(&cur).map_or(7, |&(_, d)| d);
-                if cur == b.v || d_cur >= 7 {
+                let d_cur = visited.get(&cur).map_or(max_depth, |&(_, d)| d);
+                if cur == b.v || d_cur >= max_depth {
                     continue;
                 }
                 for &(nbr, e) in &self.adj[cur] {
@@ -632,14 +893,14 @@ impl Molecule3D {
                 }
             }
             if let Some(&(mut prev_node, dv)) = visited.get(&b.v)
-                && (2..=7).contains(&dv)
+                && (2..=max_depth).contains(&dv)
             {
                 let mut ring = vec![b.v];
                 while prev_node != usize::MAX {
                     ring.push(prev_node);
                     prev_node = visited.get(&prev_node).map_or(usize::MAX, |&(p, _)| p);
                 }
-                if (3..=8).contains(&ring.len()) {
+                if (3..=max_ring).contains(&ring.len()) {
                     let mut sorted = ring.clone();
                     sorted.sort_unstable();
                     if seen_sets.insert(sorted) {

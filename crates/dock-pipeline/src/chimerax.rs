@@ -159,8 +159,9 @@ pub fn write_chimerax_session_bundle(
     })
 }
 
-/// Writes the scene and spawns `chimerax` on it. Prefer the REST channel when a session is
-/// already open; this is the cold-start path.
+/// Writes the scene and either loads it into an already-running ChimeraX session over loopback
+/// REST (`127.0.0.1:60958`) or cold-starts `chimerax` with REST remote control enabled so
+/// `Box <- ChimeraX` works immediately without typing manual commands.
 pub fn launch_chimerax_for_scene(
     complex_name: &str,
     receptor: &Molecule3D,
@@ -169,7 +170,24 @@ pub fn launch_chimerax_for_scene(
     dir_override: Option<&Path>,
 ) -> Result<ChimeraXSceneBundle, ChimeraXError> {
     let bundle = write_chimerax_session_bundle(complex_name, receptor, ligand, hyde, dir_override)?;
+    let root = dir_override.map_or_else(default_chimerax_export_dir, Path::to_path_buf);
+    let client = crate::chimerax_rest::ChimeraXRest::with_default_port(root);
+    if client.is_live() {
+        client
+            .send(&crate::chimerax_rest::ChimeraXCommand::OpenScene(
+                bundle.script_path.clone(),
+            ))
+            .map_err(|e| ChimeraXError::Rest(e.to_string()))?;
+        return Ok(bundle);
+    }
+
+    let rest_cmd = format!(
+        "remotecontrol rest start port {} json true",
+        crate::chimerax_rest::DEFAULT_REST_PORT
+    );
     std::process::Command::new("chimerax")
+        .arg("--cmd")
+        .arg(&rest_cmd)
         .arg(&bundle.script_path)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -265,9 +283,9 @@ pub fn grid_box_from_chimerax_selection(
         (lo[2] + hi[2]) * 0.5,
     ];
     let size = [
-        (hi[0] - lo[0]) + 2.0 * padding,
-        (hi[1] - lo[1]) + 2.0 * padding,
-        (hi[2] - lo[2]) + 2.0 * padding,
+        ((hi[0] - lo[0]) + 2.0 * padding).clamp(16.0, 56.0),
+        ((hi[1] - lo[1]) + 2.0 * padding).clamp(16.0, 56.0),
+        ((hi[2] - lo[2]) + 2.0 * padding).clamp(16.0, 56.0),
     ];
     let grid_box = pocket_detect::GridBox::from_center_size(center, size, 0.375)
         .map_err(|e| ChimeraXError::Rest(e.to_string()))?;
@@ -281,12 +299,29 @@ pub fn grid_box_from_chimerax_selection(
 }
 
 /// Pulls `A:189 ASP` out of a ChimeraX `info selection level residue` line, which reads
-/// `residue id #1/A:189 name ASP index 170`.
+/// `residue id #1/A:189 name ASP index 170` (also handles chainless ligands like `#2:1`).
 fn parse_residue_line(line: &str) -> Option<String> {
     let rest = line.trim().strip_prefix("residue id ")?;
     let mut parts = rest.split_whitespace();
     let spec = parts.next()?;
-    let chain_res = spec.split('/').nth(1)?;
+    let chain_res = spec.split('/').nth(1).unwrap_or(spec);
     let name = rest.split(" name ").nth(1)?.split_whitespace().next()?;
     Some(format!("{chain_res} {name}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_residue_line;
+
+    #[test]
+    fn parses_protein_and_chainless_ligand_selection_lines() {
+        assert_eq!(
+            parse_residue_line("residue id #1/A:189 name ASP index 170"),
+            Some("A:189 ASP".to_string())
+        );
+        assert_eq!(
+            parse_residue_line("residue id #2:1 name UNK index 0"),
+            Some("#2:1 UNK".to_string())
+        );
+    }
 }

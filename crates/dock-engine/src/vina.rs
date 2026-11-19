@@ -1,14 +1,15 @@
 #![forbid(unsafe_code)]
 
 use serde::{Deserialize, Serialize};
-use struct_core::{Ad4Type, Atom3D, Molecule3D};
+use struct_core::{Ad4Type, Atom3D, Molecule3D, metal_chelation_tier};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum ScoringFunction {
     #[default]
     Vina,
     Vinardo,
-    /// Vina terms combined with an explicit screened electrostatic term (`3.2 * q1*q2 / r^2`).
+    /// Vina terms combined with an explicit screened electrostatic term (`3.2 * q1*q2 / r^2`)
+    /// and AutoDock4Zn-inspired catalytic metal coordination.
     DockCraftHybrid,
 }
 
@@ -21,6 +22,8 @@ pub struct ScoreBreakdown {
     pub hydrophobic: f64,
     pub hbond: f64,
     pub electrostatic: f64,
+    #[serde(default)]
+    pub metal_kcal: f64,
     pub intra_kcal: f64,
     pub total_affinity_kcal: f64,
 }
@@ -70,23 +73,75 @@ pub fn is_hydrophobic_pair(a: &Atom3D, b: &Atom3D) -> bool {
     a.hydrophobic && b.hydrophobic
 }
 
-/// Evaluates pairwise interaction `(energy_kcal, dE / dr)` between a receptor atom `rec` and ligand atom `lig` separated by distance `r`.
+/// AutoDock4Zn-inspired smooth metal-coordination potential for divalent catalytic metals
+/// (`Zn, Mg, Fe, Mn, Ca`) interacting with true Tier-2 metal-binding warheads (primary/secondary
+/// sulfonamide N, hydroxamate O/N, anionic carboxylate/phosphonate O-, free thiol S).
+/// Ordinary neutral carbonyl/ether/sulfone oxygens (tier <= 1) keep standard Vina `XS_TYPE_Met_D`
+/// so non-chelating ligands (e.g. PDE5 Sildenafil) are never pulled off their native binding mode.
 #[inline]
-pub fn pairwise_energy_and_deriv(
+pub fn metal_coord_energy_and_deriv(metal: Ad4Type, chelator_tier: u8, r: f64) -> (f64, f64) {
+    if chelator_tier < 2 || r >= 4.5 {
+        return (0.0, 0.0);
+    }
+    let r_opt = match metal {
+        Ad4Type::Ca => 2.35,
+        Ad4Type::Mg => 2.15,
+        _ => 2.05, // Zn, Fe, Mn tetrahedral/octahedral coordinate bond
+    };
+    let well = -2.45;
+    let sigma = 0.42;
+    let inv_s2 = 1.0 / (sigma * sigma);
+    let dr = r - r_opt;
+    let g = (-dr * dr * inv_s2).exp();
+    let e_att = well * g;
+    let de_att = e_att * (-2.0 * dr * inv_s2);
+
+    // Soft inner-wall steric repulsion strictly inside covalent clash distance (r < r_opt - 0.25)
+    let r_inner = r_opt - 0.25;
+    let (e_rep, de_rep) = if r < r_inner {
+        let pen = r - r_inner;
+        (16.0 * pen * pen, 32.0 * pen)
+    } else {
+        (0.0, 0.0)
+    };
+
+    let (env, d_env) = if r > 3.6 {
+        smooth_down(r, 3.6, 4.5)
+    } else {
+        (1.0, 0.0)
+    };
+    let raw_e = e_att + e_rep;
+    let raw_de = de_att + de_rep;
+    (raw_e * env, raw_de * env + raw_e * d_env)
+}
+
+/// Evaluates pairwise interaction `(energy_kcal, dE / dr, [g1, g2, rep, hyd, hb, elec, metal])`
+/// with optional catalytic metal coordination (`enable_metal`).
+#[inline]
+pub fn pairwise_energy_and_deriv_full(
     rec: &Atom3D,
     lig: &Atom3D,
+    lig_chelator_tier: u8,
     r: f64,
     sf: ScoringFunction,
-) -> (f64, f64, [f64; 6]) {
+    enable_metal: bool,
+) -> (f64, f64, [f64; 7]) {
     if r >= 8.0 || !rec.is_heavy() || !lig.is_heavy() {
-        return (0.0, 0.0, [0.0; 6]);
+        return (0.0, 0.0, [0.0; 7]);
     }
+
+    // Physical metal-ligand coordinate bond for true Tier-2 metal-binding warheads
+    if enable_metal && rec.ad4_type.is_metal() && lig_chelator_tier >= 2 {
+        let (em, dem) = metal_coord_energy_and_deriv(rec.ad4_type, lig_chelator_tier, r);
+        return (em, dem, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, em]);
+    }
+
     let r_opt = vina_vdw_radius(rec.ad4_type, sf) + vina_vdw_radius(lig.ad4_type, sf);
     let d = r - r_opt;
 
-    // Smooth cutoff envelope in [7.2, 8.0] so forces vanish continuously.
-    let (env, d_env) = if r > 7.2 {
-        smooth_down(r, 7.2, 8.0)
+    // Keep gauss2 at full AutoDock Vina strength up to 7.92 A, vanishing smoothly to 8.0 A.
+    let (env, d_env) = if r > 7.92 {
+        smooth_down(r, 7.92, 8.0)
     } else {
         (1.0, 0.0)
     };
@@ -212,8 +267,21 @@ pub fn pairwise_energy_and_deriv(
             e_hyd * env,
             e_hb * env,
             elec * env,
+            0.0,
         ],
     )
+}
+
+/// Evaluates pairwise interaction `(energy_kcal, dE / dr, terms[6])` (backward-compatible signature).
+#[inline]
+pub fn pairwise_energy_and_deriv(
+    rec: &Atom3D,
+    lig: &Atom3D,
+    r: f64,
+    sf: ScoringFunction,
+) -> (f64, f64, [f64; 6]) {
+    let (e, de, t7) = pairwise_energy_and_deriv_full(rec, lig, 0, r, sf, false);
+    (e, de, [t7[0], t7[1], t7[2], t7[3], t7[4], t7[5]])
 }
 
 #[must_use]
@@ -222,23 +290,63 @@ pub fn rotatable_penalty_divisor(n_rotatable: usize) -> f64 {
 }
 
 /// Evaluates full exact complex affinity (no grid approximation), plus intramolecular clash check.
+/// For `ScoringFunction::Vina` and `Vinardo`, this evaluates the exact literature form (for Vina 1.2.7
+/// parity); `DockCraftHybrid` includes catalytic metal coordination automatically.
 #[must_use]
 pub fn score_complex(
     receptor: &Molecule3D,
     ligand: &Molecule3D,
     sf: ScoringFunction,
 ) -> ScoreBreakdown {
+    score_complex_with_options(
+        receptor,
+        ligand,
+        sf,
+        sf == ScoringFunction::DockCraftHybrid,
+        None,
+    )
+}
+
+/// Evaluates exact complex affinity with explicit control over catalytic metal coordination
+/// and optional covalently attached `(rec_atom_idx, lig_atom_idx)` exclusion pair.
+#[must_use]
+pub fn score_complex_with_options(
+    receptor: &Molecule3D,
+    ligand: &Molecule3D,
+    sf: ScoringFunction,
+    enable_metal: bool,
+    covalent_exclude: Option<(usize, usize)>,
+) -> ScoreBreakdown {
     let mut bd = ScoreBreakdown::default();
-    let rec_heavy: Vec<&Atom3D> = receptor.atoms.iter().filter(|a| a.is_heavy()).collect();
-    let lig_heavy: Vec<(usize, &Atom3D)> = ligand
+    let rec_heavy: Vec<(usize, &Atom3D)> = receptor
         .atoms
         .iter()
         .enumerate()
         .filter(|(_, a)| a.is_heavy())
         .collect();
+    let lig_heavy: Vec<(usize, &Atom3D, u8)> = ligand
+        .atoms
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| a.is_heavy())
+        .map(|(i, a)| {
+            let tier = if enable_metal {
+                metal_chelation_tier(ligand, i)
+            } else {
+                0
+            };
+            (i, a, tier)
+        })
+        .collect();
 
-    for &(_, la) in &lig_heavy {
-        for &ra in &rec_heavy {
+    for &(li, la, tier) in &lig_heavy {
+        for &(ri, ra) in &rec_heavy {
+            if let Some((cov_r, cov_l)) = covalent_exclude
+                && ri == cov_r
+                && (li == cov_l || ligand.adj[cov_l].iter().any(|&(nb, _)| nb == li))
+            {
+                continue; // Exclude 1-2 & 1-3 nonbonded clash across covalent attachment bond
+            }
             let dx = la.coords[0] - ra.coords[0];
             if dx.abs() >= 8.0 {
                 continue;
@@ -256,7 +364,7 @@ pub fn score_complex(
                 continue;
             }
             let r = r2.sqrt();
-            let (e, _de, terms) = pairwise_energy_and_deriv(ra, la, r, sf);
+            let (e, _de, terms) = pairwise_energy_and_deriv_full(ra, la, tier, r, sf, enable_metal);
             bd.raw_inter_kcal += e;
             bd.gauss1 += terms[0];
             bd.gauss2 += terms[1];
@@ -264,13 +372,15 @@ pub fn score_complex(
             bd.hydrophobic += terms[3];
             bd.hbond += terms[4];
             bd.electrostatic += terms[5];
+            bd.metal_kcal += terms[6];
         }
     }
 
-    // Intramolecular nonbonded steric check for 1-4+ ligand heavy pairs
+    // Intramolecular nonbonded steric check for 1-4+ ligand heavy pairs (reported in intra_kcal;
+    // official AutoDock Vina reports total_affinity_kcal = raw_inter_kcal / rot_div)
     for i in 0..lig_heavy.len() {
-        let (idx_i, ai) = lig_heavy[i];
-        for &(idx_j, aj) in lig_heavy.iter().skip(i + 1) {
+        let (idx_i, ai, _) = lig_heavy[i];
+        for &(idx_j, aj, _) in lig_heavy.iter().skip(i + 1) {
             if are_topologically_close(ligand, idx_i, idx_j) {
                 continue;
             }
@@ -289,7 +399,7 @@ pub fn score_complex(
     }
 
     let div = rotatable_penalty_divisor(ligand.rotatable_bonds.len());
-    bd.total_affinity_kcal = (bd.raw_inter_kcal + 0.35 * bd.intra_kcal) / div;
+    bd.total_affinity_kcal = bd.raw_inter_kcal / div;
     bd
 }
 

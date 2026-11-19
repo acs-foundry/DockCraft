@@ -10,5 +10,6 @@ workspace = true
 
 [dependencies]
 struct-core = { path = "../struct-core" }
+rayon = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }

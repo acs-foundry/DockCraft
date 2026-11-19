@@ -65,6 +65,8 @@ pub struct EnrichmentMetrics {
     pub total_compounds: usize,
     pub total_actives: usize,
     pub roc_auc: f64,
+    #[serde(default)]
+    pub bedroc_20: f64,
     pub ef_1_percent: f64,
     pub ef_5_percent: f64,
 }
@@ -442,10 +444,36 @@ pub fn compute_enrichment_metrics(results: &[ScreenedCandidate]) -> Option<Enric
         if expected > 0.0 { hits / expected } else { 0.0 }
     };
 
+    // Exact Truchon & Bayly (2007) discrete BEDROC(alpha = 20.0) early-recognition metric
+    let alpha = 20.0_f64;
+    let mut ranked_labeled: Vec<(f64, bool)> = labeled
+        .iter()
+        .map(|&(idx, is_a)| (results[idx].best_affinity_kcal, is_a))
+        .collect();
+    ranked_labeled.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let sum_exp: f64 = ranked_labeled
+        .iter()
+        .enumerate()
+        .filter(|&(_, (_, is_a))| *is_a)
+        .map(|(rank_idx, _)| (-alpha * ((rank_idx + 1) as f64) / (total_n as f64)).exp())
+        .sum();
+    let s_max: f64 = (0..total_act)
+        .map(|i| (-alpha * ((i + 1) as f64) / (total_n as f64)).exp())
+        .sum();
+    let s_min: f64 = (0..total_act)
+        .map(|i| (-alpha * ((total_n - i) as f64) / (total_n as f64)).exp())
+        .sum();
+    let bedroc_20 = if (s_max - s_min).abs() > 1e-12 {
+        ((sum_exp - s_min) / (s_max - s_min)).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+
     Some(EnrichmentMetrics {
         total_compounds: total_n,
         total_actives: total_act,
         roc_auc,
+        bedroc_20,
         ef_1_percent: calc_ef(0.01),
         ef_5_percent: calc_ef(0.05),
     })
@@ -462,12 +490,18 @@ pub fn run_screening_campaign(
     }
     let start = Instant::now();
 
+    let enable_metal = config.metal_coordination
+        || config.scoring == dock_engine::ScoringFunction::DockCraftHybrid;
     // Collect union of all atom channel keys across the whole library to precompute shared affinity grids ONCE.
     let mut all_channels = Vec::new();
     for item in library {
-        for a in &item.molecule.atoms {
+        for (i, a) in item.molecule.atoms.iter().enumerate() {
             if a.is_heavy() {
-                all_channels.push(AtomChannelKey::from_atom(a));
+                all_channels.push(AtomChannelKey::from_mol_atom(
+                    &item.molecule,
+                    i,
+                    enable_metal,
+                ));
             }
         }
     }
@@ -477,9 +511,17 @@ pub fn run_screening_campaign(
             h_donor: false,
             h_acceptor: false,
             hydrophobic: true,
+            chelator_tier: 0,
         });
     }
-    let grids = AffinityGridSet::build(receptor, grid_box, &all_channels, config.scoring)?;
+    let grids = AffinityGridSet::build_with_options(
+        receptor,
+        grid_box,
+        &all_channels,
+        config.scoring,
+        enable_metal,
+        None,
+    )?;
 
     let mut screened: Vec<ScreenedCandidate> = library
         .par_iter()

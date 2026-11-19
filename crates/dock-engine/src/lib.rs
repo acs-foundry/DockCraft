@@ -1,16 +1,21 @@
 #![forbid(unsafe_code)]
 
+pub mod constraints;
 pub mod external;
 pub mod grid;
 pub mod search;
 pub mod vina;
 
+pub use constraints::{DockingConstraint, PharmacophoreKind};
 pub use external::{ExternalEngineKind, detect_available_external_engines, run_external_docking};
-pub use grid::AffinityGridSet;
+pub use grid::{AffinityGridSet, AtomChannelKey};
 pub use search::{
     DockingConfig, DockingPose, DockingReport, PoseTerms, dock_ligand, dock_ligand_with_grids,
 };
-pub use vina::{ScoreBreakdown, ScoringFunction, score_complex};
+pub use vina::{
+    ScoreBreakdown, ScoringFunction, metal_coord_energy_and_deriv, score_complex,
+    score_complex_with_options,
+};
 
 use thiserror::Error;
 

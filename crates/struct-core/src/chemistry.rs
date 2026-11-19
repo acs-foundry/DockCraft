@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::f64::consts::PI;
 
@@ -10,23 +11,99 @@ use crate::types::{
 /// Maximum atoms permitted in a single SMILES input parsed to 3D.
 pub const MAX_SMILES_3D_ATOMS: usize = 512;
 
+/// A crystallographic water molecule inside a binding pocket that forms >= 2 hydrogen bonds
+/// with receptor polar atoms (e.g. HIV-1 protease flap water HOH301 in 1HSG).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BridgingWater {
+    pub res_seq: i32,
+    pub chain_id: char,
+    pub atom_index: usize,
+    pub coords: [f64; 3],
+    pub receptor_hbonds: usize,
+    pub lining_residues: Vec<String>,
+}
+
+fn is_water_res(res_name: &str) -> bool {
+    matches!(
+        res_name.trim().to_ascii_uppercase().as_str(),
+        "HOH" | "WAT" | "DOD" | "TIP" | "TIP3"
+    )
+}
+
+/// Detect buried structural/bridging waters within `radius` Å of `center` that make at least
+/// `min_hbonds` polar contacts (2.3–3.5 Å) with receptor N/O atoms.
+#[must_use]
+pub fn detect_bridging_waters(
+    raw_receptor: &Molecule3D,
+    center: [f64; 3],
+    radius: f64,
+    min_hbonds: usize,
+) -> Vec<BridgingWater> {
+    let r2_box = radius * radius;
+    let mut out = Vec::new();
+    for (idx, a) in raw_receptor.atoms.iter().enumerate() {
+        if a.element != "O" || !is_water_res(&a.res_name) {
+            continue;
+        }
+        let d2 = (a.coords[0] - center[0]).powi(2)
+            + (a.coords[1] - center[1]).powi(2)
+            + (a.coords[2] - center[2]).powi(2);
+        if d2 > r2_box {
+            continue;
+        }
+        let mut hb = 0usize;
+        let mut res_set: BTreeSet<String> = BTreeSet::new();
+        for b in &raw_receptor.atoms {
+            if is_water_res(&b.res_name) || !matches!(b.element.as_str(), "N" | "O") {
+                continue;
+            }
+            let db2 = (a.coords[0] - b.coords[0]).powi(2)
+                + (a.coords[1] - b.coords[1]).powi(2)
+                + (a.coords[2] - b.coords[2]).powi(2);
+            if (2.25 * 2.25..=3.55 * 3.55).contains(&db2) {
+                hb += 1;
+                res_set.insert(format!("{}:{}{}", b.chain_id, b.res_name, b.res_seq));
+            }
+        }
+        if hb >= min_hbonds {
+            out.push(BridgingWater {
+                res_seq: a.res_seq,
+                chain_id: a.chain_id,
+                atom_index: idx,
+                coords: a.coords,
+                receptor_hbonds: hb,
+                lining_residues: res_set.into_iter().collect(),
+            });
+        }
+    }
+    out.sort_by_key(|w| std::cmp::Reverse(w.receptor_hbonds));
+    out
+}
+
 /// Clean a protein receptor: strip non-structural waters (`HOH`/`WAT`/`DOD`) when requested,
 /// infer missing covalent bonds, perceive rings/aromaticity, protonate at pH 7.4, add missing
 /// polar hydrogens, compute Gasteiger partial charges, and assign AutoDock4 atom types.
 pub fn prepare_receptor(mol: &mut Molecule3D, strip_waters: bool) {
     if strip_waters {
-        keep_non_water_atoms(mol);
+        keep_non_water_atoms(mol, &[]);
     }
     mol.infer_bonds_by_distance();
     perceive_all(mol);
 }
 
-fn keep_non_water_atoms(mol: &mut Molecule3D) {
+/// Prepare a receptor while selectively retaining specific crystallographic water residue numbers
+/// (e.g. `&[301]` for HIV-1 protease bridging water HOH301).
+pub fn prepare_receptor_keeping_waters(mol: &mut Molecule3D, keep_water_resseqs: &[i32]) {
+    keep_non_water_atoms(mol, keep_water_resseqs);
+    mol.infer_bonds_by_distance();
+    perceive_all(mol);
+}
+
+fn keep_non_water_atoms(mol: &mut Molecule3D, keep_water_resseqs: &[i32]) {
     let mut keep_map = vec![None; mol.atoms.len()];
     let mut kept = Vec::with_capacity(mol.atoms.len());
     for (idx, mut a) in mol.atoms.drain(..).enumerate() {
-        let rn = a.res_name.trim().to_ascii_uppercase();
-        if matches!(rn.as_str(), "HOH" | "WAT" | "DOD" | "TIP" | "TIP3") {
+        if is_water_res(&a.res_name) && !keep_water_resseqs.contains(&a.res_seq) {
             continue;
         }
         let nid = kept.len();
@@ -228,6 +305,19 @@ fn apply_ph74_protonation_and_polar_h(mol: &mut Molecule3D) {
             continue;
         }
 
+        // Preserve +2 formal charge on catalytic divalent metal ions
+        if matches!(el.as_str(), "Zn" | "Mg" | "Fe" | "Ca" | "Mn" | "Cu")
+            && mol.atoms[i].formal_charge == 0
+        {
+            mol.atoms[i].formal_charge = 2;
+            continue;
+        }
+        // Structural water oxygen: neutral, both donor and acceptor (2 hydrogens if unbonded)
+        if el == "O" && is_water_res(&rn) {
+            mol.atoms[i].formal_charge = 0;
+            continue;
+        }
+
         // Ligand carboxylic / sulfonic / phosphonic deprotonation & aliphatic amine protonation
         if el == "O" && mol.adj[i].len() == 1 {
             let c_nbr = mol.adj[i][0].0;
@@ -307,7 +397,7 @@ fn apply_ph74_protonation_and_polar_h(mol: &mut Molecule3D) {
         let target_h = match el {
             "N" => {
                 if a.aromatic {
-                    // Aromatic pyridine/imidazole nitrogen without substituent and with H if pyrrole/Trp NE1
+                    // Aromatic nitrogen: protein Trp/His or Kekulé pyrrole/indole/indazole/pyrimidone NH
                     let rn = a.res_name.trim().to_ascii_uppercase();
                     let an = a.name.trim().to_ascii_uppercase();
                     if (rn == "TRP" && an == "NE1")
@@ -315,6 +405,23 @@ fn apply_ph74_protonation_and_polar_h(mol: &mut Molecule3D) {
                         || (rn == "HIE" && an == "NE2")
                     {
                         1
+                    } else if existing_h > 0 {
+                        existing_h
+                    } else if a.is_hetatm && a.formal_charge == 0 {
+                        // In Kekulé SDF/MOL2, pyrrole/indole/indazole/pyrimidone [nH] has 2 Single heavy bonds
+                        // and 0 Double bonds (bond_order_sum == 2), whereas pyridine =N- has a Double bond (sum == 3).
+                        let heavy_bonds: Vec<BondOrder> = mol.adj[i]
+                            .iter()
+                            .filter(|&&(nb, _)| mol.atoms[nb].is_heavy())
+                            .map(|&(_, bid)| mol.bonds[bid].order)
+                            .collect();
+                        if heavy_bonds.len() == 2
+                            && heavy_bonds.iter().all(|&o| o == BondOrder::Single)
+                        {
+                            1
+                        } else {
+                            0
+                        }
                     } else {
                         0
                     }
@@ -330,7 +437,9 @@ fn apply_ph74_protonation_and_polar_h(mol: &mut Molecule3D) {
                 }
             }
             "O" => {
-                if a.formal_charge < 0 {
+                if is_water_res(&a.res_name) {
+                    2
+                } else if a.formal_charge < 0 {
                     0
                 } else {
                     2usize.saturating_sub(bond_order_sum)
@@ -533,7 +642,11 @@ pub fn assign_ad4_types_and_flags(mol: &mut Molecule3D) {
                 }
             }
             "N" => {
-                if mol.atoms[i].formal_charge > 0 || bonded_h >= 2 || is_amide_nitrogen(mol, i) {
+                if mol.atoms[i].formal_charge > 0
+                    || bonded_h >= 2
+                    || is_amide_nitrogen(mol, i)
+                    || (arom && bonded_h > 0)
+                {
                     Ad4Type::N
                 } else if bonded_h == 1 || heavy_deg <= 3 {
                     Ad4Type::NA
@@ -569,14 +682,23 @@ pub fn assign_ad4_types_and_flags(mol: &mut Molecule3D) {
             _ => Ad4Type::X,
         };
 
-        let has_on_neighbor = mol.adj[i]
-            .iter()
-            .any(|&(nb, _)| matches!(mol.atoms[nb].element.as_str(), "O" | "N"));
+        let is_water = el == "O" && is_water_res(&mol.atoms[i].res_name);
+        let has_hetero_neighbor = mol.adj[i].iter().any(|&(nb, _)| {
+            matches!(
+                mol.atoms[nb].element.as_str(),
+                "O" | "N" | "S" | "F" | "Cl" | "Br" | "I" | "P"
+            )
+        });
         let a = &mut mol.atoms[i];
         a.ad4_type = ad4;
-        a.h_donor = bonded_h > 0 && matches!(el.as_str(), "N" | "O" | "S");
-        a.h_acceptor = ad4.is_acceptor() && a.formal_charge <= 0;
-        a.hydrophobic = ad4.is_hydrophobic() && !(el == "C" && has_on_neighbor);
+        // Exact AutoDock Vina X-Score H-bond / hydrophobic typing:
+        // - Metals act as H-bond donors (XS_TYPE_Met_D); sulfur is neither donor nor acceptor;
+        // - Structural waters are both donor and acceptor;
+        // - Carbons are hydrophobic (XS_TYPE_C_H) iff bonded only to C/H; halogens are hydrophobic.
+        a.h_donor =
+            is_water || ad4.is_metal() || (bonded_h > 0 && matches!(el.as_str(), "N" | "O"));
+        a.h_acceptor = is_water || (ad4.is_acceptor() && a.formal_charge <= 0);
+        a.hydrophobic = ad4.is_hydrophobic() && !(el == "C" && has_hetero_neighbor);
     }
 }
 
@@ -589,6 +711,102 @@ fn is_amide_nitrogen(mol: &Molecule3D, idx: usize) -> bool {
                     && mol.bonds[bid].order == BondOrder::Double
             })
     })
+}
+
+/// Classify a heavy atom's metal-coordination strength (AutoDock4Zn / Glide / GOLD coordination rules):
+/// - `2` (Strong): primary/secondary sulfonamide N, hydroxamate O/N (`-C(=O)N-O`), anionic O-/S-
+///   (carboxylate/phosphonate/thiolate), free thiol `-SH`, or 5-ring aromatic azole lone-pair N.
+/// - `1` (Moderate): neutral `OA` carbonyl/hydroxyl, 6-ring aromatic `NA` (pyridine), neutral amine `NA`.
+/// - `0` (None): carbons, halogens, cationic `N+`, bulk amide N, thioether/sulfone S.
+#[must_use]
+pub fn metal_chelation_tier(mol: &Molecule3D, idx: usize) -> u8 {
+    let Some(a) = mol.atoms.get(idx) else {
+        return 0;
+    };
+    if !a.is_heavy() || a.ad4_type.is_metal() || a.formal_charge > 0 {
+        return 0;
+    }
+    let heavy_deg = mol.adj[idx]
+        .iter()
+        .filter(|&&(nb, _)| mol.atoms[nb].is_heavy())
+        .count();
+
+    match a.element.as_str() {
+        "N" => {
+            // Primary/secondary sulfonamide/sulfamate N: bonded to S(=O)(=O) and <= 2 heavy neighbors
+            let is_sulfonamide_n = heavy_deg <= 2
+                && mol.adj[idx].iter().any(|&(s, _)| {
+                    mol.atoms[s].element == "S"
+                        && mol.adj[s]
+                            .iter()
+                            .filter(|&&(o, bid)| {
+                                mol.atoms[o].element == "O"
+                                    && mol.bonds[bid].order == BondOrder::Double
+                            })
+                            .count()
+                            >= 2
+                });
+            if is_sulfonamide_n {
+                return 2;
+            }
+            // Hydroxamate N: bonded to both C(=O) and O
+            let has_o = mol.adj[idx]
+                .iter()
+                .any(|&(nb, _)| mol.atoms[nb].element == "O");
+            if has_o && is_amide_nitrogen(mol, idx) {
+                return 2;
+            }
+            // Neutral sp2/amine N acceptors (pyridine, imidazole, thiadiazole) get gentle tier 1
+            if a.h_acceptor && !is_amide_nitrogen(mol, idx) {
+                1
+            } else {
+                0
+            }
+        }
+        "O" => {
+            if a.formal_charge < 0 {
+                return 2; // Anionic carboxylate, phosphonate, phenolate
+            }
+            // Hydroxamate hydroxyl O (bonded to N that is bonded to C=O)
+            let is_hydroxamate_oh = mol.adj[idx]
+                .iter()
+                .any(|&(n, _)| mol.atoms[n].element == "N" && is_amide_nitrogen(mol, n));
+            if is_hydroxamate_oh {
+                return 2;
+            }
+            // Hydroxamate carbonyl O (C=O where C is bonded to N-O)
+            let is_hydroxamate_co = mol.adj[idx].iter().any(|&(c, bid)| {
+                mol.atoms[c].element == "C"
+                    && mol.bonds[bid].order == BondOrder::Double
+                    && mol.adj[c].iter().any(|&(n, _)| {
+                        mol.atoms[n].element == "N"
+                            && mol.adj[n]
+                                .iter()
+                                .any(|&(o2, _)| mol.atoms[o2].element == "O")
+                    })
+            });
+            if is_hydroxamate_co {
+                return 2;
+            }
+            // Carboxylate carbonyl O (C=O where C also has an anionic O-)
+            let is_carboxylate_co = mol.adj[idx].iter().any(|&(c, bid)| {
+                mol.atoms[c].element == "C"
+                    && mol.bonds[bid].order == BondOrder::Double
+                    && mol.adj[c].iter().any(|&(o2, _)| {
+                        o2 != idx && mol.atoms[o2].element == "O" && mol.atoms[o2].formal_charge < 0
+                    })
+            });
+            if is_carboxylate_co {
+                return 2;
+            }
+            1
+        }
+        "S" => {
+            // Free thiol (-SH) or thiolate (-S-)
+            if heavy_deg <= 1 { 2 } else { 0 }
+        }
+        _ => 0,
+    }
 }
 
 /// Extract non-ring, non-terminal rotatable single bonds anchored from the largest rigid component.
@@ -778,6 +996,8 @@ pub fn parse_smiles_to_3d(input: &str, name: Option<&str>) -> Result<Molecule3D,
     const PENDING_H: usize = usize::MAX - 1;
     let mut chiral: Vec<(usize, i8)> = Vec::new();
     let mut nbr_order: HashMap<usize, Vec<usize>> = HashMap::new();
+    let mut pending_dir: i8 = 0; // +1 for '/', -1 for '\'
+    let mut ez_dirs: Vec<(usize, usize, i8)> = Vec::new();
     let mut i = 0usize;
 
     while i < bytes.len() {
@@ -819,7 +1039,12 @@ pub fn parse_smiles_to_3d(input: &str, name: Option<&str>) -> Result<Molecule3D,
                 pending_bond = Some(BondOrder::Aromatic);
                 i += 1;
             }
-            b'/' | b'\\' => {
+            b'/' => {
+                pending_dir = 1;
+                i += 1;
+            }
+            b'\\' => {
+                pending_dir = -1;
                 i += 1;
             }
             b'%' | b'0'..=b'9' => {
@@ -888,6 +1113,9 @@ pub fn parse_smiles_to_3d(input: &str, name: Option<&str>) -> Result<Molecule3D,
                         }
                     });
                     let _ = mol.add_bond(prev, nid, bo);
+                    if pending_dir != 0 {
+                        ez_dirs.push((prev, nid, pending_dir));
+                    }
                     nbr_order.entry(prev).or_default().push(nid);
                     nbr_order.entry(nid).or_default().push(prev);
                 }
@@ -901,6 +1129,7 @@ pub fn parse_smiles_to_3d(input: &str, name: Option<&str>) -> Result<Molecule3D,
                 }
                 current = Some(nid);
                 pending_bond = None;
+                pending_dir = 0;
                 i = next_i;
             }
             _ => {
@@ -921,11 +1150,15 @@ pub fn parse_smiles_to_3d(input: &str, name: Option<&str>) -> Result<Molecule3D,
                         }
                     });
                     let _ = mol.add_bond(prev, nid, bo);
+                    if pending_dir != 0 {
+                        ez_dirs.push((prev, nid, pending_dir));
+                    }
                     nbr_order.entry(prev).or_default().push(nid);
                     nbr_order.entry(nid).or_default().push(prev);
                 }
                 current = Some(nid);
                 pending_bond = None;
+                pending_dir = 0;
                 i = next_i;
             }
         }
@@ -975,8 +1208,118 @@ pub fn parse_smiles_to_3d(input: &str, name: Option<&str>) -> Result<Molecule3D,
         }
     }
     enforce_tetrahedral_chirality(&mut mol, &chiral, &nbr_order);
+    enforce_ez_stereo(&mut mol, &ez_dirs);
     perceive_all(&mut mol);
     Ok(mol)
+}
+
+/// Enforce SMILES `E/Z` (`/` and `\`) stereochemistry across non-ring double bonds by rigidly
+/// rotating one substituent branch by 180° around the double-bond axis when its cis/trans
+/// parity disagrees with the directional SMILES markers.
+fn enforce_ez_stereo(mol: &mut Molecule3D, ez_dirs: &[(usize, usize, i8)]) {
+    if ez_dirs.is_empty() {
+        return;
+    }
+    let mut ring_edges: BTreeSet<usize> = BTreeSet::new();
+    for r in &mol.rings {
+        for w in 0..r.len() {
+            let u = r[w];
+            let v = r[(w + 1) % r.len()];
+            if let Some(&(_, bid)) = mol.adj[u].iter().find(|&&(nb, _)| nb == v) {
+                ring_edges.insert(bid);
+            }
+        }
+    }
+    // Map directed pair (from, to) -> sign (+1 for '/', -1 for '\'); reverse bond has opposite sign
+    let mut dir_map: HashMap<(usize, usize), i8> = HashMap::new();
+    for &(u, v, s) in ez_dirs {
+        dir_map.insert((u, v), s);
+        dir_map.insert((v, u), -s);
+    }
+
+    for b in mol.bonds.clone() {
+        if b.order != BondOrder::Double || ring_edges.contains(&b.id) {
+            continue;
+        }
+        // Find one directional substituent on u (other than v) and one on v (other than u)
+        let sub_u = mol.adj[b.u]
+            .iter()
+            .filter(|&&(nb, _)| nb != b.v)
+            .find_map(|&(nb, _)| dir_map.get(&(b.u, nb)).map(|&s| (nb, s)));
+        let sub_v = mol.adj[b.v]
+            .iter()
+            .filter(|&&(nb, _)| nb != b.u)
+            .find_map(|&(nb, _)| dir_map.get(&(b.v, nb)).map(|&s| (nb, s)));
+        let (Some((a, s_ua)), Some((d, s_vd))) = (sub_u, sub_v) else {
+            continue;
+        };
+        // From a->u=v->d: dir(a->u) = -s_ua, dir(v->d) = s_vd.
+        // Same SMILES slash (e.g. F/C=C/F => dir(a->u) == dir(v->d)) means TRANS (anti);
+        // opposite SMILES slash (F/C=C\F => dir(a->u) == -dir(v->d)) means CIS (syn).
+        let want_trans = (-s_ua) == s_vd;
+
+        let pu = mol.atoms[b.u].coords;
+        let pv = mol.atoms[b.v].coords;
+        let pa = mol.atoms[a].coords;
+        let pd = mol.atoms[d].coords;
+        let axis = norm3([pv[0] - pu[0], pv[1] - pu[1], pv[2] - pu[2]]);
+        let va = [pa[0] - pu[0], pa[1] - pu[1], pa[2] - pu[2]];
+        let vd = [pd[0] - pv[0], pd[1] - pv[1], pd[2] - pv[2]];
+        let da_ax = va[0] * axis[0] + va[1] * axis[1] + va[2] * axis[2];
+        let dd_ax = vd[0] * axis[0] + vd[1] * axis[1] + vd[2] * axis[2];
+        let pa_perp = [
+            va[0] - da_ax * axis[0],
+            va[1] - da_ax * axis[1],
+            va[2] - da_ax * axis[2],
+        ];
+        let pd_perp = [
+            vd[0] - dd_ax * axis[0],
+            vd[1] - dd_ax * axis[1],
+            vd[2] - dd_ax * axis[2],
+        ];
+        let pa_len =
+            (pa_perp[0] * pa_perp[0] + pa_perp[1] * pa_perp[1] + pa_perp[2] * pa_perp[2]).sqrt();
+        let pd_len =
+            (pd_perp[0] * pd_perp[0] + pd_perp[1] * pd_perp[1] + pd_perp[2] * pd_perp[2]).sqrt();
+        if pa_len < 1e-6 || pd_len < 1e-6 {
+            continue;
+        }
+        let u1 = [
+            pa_perp[0] / pa_len,
+            pa_perp[1] / pa_len,
+            pa_perp[2] / pa_len,
+        ];
+        let u2 = cross3(axis, u1);
+        let cx = pd_perp[0] * u1[0] + pd_perp[1] * u1[1] + pd_perp[2] * u1[2];
+        let cy = pd_perp[0] * u2[0] + pd_perp[1] * u2[1] + pd_perp[2] * u2[2];
+        let cur_phi = cy.atan2(cx);
+        let target_phi = if want_trans { PI } else { 0.0 };
+        let delta = target_phi - cur_phi;
+        if delta.sin().abs() < 1e-4 && delta.cos() > 0.999 {
+            continue;
+        }
+        // Rotate the v-side branch around the u->v axis to snap exactly to planar E (180°) or Z (0°)
+        let branch = branch_from(mol, b.v, b.u);
+        if branch.contains(&b.u) {
+            continue;
+        }
+        let cos_d = delta.cos();
+        let sin_d = delta.sin();
+        for atom_id in branch {
+            if atom_id == b.v {
+                continue;
+            }
+            let q = mol.atoms[atom_id].coords;
+            let r = [q[0] - pv[0], q[1] - pv[1], q[2] - pv[2]];
+            let k_dot_r = axis[0] * r[0] + axis[1] * r[1] + axis[2] * r[2];
+            let k_cross_r = cross3(axis, r);
+            mol.atoms[atom_id].coords = [
+                pv[0] + r[0] * cos_d + k_cross_r[0] * sin_d + axis[0] * k_dot_r * (1.0 - cos_d),
+                pv[1] + r[1] * cos_d + k_cross_r[1] * sin_d + axis[1] * k_dot_r * (1.0 - cos_d),
+                pv[2] + r[2] * cos_d + k_cross_r[2] * sin_d + axis[2] * k_dot_r * (1.0 - cos_d),
+            ];
+        }
+    }
 }
 
 /// Signed volume of the tetrahedron `(a, b, c, d)`.
@@ -1332,6 +1675,9 @@ pub fn embed_3d_coordinates(mol: &mut Molecule3D) {
         let theta = ideal_bond_angle(mol, u);
         let phase = (u as f64) * 0.9;
         for (v, bid) in unplaced {
+            if coords[v].is_some() {
+                continue;
+            }
             let bl = ideal_bond_length(
                 &mol.atoms[u].element,
                 &mol.atoms[v].element,
@@ -1345,6 +1691,47 @@ pub fn embed_3d_coordinates(mol: &mut Molecule3D) {
                 pu[2] + bl * v_dir[2],
             ]);
             q.push_back(v);
+
+            // If `v` enters an unplaced secondary ring system (e.g. multi-ring drugs like
+            // tamoxifen, raloxifene, imatinib, indinavir), place that ring and any rings fused
+            // to it as proper 3D polygons right now rather than growing them as a torn tree.
+            if let Some(ri) = (0..mol.rings.len())
+                .filter(|&r_idx| !placed_rings[r_idx] && mol.rings[r_idx].contains(&v))
+                .max_by_key(|&r_idx| mol.rings[r_idx].len())
+            {
+                place_attached_ring_3d(mol, &mol.rings[ri], v, v_dir, &mut coords);
+                placed_rings[ri] = true;
+                for &rv in &mol.rings[ri] {
+                    if rv != v {
+                        q.push_back(rv);
+                    }
+                }
+                // Propagate any fused rings sharing an edge with this newly placed ring
+                loop {
+                    let mut fused_prog = false;
+                    for rj in 0..mol.rings.len() {
+                        if placed_rings[rj] {
+                            continue;
+                        }
+                        let ring = &mol.rings[rj];
+                        if let Some((k1, k2)) = (0..ring.len()).find_map(|idx| {
+                            let jdx = (idx + 1) % ring.len();
+                            (coords[ring[idx]].is_some() && coords[ring[jdx]].is_some())
+                                .then_some((idx, jdx))
+                        }) {
+                            place_fused_ring_3d(mol, ring, k1, k2, &mut coords);
+                            placed_rings[rj] = true;
+                            for &rv in ring {
+                                q.push_back(rv);
+                            }
+                            fused_prog = true;
+                        }
+                    }
+                    if !fused_prog {
+                        break;
+                    }
+                }
+            }
         }
     }
 
@@ -1393,9 +1780,12 @@ pub fn embed_3d_coordinates(mol: &mut Molecule3D) {
     // their pucker re-imposed between them, because the first block flattens the ones fused to an
     // aromatic partner.
     let mut pos: Vec<[f64; 3]> = coords.into_iter().map(|c| c.unwrap_or([0.0; 3])).collect();
-    for step in 0..56 {
-        if step == 36 {
+    for step in 0..72 {
+        if step == 44 {
             pucker_saturated_rings(mol, &mut pos);
+        }
+        if step % 8 == 7 || step == 71 {
+            flatten_aromatic_rings(mol, &mut pos);
         }
         let mut disp = vec![[0.0; 3]; n];
         for b in &mol.bonds {
@@ -1507,6 +1897,223 @@ fn place_3d_ring(
             center[1] + rad * ang.sin(),
             center[2] + z,
         ]);
+    }
+}
+
+/// Place a ring in 3D anchored at an already-placed attachment atom `anchor` so that the ring
+/// extends cleanly outward along `out_dir` (e.g. a secondary phenyl or piperidine ring reached via BFS).
+fn place_attached_ring_3d(
+    mol: &Molecule3D,
+    ring: &[usize],
+    anchor: usize,
+    out_dir: [f64; 3],
+    coords: &mut [Option<[f64; 3]>],
+) {
+    let Some(pos_in_ring) = ring.iter().position(|&v| v == anchor) else {
+        return;
+    };
+    let Some(p_anchor) = coords[anchor] else {
+        return;
+    };
+    let n = ring.len();
+    let k = n as f64;
+    let bond_len = ring_bond_length(mol, ring);
+    let pucker = ring_pucker(mol, ring);
+    let planar_chord = if pucker > 0.0 && n.is_multiple_of(2) {
+        (bond_len * bond_len - 4.0 * pucker * pucker)
+            .max(0.04)
+            .sqrt()
+    } else {
+        bond_len
+    };
+    let rad = planar_chord / (2.0 * (PI / k).sin());
+
+    let e1 = norm3(out_dir);
+    let arb = if e1[2].abs() < 0.85 {
+        [0.0, 0.0, 1.0]
+    } else {
+        [1.0, 0.0, 0.0]
+    };
+    let e2 = norm3(cross3(e1, arb));
+    let e3 = cross3(e1, e2);
+
+    // Center lies at p_anchor + rad * e1, so anchor is at angle = PI in the (e1, e2) plane
+    let center = [
+        p_anchor[0] + rad * e1[0],
+        p_anchor[1] + rad * e1[1],
+        p_anchor[2] + rad * e1[2],
+    ];
+    for (idx, &v) in ring.iter().enumerate() {
+        if coords[v].is_some() {
+            continue;
+        }
+        let step = (idx as isize - pos_in_ring as isize).rem_euclid(n as isize) as f64;
+        let ang = PI + 2.0 * PI * step / k;
+        let z = if pucker <= 0.0 {
+            0.0
+        } else if n.is_multiple_of(2) {
+            if idx.is_multiple_of(2) {
+                pucker
+            } else {
+                -pucker
+            }
+        } else if idx == 0 {
+            pucker * 1.6
+        } else {
+            0.0
+        };
+        let ca = ang.cos();
+        let sa = ang.sin();
+        coords[v] = Some([
+            center[0] + rad * (ca * e1[0] + sa * e2[0]) + z * e3[0],
+            center[1] + rad * (ca * e1[1] + sa * e2[1]) + z * e3[1],
+            center[2] + rad * (ca * e1[2] + sa * e2[2]) + z * e3[2],
+        ]);
+    }
+}
+
+/// Place a ring in 3D fused across an already-placed shared edge `(ring[k1], ring[k2])`.
+fn place_fused_ring_3d(
+    mol: &Molecule3D,
+    ring: &[usize],
+    k1: usize,
+    k2: usize,
+    coords: &mut [Option<[f64; 3]>],
+) {
+    let (Some(p1), Some(p2)) = (coords[ring[k1]], coords[ring[k2]]) else {
+        return;
+    };
+    let edge = [p2[0] - p1[0], p2[1] - p1[1], p2[2] - p1[2]];
+    let elen = (edge[0] * edge[0] + edge[1] * edge[1] + edge[2] * edge[2])
+        .sqrt()
+        .max(1e-4);
+    let e_edge = [edge[0] / elen, edge[1] / elen, edge[2] / elen];
+    let mid = [
+        0.5 * (p1[0] + p2[0]),
+        0.5 * (p1[1] + p2[1]),
+        0.5 * (p1[2] + p2[2]),
+    ];
+    // Choose in-plane outward normal pointing away from already-placed neighbours of ring[k1]/ring[k2]
+    let cen = centroid_opt3(coords);
+    let away = [mid[0] - cen[0], mid[1] - cen[1], mid[2] - cen[2]];
+    let proj = away[0] * e_edge[0] + away[1] * e_edge[1] + away[2] * e_edge[2];
+    let perp_raw = [
+        away[0] - proj * e_edge[0],
+        away[1] - proj * e_edge[1],
+        away[2] - proj * e_edge[2],
+    ];
+    let perp_len =
+        (perp_raw[0] * perp_raw[0] + perp_raw[1] * perp_raw[1] + perp_raw[2] * perp_raw[2]).sqrt();
+    let e_out = if perp_len > 1e-4 {
+        [
+            perp_raw[0] / perp_len,
+            perp_raw[1] / perp_len,
+            perp_raw[2] / perp_len,
+        ]
+    } else {
+        let arb = if e_edge[2].abs() < 0.85 {
+            [0.0, 0.0, 1.0]
+        } else {
+            [1.0, 0.0, 0.0]
+        };
+        norm3(cross3(e_edge, arb))
+    };
+    let e_norm = norm3(cross3(e_edge, e_out));
+
+    let n = ring.len();
+    let sides = n as f64;
+    let rad = elen / (2.0 * (PI / sides).sin());
+    let apo = (rad * rad - (0.5 * elen).powi(2)).max(0.0).sqrt();
+    let center = [
+        mid[0] + apo * e_out[0],
+        mid[1] + apo * e_out[1],
+        mid[2] + apo * e_out[2],
+    ];
+
+    // Local 2D coordinates in (e_edge, e_out) frame
+    let pucker = ring_pucker(mol, ring);
+    let v1 = [p1[0] - center[0], p1[1] - center[1], p1[2] - center[2]];
+    let v2 = [p2[0] - center[0], p2[1] - center[1], p2[2] - center[2]];
+    let a1 = (v1[0] * e_out[0] + v1[1] * e_out[1] + v1[2] * e_out[2])
+        .atan2(v1[0] * e_edge[0] + v1[1] * e_edge[1] + v1[2] * e_edge[2]);
+    let a2 = (v2[0] * e_out[0] + v2[1] * e_out[1] + v2[2] * e_out[2])
+        .atan2(v2[0] * e_edge[0] + v2[1] * e_edge[1] + v2[2] * e_edge[2]);
+    let mut diff = a2 - a1;
+    while diff > PI {
+        diff -= 2.0 * PI;
+    }
+    while diff < -PI {
+        diff += 2.0 * PI;
+    }
+    let step = if diff < 0.0 {
+        -2.0 * PI / sides
+    } else {
+        2.0 * PI / sides
+    };
+    for (idx, &v) in ring.iter().enumerate() {
+        if coords[v].is_none() {
+            let d = (idx as isize - k1 as isize).rem_euclid(n as isize) as f64;
+            let ang = a1 + d * step;
+            let z = if pucker <= 0.0 {
+                0.0
+            } else if idx.is_multiple_of(2) {
+                pucker
+            } else {
+                -pucker
+            };
+            let ca = ang.cos();
+            let sa = ang.sin();
+            coords[v] = Some([
+                center[0] + rad * (ca * e_edge[0] + sa * e_out[0]) + z * e_norm[0],
+                center[1] + rad * (ca * e_edge[1] + sa * e_out[1]) + z * e_norm[1],
+                center[2] + rad * (ca * e_edge[2] + sa * e_out[2]) + z * e_norm[2],
+            ]);
+        }
+    }
+}
+
+/// Project every planar aromatic 5/6-ring onto its best-fit plane during 3D coordinate relaxation
+/// so aromatic rings stay cleanly planar (~0.00 Å RMSD out-of-plane).
+fn flatten_aromatic_rings(mol: &Molecule3D, pos: &mut [[f64; 3]]) {
+    for ring in &mol.rings {
+        if !(5..=6).contains(&ring.len()) {
+            continue;
+        }
+        let is_arom = ring.iter().all(|&v| mol.atoms[v].aromatic);
+        if !is_arom {
+            continue;
+        }
+        let k = ring.len() as f64;
+        let mut c = [0.0; 3];
+        for &v in ring {
+            for j in 0..3 {
+                c[j] += pos[v][j] / k;
+            }
+        }
+        // Compute mean ring normal via Newell's method (robust for any 5/6-gon orientation)
+        let mut nrm = [0.0; 3];
+        for i in 0..ring.len() {
+            let a = pos[ring[i]];
+            let b = pos[ring[(i + 1) % ring.len()]];
+            let ra = [a[0] - c[0], a[1] - c[1], a[2] - c[2]];
+            let rb = [b[0] - c[0], b[1] - c[1], b[2] - c[2]];
+            let cr = cross3(ra, rb);
+            for j in 0..3 {
+                nrm[j] += cr[j];
+            }
+        }
+        let nl = (nrm[0] * nrm[0] + nrm[1] * nrm[1] + nrm[2] * nrm[2]).sqrt();
+        if nl < 1e-6 {
+            continue;
+        }
+        let u = [nrm[0] / nl, nrm[1] / nl, nrm[2] / nl];
+        for &v in ring {
+            let r = [pos[v][0] - c[0], pos[v][1] - c[1], pos[v][2] - c[2]];
+            let h = r[0] * u[0] + r[1] * u[1] + r[2] * u[2];
+            pos[v][0] -= 0.75 * h * u[0];
+            pos[v][1] -= 0.75 * h * u[1];
+            pos[v][2] -= 0.75 * h * u[2];
+        }
     }
 }
 
