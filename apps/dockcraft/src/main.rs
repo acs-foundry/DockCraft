@@ -30,6 +30,7 @@ use hyde_scorer::{
     HydeReport, SubstituentPreset, TorsionStatus, consensus_affinity_kcal,
     mutate_and_minimize_in_pocket, score_pose_hyde,
 };
+use pharm_core::{FeatureSource, SiteAnalysisConfig, SiteBlueprint, analyze_binding_site};
 use pocket_detect::{BindingPocket, GridBox, PocketDetectConfig, detect_pockets};
 use struct_core::{
     Atom3D, BondOrder, BridgingWater, Molecule3D, assign_ad4_types_and_flags,
@@ -200,6 +201,8 @@ struct DockCraftApp {
     metal_coordination: bool,
     hyde_rerank: bool,
     constraints: Vec<DockingConstraint>,
+    site_blueprint: Option<SiteBlueprint>,
+    blueprint_use_holo: bool,
     new_pharm_kind: PharmacophoreKind,
     new_pharm_radius: f64,
     flex_residues_input: String,
@@ -255,6 +258,8 @@ impl DockCraftApp {
             metal_coordination: true,
             hyde_rerank: true,
             constraints: Vec::new(),
+            site_blueprint: None,
+            blueprint_use_holo: true,
             new_pharm_kind: PharmacophoreKind::HAcceptor,
             new_pharm_radius: 2.0,
             flex_residues_input: String::new(),
@@ -372,8 +377,21 @@ impl DockCraftApp {
             .collect()
     }
 
+    fn pharm_kind_rgba(kind: PharmacophoreKind) -> [f32; 4] {
+        match kind {
+            PharmacophoreKind::HDonor => [0.20, 0.65, 1.0, 0.28],
+            PharmacophoreKind::HAcceptor => [1.0, 0.30, 0.30, 0.28],
+            PharmacophoreKind::Aromatic => [0.95, 0.55, 0.18, 0.28],
+            PharmacophoreKind::Hydrophobic => [0.95, 0.85, 0.25, 0.25],
+            PharmacophoreKind::PositiveIonizable => [0.28, 0.45, 1.0, 0.30],
+            PharmacophoreKind::NegativeIonizable => [1.0, 0.25, 0.65, 0.30],
+            PharmacophoreKind::MetalChelate => [0.88, 0.35, 0.98, 0.32],
+            PharmacophoreKind::AnyHeavy => [0.65, 0.90, 0.70, 0.22],
+        }
+    }
+
     fn sync_pharmacophore_visuals(&mut self) {
-        self.viewport_opts.pharmacophore_spheres = self
+        let mut spheres: Vec<([f64; 3], f64, [f32; 4])> = self
             .constraints
             .iter()
             .filter_map(|c| match c {
@@ -382,21 +400,154 @@ impl DockCraftApp {
                     radius,
                     kind,
                     ..
-                } => {
-                    let col = match kind {
-                        PharmacophoreKind::HDonor => [0.20, 0.65, 1.0, 0.25],
-                        PharmacophoreKind::HAcceptor => [1.0, 0.30, 0.30, 0.25],
-                        PharmacophoreKind::Aromatic => [0.85, 0.45, 1.0, 0.25],
-                        PharmacophoreKind::Hydrophobic => [0.95, 0.85, 0.25, 0.25],
-                        PharmacophoreKind::MetalChelate => [1.0, 0.40, 0.90, 0.30],
-                        PharmacophoreKind::AnyHeavy => [0.65, 0.90, 0.70, 0.22],
-                    };
-                    Some((*center, *radius, col))
-                }
+                } => Some((*center, *radius, Self::pharm_kind_rgba(*kind))),
                 _ => None,
             })
             .collect();
+        let mut vectors: Vec<([f64; 3], [f64; 3], [f32; 4])> = Vec::new();
+        let mut excl: Vec<([f64; 3], f64)> = Vec::new();
+        if let Some(bp) = &self.site_blueprint {
+            if spheres.is_empty() {
+                for f in bp.features.iter().filter(|f| f.enabled) {
+                    spheres.push((f.center, f.radius_a, Self::pharm_kind_rgba(f.kind)));
+                }
+            }
+            for f in bp.features.iter().filter(|f| f.enabled) {
+                if let Some(dir) = f.direction {
+                    let tip = [
+                        f.center[0] + dir[0] * 1.85,
+                        f.center[1] + dir[1] * 1.85,
+                        f.center[2] + dir[2] * 1.85,
+                    ];
+                    let mut col = Self::pharm_kind_rgba(f.kind);
+                    col[3] = 0.95;
+                    vectors.push((f.center, tip, col));
+                }
+            }
+            excl = bp
+                .exclusion_spheres
+                .iter()
+                .map(|e| (e.center, e.radius_a))
+                .collect();
+        }
+        self.viewport_opts.pharmacophore_spheres = spheres;
+        self.viewport_opts.pharmacophore_vectors = vectors;
+        self.viewport_opts.exclusion_spheres = excl;
         self.scene_dirty = true;
+    }
+
+    fn analyze_active_site_now(&mut self) {
+        let Some(rec) = self
+            .raw_receptor_with_waters
+            .as_ref()
+            .or(self.receptor.as_ref())
+        else {
+            self.status_line = "Load a receptor before analyzing the active site.".to_string();
+            return;
+        };
+        let holo_vec: Vec<&Molecule3D> = if self.blueprint_use_holo {
+            self.ligand.iter().collect()
+        } else {
+            Vec::new()
+        };
+        match analyze_binding_site(
+            rec,
+            &self.grid_box,
+            &holo_vec,
+            &SiteAnalysisConfig::default(),
+        ) {
+            Ok(bp) => {
+                self.status_line = format!(
+                    "Site Blueprint: {:.0} A3 ({:.1}x{:.1}x{:.1} A) | {} hotspots | {} optimal distances ({} ms)",
+                    bp.geometry.accessible_volume_a3,
+                    bp.geometry.principal_dims_a[0],
+                    bp.geometry.principal_dims_a[1],
+                    bp.geometry.principal_dims_a[2],
+                    bp.features.len(),
+                    bp.distance_matrix.len(),
+                    bp.elapsed_ms
+                );
+                self.site_blueprint = Some(bp);
+                self.sync_pharmacophore_visuals();
+            }
+            Err(e) => self.status_line = format!("Active-site MIF analysis error: {e}"),
+        }
+    }
+
+    fn apply_blueprint_to_docking(&mut self) {
+        let Some(bp) = &self.site_blueprint else {
+            self.status_line = "Run 'Analyze Active Site (MIFs)' first.".to_string();
+            return;
+        };
+        self.constraints = bp.to_docking_constraints(6, 0.9);
+        self.sync_pharmacophore_visuals();
+        self.status_line = format!(
+            "Applied {} enabled blueprint features as soft pharmacophore docking restraints.",
+            self.constraints.len()
+        );
+    }
+
+    fn load_blueprint_dialog(&mut self) {
+        let Some(path) = pick_open_file(
+            "Load Active-Site Blueprint (.pharm.json)",
+            "Site Blueprints",
+            "*.pharm.json *.json",
+        ) else {
+            return;
+        };
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            self.status_line = format!("Cannot read blueprint '{path}'");
+            return;
+        };
+        match SiteBlueprint::from_json_str(&raw) {
+            Ok(bp) => {
+                self.grid_box = bp.grid_box.clone();
+                self.status_line = format!(
+                    "Loaded blueprint '{}' ({} features, {} distances).",
+                    bp.target_name,
+                    bp.features.len(),
+                    bp.distance_matrix.len()
+                );
+                self.site_blueprint = Some(bp);
+                self.sync_pharmacophore_visuals();
+            }
+            Err(e) => self.status_line = format!("Invalid blueprint JSON: {e}"),
+        }
+    }
+
+    fn export_blueprint_dialog(&mut self) {
+        let Some(bp) = &self.site_blueprint else {
+            self.status_line = "Run 'Analyze Active Site (MIFs)' before exporting.".to_string();
+            return;
+        };
+        let Some(path_str) = pick_save_file(
+            "Export Active-Site Blueprint",
+            "site_blueprint.pharm.json",
+            "Site Blueprint (.pharm.json / .md)",
+            "*.pharm.json *.md",
+        ) else {
+            return;
+        };
+        let path = PathBuf::from(&path_str);
+        let write_res = if path_str.ends_with(".md") {
+            std::fs::write(&path, bp.render_markdown())
+        } else {
+            match bp.to_json_pretty() {
+                Ok(js) => {
+                    let md_path = path.with_extension("md");
+                    let _ = std::fs::write(&md_path, bp.render_markdown());
+                    std::fs::write(&path, js)
+                }
+                Err(e) => {
+                    self.status_line = format!("Blueprint serialize error: {e}");
+                    return;
+                }
+            }
+        };
+        match write_res {
+            Ok(()) => self.status_line = format!("Exported Site Blueprint -> {}", path.display()),
+            Err(e) => self.status_line = format!("Blueprint export failed: {e}"),
+        }
     }
 
     fn run_docking_now(&mut self) {
@@ -1183,6 +1334,12 @@ impl eframe::App for DockCraftApp {
                     changed |= ui
                         .checkbox(&mut self.viewport_opts.show_grid_box, "Docking GridBox")
                         .changed();
+                    changed |= ui
+                        .checkbox(
+                            &mut self.viewport_opts.show_exclusion_spheres,
+                            "Site Exclusion Spheres",
+                        )
+                        .changed();
                     if changed {
                         self.scene_dirty = true;
                     }
@@ -1201,6 +1358,25 @@ impl eframe::App for DockCraftApp {
                         self.detect_pockets_now();
                         ui.close_menu();
                     }
+                    if ui
+                        .button("Analyze Active Site (MIFs & Distances)")
+                        .clicked()
+                    {
+                        self.analyze_active_site_now();
+                        ui.close_menu();
+                    }
+                    if ui.button("Load Site Blueprint (.pharm.json)...").clicked() {
+                        self.load_blueprint_dialog();
+                        ui.close_menu();
+                    }
+                    if ui
+                        .button("Export Site Blueprint (.pharm.json / .md)...")
+                        .clicked()
+                    {
+                        self.export_blueprint_dialog();
+                        ui.close_menu();
+                    }
+                    ui.separator();
                     if ui.button("Detect Bridging Waters").clicked() {
                         self.detect_waters_now();
                         ui.close_menu();
@@ -1401,6 +1577,89 @@ impl eframe::App for DockCraftApp {
                     }
 
                     ui.separator();
+                    egui::CollapsingHeader::new("Site Blueprint (MIFs & Distances)")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            ui.checkbox(
+                                &mut self.blueprint_use_holo,
+                                "Use loaded ligand (Holo consensus)",
+                            );
+                            ui.horizontal(|ui| {
+                                if ui.button("Analyze Site").clicked() {
+                                    self.analyze_active_site_now();
+                                }
+                                if ui.button("Apply -> Restraints").clicked() {
+                                    self.apply_blueprint_to_docking();
+                                }
+                            });
+                            let mut bp_changed = false;
+                            if let Some(bp) = &mut self.site_blueprint {
+                                let g = &bp.geometry;
+                                ui.small(format!(
+                                    "Vol: {:.0} A3 | LxWxD: {:.1}x{:.1}x{:.1} A",
+                                    g.accessible_volume_a3,
+                                    g.principal_dims_a[0],
+                                    g.principal_dims_a[1],
+                                    g.principal_dims_a[2]
+                                ));
+                                ui.small(format!(
+                                    "Hyd {:.0}% / Pol {:.0}% | Opt MW {:.0}-{:.0} Da",
+                                    g.hydrophobic_fraction * 100.0,
+                                    g.polar_fraction * 100.0,
+                                    g.recommended_mw_range[0],
+                                    g.recommended_mw_range[1]
+                                ));
+                                ui.separator();
+                                ui.strong("Hotspots (toggle to edit matrix):");
+                                for f in &mut bp.features {
+                                    let src_tag = match f.source {
+                                        FeatureSource::ApoMif => "Apo",
+                                        FeatureSource::HybridApoHolo => "Hyb",
+                                        FeatureSource::HoloValidated => "Holo",
+                                        FeatureSource::UserDefined => "User",
+                                    };
+                                    ui.horizontal(|ui| {
+                                        if ui
+                                            .checkbox(
+                                                &mut f.enabled,
+                                                format!("{} {:?} [{}]", f.id, f.kind, src_tag),
+                                            )
+                                            .changed()
+                                        {
+                                            bp_changed = true;
+                                        }
+                                        ui.small(format!(
+                                            "{} ({:.1})",
+                                            f.key_residue, f.energy_kcal
+                                        ));
+                                    });
+                                }
+                                if bp_changed {
+                                    bp.rebuild_distance_matrix();
+                                }
+                                if !bp.distance_matrix.is_empty() {
+                                    ui.separator();
+                                    ui.strong(format!(
+                                        "Optimal Distances ({} pairs):",
+                                        bp.distance_matrix.len()
+                                    ));
+                                    for d in bp.distance_matrix.iter().take(10) {
+                                        ui.small(format!(
+                                            "{}<->{}: {:.2} A ({:.1}-{:.1})",
+                                            d.from_id,
+                                            d.to_id,
+                                            d.ideal_distance_a,
+                                            d.min_distance_a,
+                                            d.max_distance_a
+                                        ));
+                                    }
+                                }
+                            }
+                            if bp_changed {
+                                self.sync_pharmacophore_visuals();
+                            }
+                        });
+
                     egui::CollapsingHeader::new("Bridging Waters & Metals")
                         .default_open(false)
                         .show(ui, |ui| {
@@ -1452,6 +1711,8 @@ impl eframe::App for DockCraftApp {
                                             PharmacophoreKind::HAcceptor,
                                             PharmacophoreKind::Aromatic,
                                             PharmacophoreKind::Hydrophobic,
+                                            PharmacophoreKind::PositiveIonizable,
+                                            PharmacophoreKind::NegativeIonizable,
                                             PharmacophoreKind::MetalChelate,
                                         ] {
                                             ui.selectable_value(

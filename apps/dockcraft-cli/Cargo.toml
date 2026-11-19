@@ -13,8 +13,10 @@ struct-core = { path = "../../crates/struct-core" }
 pocket-detect = { path = "../../crates/pocket-detect" }
 dock-engine = { path = "../../crates/dock-engine" }
 hyde-scorer = { path = "../../crates/hyde-scorer" }
+pharm-core = { path = "../../crates/pharm-core" }
 dock-pipeline = { path = "../../crates/dock-pipeline" }
 clap = { workspace = true }
+flate2 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

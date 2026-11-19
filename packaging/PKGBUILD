@@ -11,7 +11,7 @@
 # then packaging/install.sh, or regenerate the tarball and rerun makepkg here.
 pkgname=dockcraft-bin
 _pkgname=dockcraft
-pkgver=0.2.0
+pkgver=0.3.0
 pkgrel=1
 pkgdesc="Pure-Rust virtual screening (PyRx/Vina/Vinardo) and HYDE-style 3D structure-based design workstation (prebuilt)"
 arch=('x86_64')

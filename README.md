@@ -1,31 +1,37 @@
-# DockCraft v0.2.0
+# DockCraft v0.3.0
 
-**100% Pure-Rust Commercial-Grade Virtual Screening & Structure-Based Drug Design Workstation** (`#![forbid(unsafe_code)]`, clean-room public algorithms).
+**100% Pure-Rust Commercial-Grade Virtual Screening, Active-Site Blueprinting & Structure-Based Drug Design Workstation** (`#![forbid(unsafe_code)]`, clean-room public algorithms).
 
-DockCraft unifies high-throughput virtual screening (AutoDock Vina / Vinardo / AutoDock4Zn-class metal coordination / pharmacophore / core tether / covalent / flexible sidechains) with interactive SeeSAR-inspired 3D HYDE affinity & torsion optimization in a single portable Cargo workspace:
+DockCraft unifies active-site MIF pharmacophore blueprinting (`pharm-core`), ultra-fast streaming 3D pharmacophore pre-screening (`pharm-screen`), high-throughput virtual screening (AutoDock Vina / Vinardo / AutoDock4Zn-class metal coordination / pharmacophore / core tether / covalent / flexible sidechains), and interactive SeeSAR-inspired 3D HYDE affinity & torsion optimization in a single portable 9-crate Cargo workspace:
 
-1. **Mass Virtual Screening & Docking Engine (`pocket-detect` + `dock-engine`):**
+1. **Active-Site Blueprinting & 3D Pharmacophore Funnel (`pharm-core`):**
+   - **7-probe Rayon-parallel Molecular Interaction Fields (MIFs):** `HDonor`, `HAcceptor`, `Hydrophobic`, `Aromatic`, `PositiveIonizable`, `NegativeIonizable`, and `MetalChelate` with pH 7.4 protein atom typing, same-sign electrostatic opposition, and 6-connected main-cavity isolation.
+   - **PCA Pocket Dimensions & Optimal Ligand Envelope:** Extracts physical pocket dimensions ($L \times W \times D$), accessible volume ($\text{Å}^3$), hydrophobic/polar surface ratio, Mecozzi-Rebek optimal MW & heavy-atom envelope, optimal inter-feature 3D distance matrix with allowed ranges & vector angles, receptor wall exclusion spheres, and crystallographic water classification (`ConservedBridge` vs `Displaceable`).
+   - **Hybrid Apo + Holo Consensus & Ultra-Fast Streaming Funnel (`pharm-screen`):** Bounded distance-clique DFS + exact 4×4 Horn unit-quaternion Kabsch 3D superposition ($\det R = +1$) + directional vector alignment + pocket shape containment + continuous steric wall penalty. Streams `.smi` / `.smi.gz` / `.sdf` / `.sdf.gz` / `.chemcraft` libraries at **`~0.09 ms/ligand` (`>10,000 ligands/s` on 24 threads)** and feeds pre-aligned 3D hits + soft `--pharmacophore-file` restraints straight into `dock` / `screen`.
+   - **Centralized Bio Data Store (`CRAFT_DATA_DIR`):** Defaults to `/home/acs/Datos/CraftBio/{libraries,models,building_blocks,envs,campaigns}` (configurable via `CRAFT_DATA_DIR`) so multi-gigabyte libraries, ML models, and campaigns stay off the root partition.
+2. **Mass Virtual Screening & Docking Engine (`pocket-detect` + `dock-engine`):**
    - **Parallel LIGSITE-csc 26-ray / 13-PSP blind pocket detector** (`pocket-detect`) with 1.0 Å occupancy grid, 6-connected subpocket separation, catalytic metal bonus, deep-core burial centroid, 42-point Fibonacci SASA, and SiteMap/DoGSiteScorer-class druggability ranking (`86.4%` Top-1 / `90.9%` Top-3 DCA ≤ 4 Å across 22 RCSB proteins in ~64 ms).
    - **Rayon-parallel 3D trilinear affinity grids** + analytical spatial gradients, rigid-core-anchored SO(3) + root-to-leaf dihedral L-BFGS (`m = 8`), Vina-style single-DOF Metropolis ILS, anchor+conformer-stratified seeding, and WL-refined symmetry-aware heavy-atom RMSD deduplication (`dock-engine`), plus optional external `vina` / `smina` / `gnina` execution when installed.
-   - **Commercial docking modes:** AutoDock4Zn-inspired catalytic metal coordination (`Zn/Mg/Fe/Mn/Ca` with Tier-2 warhead typing for sulfonamides, hydroxamates, carboxylates/phosphonates, thiols), structural bridging water detection & retention (`detect-waters`, `--keep-waters`, `--auto-waters`), pharmacophore sphere restraints (`--pharmacophore`), template core tethering, covalent warhead attachment (`--covalent`), flexible receptor sidechain rotamers (`--flex-residues`, `chi1`/`chi2`), and Vina+HYDE consensus reranking (`--rerank-hyde`).
+   - **Commercial docking modes:** AutoDock4Zn-inspired catalytic metal coordination (`Zn/Mg/Fe/Mn/Ca` with Tier-2 warhead typing for sulfonamides, hydroxamates, carboxylates/phosphonates, thiols), structural bridging water detection & retention (`detect-waters`, `--keep-waters`, `--auto-waters`), pharmacophore sphere restraints (`--pharmacophore`, `--pharmacophore-file`), template core tethering, covalent warhead attachment (`--covalent`), flexible receptor sidechain rotamers (`--flex-residues`, `chi1`/`chi2`), and Vina+HYDE consensus reranking (`--rerank-hyde`).
    - **Pure literature scoring & virtual screening metrics:** Exact `ScoringFunction::Vina` and `ScoringFunction::Vinardo` parity (`r = 0.9875`, MAE `0.288 kcal/mol` vs Official AutoDock Vina 1.2.7), opt-in `ScoringFunction::DockCraftHybrid`, plus 8-descriptor Bickerton `QED`, Wildman-Crippen `cLogP`, `TPSA`, Lipinski/Veber/hERG/BBB, PAINS filters, `MPO`, `ROC AUC`, `BEDROC(α=20)`, `EF1%`, and `EF5%` (`dock-pipeline`).
-2. **Interactive 3D Pocket & SeeSAR-Style HYDE v2 Workstation (`hyde-scorer` + `dock-viewport` + `dockcraft`):**
-   - Hardware-accelerated `wgpu` 24 WGSL 3D viewport (`dock-viewport`) inside `eframe`/`egui` (`dockcraft`) following unified **Craft UI** conventions (`File | Edit | View | Docking | Apps`, visible `v0.2.0`, native Open/Save/Export dialogs, on-demand **ChemCraft**, **AdmetCraft**, and **ChimeraX** handoff).
+3. **Interactive 3D Pocket & SeeSAR-Style HYDE v2 Workstation (`hyde-scorer` + `dock-viewport` + `dockcraft`):**
+   - Hardware-accelerated `wgpu` 24 WGSL 3D viewport (`dock-viewport`) inside `eframe`/`egui` (`dockcraft`) following unified **Craft UI** conventions (`File | Edit | View | Docking | Apps`, visible `v0.3.0`, interactive **Site Blueprint (MIFs & Distances)** panel with live hotspot toggles & 3D directional vectors + exclusion spheres, native Open/Save/Export dialogs, on-demand **ChemCraft**, **AdmetCraft**, and **ChimeraX** handoff).
    - **HYDE v2 empirical scoring & PoseBusters audit:** Pocket-shell SASA desolvation, 100% directional H-bond geometry (`D–H···A` angles), salt bridges, metal coordination, water bridges, $\pi\text{-}\pi$, cation-$\pi$, halogen bonds, honest $K_i$ bracket (`±1.2 kcal/mol`), built-in **PoseBusters 5-check geometric validator** (`validate-pose`), and **SeeSAR-style torsion strain traffic-lights** (`Green / Yellow / Red`).
    - **Real-time 32-Group In-Pocket Inspirator:** Mutate any clicked atom across 32 medicinal-chemistry substituents & bioisosteres (Halogens, Polar/H-Bond, Lipophilic/Small Rings, Bioisosteres/Heterocycles incl. Tetrazole, Oxetane, Cyclopropyl, Pyridine, Morpholine, Sulfonamide) with instant in-pocket relaxation and $\Delta\Delta G$ feedback.
 
 ---
 
-## Architecture (8-Crate Portable Workspace)
+## Architecture (9-Crate Portable Workspace)
 
 - `crates/struct-core` — PDB, mmCIF, MOL2, SDF (V2000/V3000), PDBQT parsers/writers (bounded atom limits), Gasteiger-Marsili PEOE partial charges, pH 7.4 protonation (delocalized amidinium/guanidinium `+1`, catalytic metal `+2`), ring perception from **3 to 24 members (macrocycles)**, non-leaking aromaticity, exact Vina X-Score AD4 typing + metal chelation tiers, structural bridging water perception (`detect_bridging_waters`), WL-refined symmetry-aware RMSD (`rmsd_heavy_symmetric`), largest-rigid-fragment root-to-leaf rotatable bond graph, and 3D SMILES builder with multi-ring embedding, puckered rings, `@`/`@@` tetrahedral chirality, and planar `E/Z` (`/`/`\`) alkene stereochemistry.
 - `crates/pocket-detect` — Parallel LIGSITE-csc 26-ray / 13-PSP 1.0 Å cavity scanner, 6-connected subpocket separation, catalytic metal bonus, 42-pt Fibonacci SASA, and bounded `GridBox` extraction (`<= 60 Å` axis / `1.5M` voxels).
-- `crates/dock-engine` — Parallel trilinear affinity grids, Vina / Vinardo / DockCraftHybrid + catalytic metal coordination, pharmacophore/core-tether/covalent restraints + flexible sidechain rotamers (`constraints.rs`), rigid-core-anchored SO(3)+torsion L-BFGS (`m = 8`), `rayon` two-stage global search + single-DOF ILS, symmetry-aware clustering, and external engine adapter.
+- `crates/pharm-core` — 7-probe parallel MIF active-site blueprinting (`analyze_binding_site`), 3×3 PCA pocket dimensions & Mecozzi-Rebek ligand envelope, Hybrid Apo+Holo consensus & optimal distance matrix, wall exclusion spheres, water assessment, 4×4 Horn unit-quaternion Kabsch 3D superposition, streaming `pharm-screen` funnel, and `CRAFT_DATA_DIR` manager.
+- `crates/dock-engine` — Parallel trilinear affinity grids, Vina / Vinardo / DockCraftHybrid + catalytic metal coordination, 7-class pharmacophore/core-tether/covalent restraints + flexible sidechain rotamers (`constraints.rs`), rigid-core-anchored SO(3)+torsion L-BFGS (`m = 8`), `rayon` two-stage global search + single-DOF ILS, symmetry-aware clustering, and external engine adapter.
 - `crates/hyde-scorer` — HYDE v2 per-atom $\Delta G$ & honest $K_i$ bracket, 100% directional H-bond/metal/water-bridge/salt-bridge/$\pi$/halogen interaction detector, built-in PoseBusters validator (`posebusters.rs`), torsion traffic-lights (`torsion.rs`), and 32-group interactive Inspirator.
-- `crates/dock-viewport` — Pure-Rust `wgpu` 24 WGSL instanced sphere/cylinder/corona/line pipelines with torsion traffic-light beads, catalytic metal & bridging water markers, translucent pharmacophore spheres, and ray atom picking.
+- `crates/dock-viewport` — Pure-Rust `wgpu` 24 WGSL instanced sphere/cylinder/corona/line pipelines with torsion traffic-light beads, catalytic metal & bridging water markers, translucent pharmacophore spheres + directional vectors + toggleable site exclusion spheres, and ray atom picking.
 - `crates/dock-pipeline` — `openat2(RESOLVE_BENEATH | NO_SYMLINKS)` sandbox (`PathSandbox`), bounded 32 MiB `.chemcraft` reader, standalone QED/PAINS/ADMET/MPO/ROC/BEDROC20 engine, ChimeraX REST live selection, and self-contained PyMOL (`.pml`) & ChimeraX (`.cxc`) scene exporters.
-- `apps/dockcraft-cli` — Headless CLI (`prepare-receptor`, `detect-pockets`, `detect-waters`, `dock`, `screen`, `score-pose`, `validate-pose`, `chimerax`, `mcp`) and hardened JSON-RPC 2.0 MCP server (`stdio` and loopback-only Bearer-token `tcp`).
-- `apps/dockcraft` — Native desktop GUI workstation (`eframe` + `egui` + `wgpu`) with unified Craft menu bar, native OS file dialogs, `.dockcraft` project persistence, and on-demand ChemCraft / AdmetCraft / ChimeraX handoff.
+- `apps/dockcraft-cli` — Headless CLI (`prepare-receptor`, `detect-pockets`, `detect-waters`, `analyze-site`, `pharm-screen`, `dock`, `screen`, `score-pose`, `validate-pose`, `chimerax`, `mcp`) and hardened JSON-RPC 2.0 MCP server (`stdio` and loopback-only Bearer-token `tcp`, including `analyze_binding_site` and `pharmacophore_screen`).
+- `apps/dockcraft` — Native desktop GUI workstation (`eframe` + `egui` + `wgpu`) with unified Craft menu bar, interactive Site Blueprint panel, native OS file dialogs, `.dockcraft` / `.pharm.json` persistence, and on-demand ChemCraft / AdmetCraft / ChimeraX handoff.
 
 ---
 
@@ -60,9 +66,22 @@ Per-target DUD-E virtual screening (`25` actives + `125` property-matched decoys
 - `esr1` (nuclear receptor): DockCraft AUC **0.828**, BEDROC20 **0.544** vs Vina 1.2.7 AUC 0.866, BEDROC20 0.508 (max null 0.699).
 - `try1` (protease): DockCraft AUC **0.754**, BEDROC20 **0.398**, EF5% **3.0** vs Vina 1.2.7 AUC 0.745, BEDROC20 0.390, EF5% 2.2.
 
+### Active-Site Blueprinting & Streaming 3D Pharmacophore Funnel (`pharm-core` on DUD-E CDK2)
+
+Benchmarked on human **CDK2** (`PDB 1KE6`, `1H1S`, and DUD-E `cdk2` with `474` ChEMBL actives + `27,850` property-matched ZINC decoys = `28,324` ligands, plus an apples-to-apples `N = 2,000` stratified subset of `200` actives + `1,800` decoys):
+
+| Pipeline Mode (DUD-E CDK2) | Wall Time | Speedup | ROC AUC | BEDROC(α=20) | EF1% | EF5% | EF10% |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Best 1D Null Descriptor (`cLogP`, `N=2,000`) | — | — | `0.665` | — | — | — | — |
+| Unfiltered `DockCraft Vina` (`N=2,000`, exh=4) | `277.3 s` | `1.0×` | `0.715` | `0.360` | `4.00×` (8/20) | `3.30×` (33/100) | `3.15×` (63/200) |
+| Stage 1 `pharm-screen` only (`N=2,000`) | **`0.20 s`** | `1,387×` | **`0.793`** | `0.432` | `4.50×` (9/20) | `4.50×` (45/100) | `3.60×` (72/200) |
+| **2-Stage Funnel (`pharm-screen` Top 400 → Vina)** | **`35.6 s`** | **`7.8×`** | **`0.797`** | **`0.484`** | **`6.50×` (13/20)** | **`4.80×` (48/100)** | **`3.90×` (78/200)** |
+| **2-Stage Consensus (`0.65·Vina + 0.35·Pharm`)** | **`35.6 s`** | **`7.8×`** | **`0.799`** | **`0.500`** | **`6.50×` (13/20)** | **`5.10×` (51/100)** | **`4.10×` (82/200)** |
+| Full-Library Streaming `pharm-screen` (`N=28,324`) | **`2.65 s`** (`0.093 ms/lig`) | `~1,480×` | **`0.801`** | `0.294` *(1.67% prev.)* | **`7.60×` (36/283)** | **`6.12×` (145/1416)** | **`4.52×` (214/2832)** |
+
 ### Built-In Repository Regression Suite
 
-Run `cargo test --release --workspace` to reproduce all workspace tests (all 8 crates passing):
+Run `cargo test --release --workspace` to reproduce all workspace tests (all 9 crates passing, including `crates/pharm-core/tests/real_pockets.rs` verifying `>= 80%` crystallographic feature recovery across `3PTB`, `3ERT`, `1HSG`, `1STP`):
 - **Randomized-conformer re-docking** (`crates/dock-pipeline/tests/randomized_conformer_redock.rs`): 48/48 poses under 2.0 Å across 3PTB, 1STP, 1HSG (13 rotatable bonds), and 3ERT.
 - **Commercial modes verification** (`crates/dock-engine/tests/commercial_modes.rs`): symmetry-aware RMSD, 14-membered macrocycle perception + `E/Z` stereochemistry, bridging water detection/retention, Zn-sulfonamide coordination, pharmacophore sphere, core tether, covalent attachment, and flexible sidechain rotamers.
 - **Grid accuracy** (`crates/dock-engine/tests/grid_accuracy.rs`): exact at nodes (`4.2e-8 kcal/mol`), `0.033 kcal/mol` MAE at cell centers.

@@ -569,7 +569,7 @@ dependencies = [
 
 [[package]]
 name = "dock-engine"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "pocket-detect",
  "rand",
@@ -581,7 +581,7 @@ dependencies = [
 
 [[package]]
 name = "dock-pipeline"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "csv",
  "dock-engine",
@@ -598,7 +598,7 @@ dependencies = [
 
 [[package]]
 name = "dock-viewport"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bytemuck",
  "egui",
@@ -612,7 +612,7 @@ dependencies = [
 
 [[package]]
 name = "dockcraft"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "dock-engine",
  "dock-pipeline",
@@ -620,6 +620,7 @@ dependencies = [
  "eframe",
  "egui",
  "hyde-scorer",
+ "pharm-core",
  "pocket-detect",
  "serde",
  "serde_json",
@@ -628,12 +629,14 @@ dependencies = [
 
 [[package]]
 name = "dockcraft-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "clap",
  "dock-engine",
  "dock-pipeline",
+ "flate2",
  "hyde-scorer",
+ "pharm-core",
  "pocket-detect",
  "serde",
  "serde_json",
@@ -1170,7 +1173,7 @@ checksum = "dfa686283ad6dd069f105e5ab091b04c62850d3e4cf5d67debad1933f55023df"
 
 [[package]]
 name = "hyde-scorer"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "pocket-detect",
  "serde",
@@ -2013,6 +2016,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
+name = "pharm-core"
+version = "0.3.0"
+dependencies = [
+ "dock-engine",
+ "pocket-detect",
+ "rayon",
+ "serde",
+ "serde_json",
+ "struct-core",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "pin-project"
 version = "1.1.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2065,7 +2081,7 @@ dependencies = [
 
 [[package]]
 name = "pocket-detect"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "rayon",
  "serde",
@@ -2557,7 +2573,7 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 
 [[package]]
 name = "struct-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde",
  "thiserror 2.0.21",

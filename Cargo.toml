@@ -5,6 +5,7 @@ members = [
     "crates/pocket-detect",
     "crates/dock-engine",
     "crates/hyde-scorer",
+    "crates/pharm-core",
     "crates/dock-viewport",
     "crates/dock-pipeline",
     "apps/dockcraft-cli",
@@ -12,7 +13,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 

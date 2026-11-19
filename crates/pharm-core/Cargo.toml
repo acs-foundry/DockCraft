@@ -1,0 +1,17 @@
+[package]
+name = "pharm-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+struct-core = { path = "../struct-core" }
+pocket-detect = { path = "../pocket-detect" }
+dock-engine = { path = "../dock-engine" }
+serde.workspace = true
+serde_json.workspace = true
+rayon.workspace = true
+thiserror.workspace = true

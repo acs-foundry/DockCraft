@@ -2,6 +2,7 @@
 
 mod mcp;
 
+use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -15,8 +16,13 @@ use dock_pipeline::{
     is_chimerax_available, launch_chimerax_for_scene, load_ligand_library_bytes,
     run_screening_campaign, write_chimerax_session_bundle, write_results_sidecar,
 };
+use flate2::read::GzDecoder;
 use hyde_scorer::{
     analyze_torsions, consensus_affinity_kcal, score_pose_hyde, validate_pose_geometry,
+};
+use pharm_core::{
+    PharmScreenConfig, SiteAnalysisConfig, SiteBlueprint, analyze_binding_site, craft_data_dir,
+    screen_molecules_parallel, screen_smiles_stream,
 };
 use pocket_detect::{GridBox, PocketDetectConfig, detect_pockets};
 use struct_core::{
@@ -85,6 +91,12 @@ enum Commands {
         exhaustiveness: usize,
         #[arg(long, default_value_t = 1000)]
         max_ligands: usize,
+        /// Optional `.pharm.json` blueprint from `analyze-site` used as soft pharmacophore guidance
+        #[arg(long)]
+        pharmacophore_file: Option<PathBuf>,
+        /// Soft restraint weight multiplier when `--pharmacophore-file` is supplied
+        #[arg(long, default_value_t = 0.45)]
+        pharm_weight: f64,
         /// Also write a `*.dockcraft.json` results sidecar plus the docked poses, for ChemCraft
         /// to fold back into its SAR table. Default directory:
         /// $XDG_DATA_HOME/ChemCraft/dockcraft_results
@@ -93,6 +105,69 @@ enum Commands {
         /// Directory for the sidecar, overriding the default
         #[arg(long)]
         sidecar_dir: Option<PathBuf>,
+    },
+    /// Profile an active site with 7-probe 3D MIFs, PCA dimensions, optimal inter-feature distance
+    /// matrix, wall exclusion spheres, and water assessment (emits `.pharm.json` + Markdown blueprint)
+    AnalyzeSite {
+        #[arg(long)]
+        receptor: PathBuf,
+        /// Optional cocrystallized reference ligand(s) for hybrid Apo+Holo hotspot consensus
+        #[arg(long)]
+        ligand: Vec<PathBuf>,
+        #[arg(long, value_delimiter = ',', allow_hyphen_values = true)]
+        center: Vec<f64>,
+        #[arg(long, value_delimiter = ',', allow_hyphen_values = true)]
+        size: Vec<f64>,
+        /// Automatically select the top druggable pocket when `--center`/`--size` are omitted
+        #[arg(long)]
+        auto_pocket: bool,
+        /// Retain crystallographic waters in receptor for ConservedBridge vs Displaceable audit
+        #[arg(long)]
+        keep_waters: bool,
+        /// MIF grid spacing in Å
+        #[arg(long, default_value_t = 0.65)]
+        spacing: f64,
+        /// Maximum number of pharmacophore features in the blueprint
+        #[arg(long, default_value_t = 10)]
+        max_features: usize,
+        /// Write versioned `.pharm.json` blueprint file
+        #[arg(long)]
+        out_json: Option<PathBuf>,
+        /// Write human-readable Markdown Target Binding Blueprint
+        #[arg(long)]
+        out_md: Option<PathBuf>,
+    },
+    /// Ultra-fast streaming 3D pharmacophore + exclusion-volume funnel (`10^6 -> 10^4`) against a
+    /// `.pharm.json` blueprint, emitting ranked CSV and pre-aligned 3D SDF hits for docking
+    PharmScreen {
+        #[arg(long)]
+        blueprint: PathBuf,
+        /// Chemical library (`.smi`, `.ism`, `.smi.gz`, `.sdf`, `.sdf.gz`, `.chemcraft`)
+        #[arg(long)]
+        library: PathBuf,
+        #[arg(long)]
+        out_csv: Option<PathBuf>,
+        /// Optional output SDF containing 3D Kabsch-aligned hit poses inside the active site
+        #[arg(long)]
+        out_sdf: Option<PathBuf>,
+        /// Minimum enabled blueprint features that must match simultaneously
+        #[arg(long, default_value_t = 3)]
+        min_match: usize,
+        /// Maximum feature alignment RMSD (Å)
+        #[arg(long, default_value_t = 1.65)]
+        max_rmsd: f64,
+        /// Maximum heavy-atom clashes against receptor exclusion spheres
+        #[arg(long, default_value_t = 3)]
+        max_clashes: usize,
+        /// Conformers sampled per flexible ligand (`1` = fastest, `3–5` = higher recall)
+        #[arg(long, default_value_t = 3)]
+        conformers: usize,
+        /// Keep top N hits sorted by pharmacophore score (`0` = keep all)
+        #[arg(long, default_value_t = 5000)]
+        top: usize,
+        /// Optional hard cap on input molecules read (`0` = stream entire file)
+        #[arg(long, default_value_t = 0)]
+        max_ligands: usize,
     },
     /// Detect druggable binding pockets blindly from a receptor structure
     DetectPockets {
@@ -151,9 +226,15 @@ enum Commands {
         /// Re-rank docked modes using SeeSAR-style Vina + directional HYDE + torsion consensus
         #[arg(long)]
         rerank_hyde: bool,
-        /// Pharmacophore sphere constraint `x,y,z,radius,kind` (kind: hdonor|hacceptor|aromatic|hydrophobic|metal|any)
+        /// Pharmacophore sphere constraint `x,y,z,radius,kind` (kind: hdonor|hacceptor|aromatic|hydrophobic|pos|neg|metal|any)
         #[arg(long, allow_hyphen_values = true)]
         pharmacophore: Vec<String>,
+        /// Optional `.pharm.json` blueprint from `analyze-site` used as soft pharmacophore guidance
+        #[arg(long)]
+        pharmacophore_file: Option<PathBuf>,
+        /// Soft restraint weight multiplier when `--pharmacophore-file` is supplied
+        #[arg(long, default_value_t = 0.45)]
+        pharm_weight: f64,
         /// Flexible receptor sidechain residue specs (e.g. `A:ASP189,A:TRP79`)
         #[arg(long, value_delimiter = ',')]
         flex_residues: Vec<String>,
@@ -257,10 +338,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             scoring,
             exhaustiveness,
             max_ligands,
+            pharmacophore_file,
+            pharm_weight,
             sidecar,
             sidecar_dir,
         } => {
             let rec = read_receptor_file(&receptor, true)?;
+            let blueprint_opt = if let Some(pf) = &pharmacophore_file {
+                let raw_bp = std::fs::read_to_string(pf)?;
+                Some(SiteBlueprint::from_json_str(&raw_bp)?)
+            } else {
+                None
+            };
             let gbox = if box_from_chimerax {
                 let root = default_chimerax_export_dir();
                 std::fs::create_dir_all(&root)?;
@@ -279,18 +368,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     selection.grid_box.size[2],
                 );
                 selection.grid_box
-            } else {
-                if center.len() != 3 || size.len() != 3 {
-                    return Err(
-                        "--center and --size must be comma-separated 3-vectors x,y,z,                          or pass --box-from-chimerax"
-                            .into(),
-                    );
-                }
+            } else if center.len() == 3 && size.len() == 3 {
                 GridBox::from_center_size(
                     [center[0], center[1], center[2]],
                     [size[0], size[1], size[2]],
                     0.375,
                 )?
+            } else if let Some(bp) = &blueprint_opt {
+                bp.grid_box.clone()
+            } else {
+                return Err(
+                    "--center and --size must be comma-separated 3-vectors x,y,z, or pass --box-from-chimerax / --pharmacophore-file"
+                        .into(),
+                );
             };
             let bytes = std::fs::read(&library)?;
             let ext = library
@@ -298,6 +388,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .and_then(|s| s.to_str())
                 .unwrap_or("smi");
             let lib = load_ligand_library_bytes(ext, &bytes, max_ligands)?;
+            let constraints = blueprint_opt
+                .as_ref()
+                .map_or_else(Vec::new, |bp| bp.to_docking_constraints(3, pharm_weight));
             let cfg = DockingConfig {
                 scoring: match scoring {
                     CliScoring::Vina => ScoringFunction::Vina,
@@ -305,6 +398,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     CliScoring::Hybrid => ScoringFunction::DockCraftHybrid,
                 },
                 exhaustiveness,
+                constraints,
                 ..Default::default()
             };
             let report = run_screening_campaign(&rec, &gbox, &lib, &cfg)?;
@@ -344,6 +438,221 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 out.display()
             );
         }
+        Commands::AnalyzeSite {
+            receptor,
+            ligand,
+            center,
+            size,
+            auto_pocket,
+            keep_waters,
+            spacing,
+            max_features,
+            out_json,
+            out_md,
+        } => {
+            let mut rec = read_receptor_file(&receptor, !keep_waters)?;
+            if let Some(stem) = receptor.file_stem().and_then(|s| s.to_str()) {
+                rec.name = stem.to_string();
+            }
+            let mut holo_owned = Vec::new();
+            for lp in &ligand {
+                let raw = std::fs::read_to_string(lp)?;
+                let ext = lp
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("sdf")
+                    .to_ascii_lowercase();
+                let mut mol = match ext.as_str() {
+                    "mol2" => parse_mol2(&raw)?,
+                    "pdbqt" => parse_pdbqt(&raw)?,
+                    "pdb" => parse_pdb(&raw, true)?,
+                    _ => parse_sdf_3d_with_limit(&raw, 1)
+                        .pop()
+                        .ok_or("empty holo ligand SDF")??,
+                };
+                struct_core::perceive_all(&mut mol);
+                holo_owned.push(mol);
+            }
+            let holo_refs: Vec<&struct_core::Molecule3D> = holo_owned.iter().collect();
+
+            let gbox = if center.len() == 3 && size.len() == 3 {
+                GridBox::from_center_size(
+                    [center[0], center[1], center[2]],
+                    [size[0], size[1], size[2]],
+                    0.375,
+                )?
+            } else if let Some(first_holo) = holo_owned.first()
+                && !auto_pocket
+            {
+                GridBox::from_ligand(first_holo, 5.5)?
+            } else {
+                let pockets = detect_pockets(&rec, &PocketDetectConfig::default())?;
+                let top = pockets
+                    .first()
+                    .ok_or("no druggable pocket detected; pass --center and --size")?;
+                top.grid_box.clone()
+            };
+
+            let cfg = SiteAnalysisConfig {
+                spacing_a: spacing,
+                max_features,
+                ..Default::default()
+            };
+            let blueprint = analyze_binding_site(&rec, &gbox, &holo_refs, &cfg)?;
+            let js = blueprint.to_json_pretty()?;
+            if let Some(jp) = &out_json {
+                std::fs::write(jp, &js)?;
+            }
+            if let Some(mp) = &out_md {
+                std::fs::write(mp, blueprint.render_markdown())?;
+            }
+            if out_json.is_some() || out_md.is_some() {
+                eprintln!(
+                    "Site blueprint '{}': {:.0} A3, LxWxD = {:.1}x{:.1}x{:.1} A, {} features, {} distance pairs, {} excl spheres ({} ms) [CRAFT_DATA_DIR={}]",
+                    blueprint.target_name,
+                    blueprint.geometry.accessible_volume_a3,
+                    blueprint.geometry.principal_dims_a[0],
+                    blueprint.geometry.principal_dims_a[1],
+                    blueprint.geometry.principal_dims_a[2],
+                    blueprint.features.len(),
+                    blueprint.distance_matrix.len(),
+                    blueprint.exclusion_spheres.len(),
+                    blueprint.elapsed_ms,
+                    craft_data_dir().display()
+                );
+            }
+            println!("{js}");
+        }
+        Commands::PharmScreen {
+            blueprint,
+            library,
+            out_csv,
+            out_sdf,
+            min_match,
+            max_rmsd,
+            max_clashes,
+            conformers,
+            top,
+            max_ligands,
+        } => {
+            let bp_raw = std::fs::read_to_string(&blueprint)?;
+            let bp = SiteBlueprint::from_json_str(&bp_raw)?;
+            let cfg = PharmScreenConfig {
+                min_matched_features: min_match,
+                max_rmsd_a: max_rmsd,
+                max_exclusion_clashes: max_clashes,
+                max_conformers: conformers.max(1),
+                max_hits: top,
+                ..Default::default()
+            };
+
+            let fname_lower = library
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            let is_smi_stream = fname_lower.ends_with(".smi")
+                || fname_lower.ends_with(".ism")
+                || fname_lower.ends_with(".smi.gz")
+                || fname_lower.ends_with(".ism.gz");
+
+            let report = if is_smi_stream {
+                let file = std::fs::File::open(&library)?;
+                let reader: Box<dyn BufRead> = if fname_lower.ends_with(".gz") {
+                    Box::new(BufReader::new(GzDecoder::new(file)))
+                } else {
+                    Box::new(BufReader::new(file))
+                };
+                let mut idx = 0usize;
+                let iter = reader
+                    .lines()
+                    .map_while(Result::ok)
+                    .filter_map(move |line| {
+                        let trimmed = line.trim();
+                        if trimmed.is_empty() || trimmed.starts_with('#') {
+                            return None;
+                        }
+                        let mut parts = trimmed.split_whitespace();
+                        let smi = parts.next()?.to_string();
+                        if smi.eq_ignore_ascii_case("smiles") {
+                            return None;
+                        }
+                        idx += 1;
+                        if max_ligands > 0 && idx > max_ligands {
+                            return None;
+                        }
+                        let name = parts
+                            .next()
+                            .map_or_else(|| format!("mol_{idx}"), ToString::to_string);
+                        Some((smi, name))
+                    });
+                screen_smiles_stream(iter, &bp, &cfg, 2048)
+            } else {
+                let raw_bytes = if fname_lower.ends_with(".gz") {
+                    let file = std::fs::File::open(&library)?;
+                    let mut dec = GzDecoder::new(file);
+                    let mut buf = Vec::new();
+                    std::io::Read::read_to_end(&mut dec, &mut buf)?;
+                    buf
+                } else {
+                    std::fs::read(&library)?
+                };
+                let ext = if fname_lower.ends_with(".sdf.gz") || fname_lower.ends_with(".sdf") {
+                    "sdf"
+                } else {
+                    library
+                        .extension()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("sdf")
+                };
+                let lim = if max_ligands == 0 {
+                    100_000
+                } else {
+                    max_ligands
+                };
+                let recs = load_ligand_library_bytes(ext, &raw_bytes, lim)?;
+                let mols: Vec<struct_core::Molecule3D> =
+                    recs.into_iter().map(|r| r.molecule).collect();
+                screen_molecules_parallel(&mols, &bp, &cfg)
+            };
+
+            if let Some(csv_path) = &out_csv {
+                let mut csv_out = String::from(
+                    "rank,name,smiles,matched_count,total_features,matched_ids,pharm_rmsd_a,exclusion_clashes,pharm_score\n",
+                );
+                for (i, h) in report.hits.iter().enumerate() {
+                    csv_out.push_str(&format!(
+                        "{},{},{},{},{},{},{:.3},{},{:.3}\n",
+                        i + 1,
+                        h.name.replace(',', "_"),
+                        h.smiles.as_deref().unwrap_or("").replace(',', "_"),
+                        h.matched_count,
+                        h.total_active_features,
+                        h.matched_feature_ids.join(";"),
+                        h.pharm_rmsd_a,
+                        h.exclusion_clashes,
+                        h.pharm_score
+                    ));
+                }
+                std::fs::write(csv_path, csv_out)?;
+            }
+            if let Some(sdf_path) = &out_sdf {
+                let refs: Vec<&struct_core::Molecule3D> =
+                    report.hits.iter().map(|h| &h.aligned_molecule).collect();
+                std::fs::write(sdf_path, write_sdf_3d(&refs))?;
+            }
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "target_name": report.target_name,
+                    "total_evaluated": report.total_evaluated,
+                    "passed_count": report.passed_count,
+                    "returned_hits": report.hits.len(),
+                    "elapsed_ms": report.elapsed_ms,
+                    "ms_per_ligand": (report.elapsed_ms as f64) / (report.total_evaluated.max(1) as f64),
+                }))?
+            );
+        }
         Commands::DetectPockets {
             receptor,
             max_pockets,
@@ -378,7 +687,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ligand,
             keep_waters,
         } => {
-            let rec = read_receptor_file(&receptor, !keep_waters)?;
+            let mut rec = read_receptor_file(&receptor, !keep_waters)?;
+            if let Some(stem) = receptor.file_stem().and_then(|s| s.to_str()) {
+                rec.name = stem.to_string();
+            }
             let lig_raw = std::fs::read_to_string(&ligand)?;
             let mut ligs = parse_sdf_3d_with_limit(&lig_raw, 1);
             let mut lig = ligs.pop().ok_or("empty ligand SDF")??;
@@ -407,19 +719,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             no_metal_coord,
             rerank_hyde,
             pharmacophore,
+            pharmacophore_file,
+            pharm_weight,
             flex_residues,
             covalent,
             out_sdf,
         } => {
-            if center.len() != 3 || size.len() != 3 {
-                return Err("--center and --size must be comma-separated 3-vectors x,y,z".into());
-            }
+            let blueprint_opt = if let Some(pf) = &pharmacophore_file {
+                let raw_bp = std::fs::read_to_string(pf)?;
+                Some(SiteBlueprint::from_json_str(&raw_bp)?)
+            } else {
+                None
+            };
+            let (ctr, sz) = if center.len() == 3 && size.len() == 3 {
+                (
+                    [center[0], center[1], center[2]],
+                    [size[0], size[1], size[2]],
+                )
+            } else if let Some(bp) = &blueprint_opt {
+                (bp.grid_box.center, bp.grid_box.size)
+            } else {
+                return Err(
+                    "--center and --size must be comma-separated 3-vectors x,y,z (or pass --pharmacophore-file)"
+                        .into(),
+                );
+            };
             let rec = if auto_waters && !keep_waters {
                 let raw = std::fs::read_to_string(&receptor)?;
                 let mut rec_raw = parse_pdb(&raw, false)?;
-                let box_r = 0.5 * size[0].max(size[1]).max(size[2]);
-                let bw =
-                    detect_bridging_waters(&rec_raw, [center[0], center[1], center[2]], box_r, 2);
+                let box_r = 0.5 * sz[0].max(sz[1]).max(sz[2]);
+                let bw = detect_bridging_waters(&rec_raw, ctr, box_r, 2);
                 let keep_ids: Vec<i32> = bw.iter().map(|w| w.res_seq).collect();
                 prepare_receptor_keeping_waters(&mut rec_raw, &keep_ids);
                 rec_raw
@@ -442,17 +771,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
             struct_core::perceive_all(&mut lig);
-            let gbox = GridBox::from_center_size(
-                [center[0], center[1], center[2]],
-                [size[0], size[1], size[2]],
-                0.375,
-            )?;
+            let gbox = GridBox::from_center_size(ctr, sz, 0.375)?;
             let sf = match scoring {
                 CliScoring::Vina => ScoringFunction::Vina,
                 CliScoring::Vinardo => ScoringFunction::Vinardo,
                 CliScoring::Hybrid => ScoringFunction::DockCraftHybrid,
             };
-            let mut constraints: Vec<DockingConstraint> = Vec::new();
+            let mut constraints: Vec<DockingConstraint> = blueprint_opt
+                .as_ref()
+                .map_or_else(Vec::new, |bp| bp.to_docking_constraints(5, pharm_weight));
             for spec in &pharmacophore {
                 let parts: Vec<&str> = spec.split(',').collect();
                 if parts.len() < 4 {
@@ -474,6 +801,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Some("hacceptor" | "acceptor") => PharmacophoreKind::HAcceptor,
                     Some("aromatic" | "arom") => PharmacophoreKind::Aromatic,
                     Some("hydrophobic" | "hyd") => PharmacophoreKind::Hydrophobic,
+                    Some("pos" | "positive" | "cation") => PharmacophoreKind::PositiveIonizable,
+                    Some("neg" | "negative" | "anion") => PharmacophoreKind::NegativeIonizable,
                     Some("metal" | "metalchelate") => PharmacophoreKind::MetalChelate,
                     _ => PharmacophoreKind::AnyHeavy,
                 };
@@ -565,7 +894,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             full,
             keep_waters,
         } => {
-            let rec = read_receptor_file(&receptor, !keep_waters)?;
+            let mut rec = read_receptor_file(&receptor, !keep_waters)?;
+            if let Some(stem) = receptor.file_stem().and_then(|s| s.to_str()) {
+                rec.name = stem.to_string();
+            }
             let lig_raw = std::fs::read_to_string(&ligand)?;
             let mut ligs = parse_sdf_3d_with_limit(&lig_raw, 1);
             let mut lig = ligs.pop().ok_or("empty ligand SDF")??;

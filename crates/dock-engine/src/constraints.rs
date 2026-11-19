@@ -6,12 +6,14 @@ use struct_core::{Atom3D, Molecule3D, metal_chelation_tier};
 use crate::vina::{ScoringFunction, pairwise_energy_and_deriv_full};
 
 /// Chemical feature class for pharmacophore-constrained docking (Glide / SeeSAR / GOLD style).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum PharmacophoreKind {
     HDonor,
     HAcceptor,
     Aromatic,
     Hydrophobic,
+    PositiveIonizable,
+    NegativeIonizable,
     MetalChelate,
     AnyHeavy,
 }
@@ -105,6 +107,8 @@ pub(crate) fn resolve_constraints(
                         PharmacophoreKind::HAcceptor => a.h_acceptor,
                         PharmacophoreKind::Aromatic => a.aromatic,
                         PharmacophoreKind::Hydrophobic => a.hydrophobic,
+                        PharmacophoreKind::PositiveIonizable => a.formal_charge > 0,
+                        PharmacophoreKind::NegativeIonizable => a.formal_charge < 0,
                         PharmacophoreKind::MetalChelate => metal_chelation_tier(ligand, idx) >= 1,
                         PharmacophoreKind::AnyHeavy => true,
                     };

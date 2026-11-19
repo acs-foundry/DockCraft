@@ -13,6 +13,10 @@ use dock_pipeline::{
     write_chimerax_session_bundle, write_sandboxed_scene_package,
 };
 use hyde_scorer::{SubstituentPreset, mutate_and_minimize_in_pocket, score_pose_hyde};
+use pharm_core::{
+    PharmScreenConfig, SiteAnalysisConfig, SiteBlueprint, analyze_binding_site,
+    screen_molecules_parallel,
+};
 use pocket_detect::{GridBox, PocketDetectConfig, detect_pockets};
 use serde_json::{Value, json};
 use struct_core::{
@@ -215,6 +219,59 @@ fn tool_definitions() -> Value {
                 "properties": {
                     "target": { "type": "string" },
                     "written_files": { "type": "array" }
+                }
+            }
+        },
+        {
+            "name": "analyze_binding_site",
+            "description": "Profiles an active site with 7-probe 3D Molecular Interaction Fields (MIFs), PCA physical dimensions, optimal inter-feature distance matrix, exclusion spheres, and water assessment; optionally writes .pharm.json and Markdown blueprint inside write_root.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["receptor_path"],
+                "properties": {
+                    "receptor_path": { "type": "string" },
+                    "ligand_path": { "type": "string" },
+                    "box_center": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                    "box_size": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                    "keep_waters": { "type": "boolean" },
+                    "max_features": { "type": "integer", "minimum": 2, "maximum": 20 },
+                    "out_blueprint_path": { "type": "string" },
+                    "out_markdown_path": { "type": "string" }
+                }
+            },
+            "outputSchema": {
+                "type": "object",
+                "required": ["geometry", "features", "distance_matrix"],
+                "properties": {
+                    "geometry": { "type": "object" },
+                    "features": { "type": "array" },
+                    "distance_matrix": { "type": "array" }
+                }
+            }
+        },
+        {
+            "name": "pharmacophore_screen",
+            "description": "Runs ultra-fast 3D pharmacophore + exclusion-volume screening of a ligand library against a .pharm.json blueprint inside read_root/write_root.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["blueprint_path", "library_path"],
+                "properties": {
+                    "blueprint_path": { "type": "string" },
+                    "library_path": { "type": "string" },
+                    "min_match": { "type": "integer", "minimum": 1, "maximum": 12 },
+                    "max_rmsd": { "type": "number" },
+                    "max_clashes": { "type": "integer", "minimum": 0, "maximum": 20 },
+                    "max_hits": { "type": "integer", "minimum": 1, "maximum": 1000 },
+                    "out_sdf_path": { "type": "string" }
+                }
+            },
+            "outputSchema": {
+                "type": "object",
+                "required": ["total_evaluated", "passed_count", "hits"],
+                "properties": {
+                    "total_evaluated": { "type": "integer" },
+                    "passed_count": { "type": "integer" },
+                    "hits": { "type": "array" }
                 }
             }
         }
@@ -537,6 +594,154 @@ fn handle_tool_call(
             Ok(json!({
                 "target": target,
                 "written_files": written
+            }))
+        }
+        "analyze_binding_site" => {
+            let rec_path = args
+                .get("receptor_path")
+                .and_then(|v| v.as_str())
+                .ok_or((-32602, "missing 'receptor_path'".to_string()))?;
+            let keep_waters = args
+                .get("keep_waters")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let rec_raw = sandbox
+                .read_string(Path::new(rec_path))
+                .map_err(|e| (-32602, e.to_string()))?;
+            let rec = parse_receptor_by_path(Path::new(rec_path), &rec_raw, !keep_waters)
+                .map_err(|e| (-32602, e))?;
+            let holo_opt =
+                if args.get("ligand_path").is_some() || args.get("ligand_smiles").is_some() {
+                    Some(parse_single_ligand(sandbox, args).map_err(|e| (-32602, e))?)
+                } else {
+                    None
+                };
+            let gbox = if args.get("box_center").is_some() && args.get("box_size").is_some() {
+                let c =
+                    parse_vec3(args.get("box_center"), "box_center").map_err(|e| (-32602, e))?;
+                let s = parse_vec3(args.get("box_size"), "box_size").map_err(|e| (-32602, e))?;
+                GridBox::from_center_size(c, s, 0.375).map_err(|e| (-32602, e.to_string()))?
+            } else if let Some(hl) = &holo_opt {
+                GridBox::from_ligand(hl, 5.5).map_err(|e| (-32602, e.to_string()))?
+            } else {
+                let pockets = detect_pockets(&rec, &PocketDetectConfig::default())
+                    .map_err(|e| (-32000, e.to_string()))?;
+                pockets
+                    .first()
+                    .ok_or((-32000, "no druggable pocket found".to_string()))?
+                    .grid_box
+                    .clone()
+            };
+            let max_features = args
+                .get("max_features")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(10)
+                .clamp(2, 20) as usize;
+            let holo_slice: Vec<&Molecule3D> = holo_opt.iter().collect();
+            let bp = analyze_binding_site(
+                &rec,
+                &gbox,
+                &holo_slice,
+                &SiteAnalysisConfig {
+                    max_features,
+                    ..Default::default()
+                },
+            )
+            .map_err(|e| (-32000, e.to_string()))?;
+            if let Some(out_bp) = args.get("out_blueprint_path").and_then(|v| v.as_str()) {
+                let js = bp.to_json_pretty().map_err(|e| (-32000, e.to_string()))?;
+                sandbox
+                    .write_string(Path::new(out_bp), &js)
+                    .map_err(|e| (-32602, e.to_string()))?;
+            }
+            if let Some(out_md) = args.get("out_markdown_path").and_then(|v| v.as_str()) {
+                sandbox
+                    .write_string(Path::new(out_md), &bp.render_markdown())
+                    .map_err(|e| (-32602, e.to_string()))?;
+            }
+            Ok(json!({
+                "target_name": bp.target_name,
+                "geometry": bp.geometry,
+                "features": bp.features,
+                "distance_matrix": bp.distance_matrix,
+                "waters": bp.waters,
+                "exclusion_spheres_count": bp.exclusion_spheres.len(),
+                "elapsed_ms": bp.elapsed_ms,
+            }))
+        }
+        "pharmacophore_screen" => {
+            let bp_path = args
+                .get("blueprint_path")
+                .and_then(|v| v.as_str())
+                .ok_or((-32602, "missing 'blueprint_path'".to_string()))?;
+            let lib_path = args
+                .get("library_path")
+                .and_then(|v| v.as_str())
+                .ok_or((-32602, "missing 'library_path'".to_string()))?;
+            let bp_raw = sandbox
+                .read_string(Path::new(bp_path))
+                .map_err(|e| (-32602, e.to_string()))?;
+            let bp = SiteBlueprint::from_json_str(&bp_raw).map_err(|e| (-32602, e.to_string()))?;
+            let bytes = sandbox
+                .read_bytes(Path::new(lib_path))
+                .map_err(|e| (-32602, e.to_string()))?;
+            let ext = Path::new(lib_path)
+                .extension()
+                .and_then(|s| s.to_str())
+                .unwrap_or("smi");
+            let records = load_ligand_library_bytes(ext, &bytes, MAX_MCP_LIBRARY_RECORDS)
+                .map_err(|e| (-32602, e.to_string()))?;
+            let mols: Vec<Molecule3D> = records.into_iter().map(|r| r.molecule).collect();
+            let cfg = PharmScreenConfig {
+                min_matched_features: args
+                    .get("min_match")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(3)
+                    .clamp(1, 12) as usize,
+                max_rmsd_a: args
+                    .get("max_rmsd")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(1.65),
+                max_exclusion_clashes: args
+                    .get("max_clashes")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(3)
+                    .clamp(0, 20) as usize,
+                max_hits: args
+                    .get("max_hits")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(200)
+                    .clamp(1, 1000) as usize,
+                ..Default::default()
+            };
+            let rep = screen_molecules_parallel(&mols, &bp, &cfg);
+            if let Some(out_sdf) = args.get("out_sdf_path").and_then(|v| v.as_str()) {
+                let refs: Vec<&Molecule3D> = rep.hits.iter().map(|h| &h.aligned_molecule).collect();
+                sandbox
+                    .write_string(Path::new(out_sdf), &write_sdf_3d(&refs))
+                    .map_err(|e| (-32602, e.to_string()))?;
+            }
+            let compact: Vec<Value> = rep
+                .hits
+                .iter()
+                .take(50)
+                .map(|h| {
+                    json!({
+                        "name": h.name,
+                        "smiles": h.smiles,
+                        "matched_count": h.matched_count,
+                        "matched_feature_ids": h.matched_feature_ids,
+                        "pharm_rmsd_a": h.pharm_rmsd_a,
+                        "exclusion_clashes": h.exclusion_clashes,
+                        "pharm_score": h.pharm_score,
+                    })
+                })
+                .collect();
+            Ok(json!({
+                "total_evaluated": rep.total_evaluated,
+                "passed_count": rep.passed_count,
+                "elapsed_ms": rep.elapsed_ms,
+                "hits": compact,
             }))
         }
         other => Err((-32601, format!("unknown tool '{other}'"))),
@@ -1015,7 +1220,28 @@ mod tests {
         assert!(wdir.join("scene.cxc").exists());
         assert!(wdir.join("scene.chymera.json").exists());
 
-        // 7. Reject oversized 200^3 A box DoS immediately
+        // 7. Analyze binding site -> write blueprint -> run pharmacophore_screen
+        let site_resp = handle_mcp_line(
+            &sandbox,
+            &mut state,
+            r#"{"jsonrpc":"2.0","id":70,"method":"tools/call","params":{"name":"analyze_binding_site","arguments":{"receptor_path":"pocket.pdb","ligand_path":"docked.sdf","box_center":[0,0,0],"box_size":[12,12,12],"out_blueprint_path":"site.pharm.json","out_markdown_path":"site.md"}}}"#,
+        )
+        .ok_or("expected response")?;
+        assert!(site_resp["result"]["structuredContent"]["features"].is_array());
+        assert!(wdir.join("site.pharm.json").exists());
+        assert!(wdir.join("site.md").exists());
+        std::fs::copy(wdir.join("site.pharm.json"), rdir.join("site.pharm.json"))?;
+        std::fs::write(rdir.join("mini.smi"), "CCO ethanol\nc1ccccc1O phenol\n")?;
+        let ps_resp = handle_mcp_line(
+            &sandbox,
+            &mut state,
+            r#"{"jsonrpc":"2.0","id":71,"method":"tools/call","params":{"name":"pharmacophore_screen","arguments":{"blueprint_path":"site.pharm.json","library_path":"mini.smi","min_match":1,"out_sdf_path":"pharm_hits.sdf"}}}"#,
+        )
+        .ok_or("expected response")?;
+        assert_eq!(ps_resp["result"]["structuredContent"]["total_evaluated"], 2);
+        assert!(wdir.join("pharm_hits.sdf").exists());
+
+        // 8. Reject oversized 200^3 A box DoS immediately
         let huge_box = handle_mcp_line(
             &sandbox,
             &mut state,

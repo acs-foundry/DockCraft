@@ -29,6 +29,14 @@ pub struct ViewportOptions {
     /// Optional 3D pharmacophore constraint spheres `(center, radius, rgba)` rendered in the viewport.
     #[serde(default)]
     pub pharmacophore_spheres: Vec<([f64; 3], f64, [f32; 4])>,
+    /// Optional 3D pharmacophore directional vectors `(origin, tip, rgba)` rendered as lines.
+    #[serde(default)]
+    pub pharmacophore_vectors: Vec<([f64; 3], [f64; 3], [f32; 4])>,
+    /// Optional receptor wall exclusion spheres `(center, radius)` from `pharm-core`.
+    #[serde(default)]
+    pub exclusion_spheres: Vec<([f64; 3], f64)>,
+    #[serde(default)]
+    pub show_exclusion_spheres: bool,
     pub background_rgba: [f32; 4],
 }
 
@@ -44,6 +52,9 @@ impl Default for ViewportOptions {
             show_torsion_lights: true,
             show_waters_metals: true,
             pharmacophore_spheres: Vec::new(),
+            pharmacophore_vectors: Vec::new(),
+            exclusion_spheres: Vec::new(),
+            show_exclusion_spheres: false,
             background_rgba: [0.075, 0.09, 0.12, 1.0],
         }
     }
@@ -579,6 +590,29 @@ pub fn build_dock_scene(
             ],
             color,
         });
+    }
+    for &(origin, tip, color) in &opts.pharmacophore_vectors {
+        let a = f64_to_f32_3(origin);
+        let b = f64_to_f32_3(tip);
+        scene.lines.push(LineVertex { pos: a, color });
+        scene.lines.push(LineVertex { pos: b, color });
+        scene.opaque_spheres.push(SphereInstance {
+            pos_rad: [b[0], b[1], b[2], 0.18],
+            color,
+        });
+    }
+    if opts.show_exclusion_spheres {
+        for &(center, radius) in &opts.exclusion_spheres {
+            scene.translucent_coronas.push(SphereInstance {
+                pos_rad: [
+                    center[0] as f32,
+                    center[1] as f32,
+                    center[2] as f32,
+                    radius as f32,
+                ],
+                color: [0.45, 0.48, 0.54, 0.12],
+            });
+        }
     }
 
     if opts.show_grid_box
