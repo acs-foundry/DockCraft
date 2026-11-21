@@ -8,9 +8,11 @@ use std::time::{Duration, Instant};
 
 use dock_engine::{DockingConfig, ScoringFunction, dock_ligand};
 use dock_pipeline::{
-    AntiTargetEntry, DEFAULT_MAX_FILE_BYTES, LoadedAntiTarget, PathSandbox, SafetyPanelConfig,
-    SceneExportRequest, build_chimerax_md_script, campaign_report_to_csv, canonical_export_target,
-    check_openmm_env, load_ligand_library_bytes, run_safety_panel_loaded, run_screening_campaign,
+    AntiTargetEntry, DEFAULT_MAX_FILE_BYTES, GninaRescoreConfig, LeadOptConfig, LeadOptMode,
+    LoadedAntiTarget, PathSandbox, SafetyPanelConfig, SceneExportRequest, build_chimerax_md_script,
+    campaign_report_to_csv, canonical_export_target, check_fep_env, check_gnina_env,
+    check_openmm_env, load_ligand_library_bytes, plan_rbfe_network, run_gnina_rescore,
+    run_lead_optimization, run_safety_panel_loaded, run_screening_campaign,
     write_chimerax_session_bundle, write_sandboxed_scene_package,
 };
 use hyde_scorer::{SubstituentPreset, mutate_and_minimize_in_pocket, score_pose_hyde};
@@ -404,6 +406,80 @@ fn tool_definitions() -> Value {
                 "properties": {
                     "targets_evaluated": { "type": "integer" },
                     "summaries": { "type": "array" }
+                }
+            }
+        },
+        {
+            "name": "run_lead_optimization",
+            "description": "Runs closed-loop 3D in-pocket lead optimization (substituent growth + optional ΔMIF selectivity + PoseBusters + Pareto ranking) inside read_root/write_root and optionally writes aligned congeneric series SDF & Markdown dossier.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["receptor_path", "ligand_path"],
+                "properties": {
+                    "receptor_path": { "type": "string" },
+                    "ligand_path": { "type": "string" },
+                    "selectivity_json_path": { "type": "string" },
+                    "mode": { "type": "string", "enum": ["combined", "pocket-growth", "som-blocking"] },
+                    "tpp_profile": { "type": "string", "enum": ["oral", "cns", "peripheral", "oncology"] },
+                    "max_vectors": { "type": "integer", "minimum": 1, "maximum": 8 },
+                    "max_analogs": { "type": "integer", "minimum": 2, "maximum": 40 },
+                    "use_external_clis": { "type": "boolean" },
+                    "out_series_sdf_path": { "type": "string" },
+                    "out_markdown_path": { "type": "string" }
+                }
+            },
+            "outputSchema": {
+                "type": "object",
+                "required": ["parent_name", "valid_unique_analogs", "analogs"],
+                "properties": {
+                    "parent_name": { "type": "string" },
+                    "valid_unique_analogs": { "type": "integer" },
+                    "analogs": { "type": "array" }
+                }
+            }
+        },
+        {
+            "name": "prepare_fep_network",
+            "description": "Probes OpenMM/pymbar/OpenFE RBFE availability, plans a star + cycle-closure 3D perturbation network from 2..12 aligned congeneric ligands in read_root, and optionally stages config JSON & report inside write_root.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["ligands_sdf_path"],
+                "properties": {
+                    "receptor_path": { "type": "string" },
+                    "offtarget_receptor_path": { "type": "string" },
+                    "ligands_sdf_path": { "type": "string" },
+                    "n_windows": { "type": "integer", "minimum": 5, "maximum": 21 },
+                    "ns_per_window": { "type": "number" },
+                    "max_edges": { "type": "integer", "minimum": 1, "maximum": 24 },
+                    "out_config_path": { "type": "string" }
+                }
+            },
+            "outputSchema": {
+                "type": "object",
+                "required": ["env_status", "planned_edges"],
+                "properties": {
+                    "env_status": { "type": "object" },
+                    "planned_edges": { "type": "array" }
+                }
+            }
+        },
+        {
+            "name": "rescore_poses_cnn",
+            "description": "Probes opt-in GNINA CNN binary availability and optionally runs GNINA --score_only 3-way consensus rescoring (Vina + HYDE + CNN) on sandboxed receptor & poses SDF inside read_root/write_root.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "receptor_path": { "type": "string" },
+                    "poses_sdf_path": { "type": "string" },
+                    "force_cpu": { "type": "boolean" },
+                    "out_csv_path": { "type": "string" }
+                }
+            },
+            "outputSchema": {
+                "type": "object",
+                "required": ["env_status"],
+                "properties": {
+                    "env_status": { "type": "object" }
                 }
             }
         }
@@ -1241,6 +1317,219 @@ fn handle_tool_call(
             }
             serde_json::to_value(&report).map_err(|e| (-32000, e.to_string()))
         }
+        "run_lead_optimization" => {
+            let rec_path = args
+                .get("receptor_path")
+                .and_then(|v| v.as_str())
+                .ok_or((-32602, "missing 'receptor_path'".to_string()))?;
+            let rec_raw = sandbox
+                .read_string(Path::new(rec_path))
+                .map_err(|e| (-32602, e.to_string()))?;
+            let mut rec = parse_receptor_by_path(Path::new(rec_path), &rec_raw, true)
+                .map_err(|e| (-32602, e))?;
+            if let Some(stem) = Path::new(rec_path).file_stem().and_then(|s| s.to_str()) {
+                rec.name = stem.to_string();
+            }
+            let lig = parse_single_ligand(sandbox, args).map_err(|e| (-32602, e))?;
+
+            let mode = match args.get("mode").and_then(|v| v.as_str()) {
+                Some("pocket-growth") => LeadOptMode::PocketGrowth,
+                Some("som-blocking") => LeadOptMode::SomBlocking,
+                _ => LeadOptMode::Combined,
+            };
+            let tpp_profile = args
+                .get("tpp_profile")
+                .and_then(|v| v.as_str())
+                .unwrap_or("oncology")
+                .to_string();
+            let max_vectors = args
+                .get("max_vectors")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(4)
+                .clamp(1, 8) as usize;
+            let max_analogs = args
+                .get("max_analogs")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(20)
+                .clamp(2, 40) as usize;
+            let use_external_craft_clis = args
+                .get("use_external_clis")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+
+            let stage_dir = std::env::temp_dir().join(format!(
+                "dockcraft_mcp_leadopt_{}_{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_nanos())
+            ));
+            let _ = std::fs::create_dir_all(&stage_dir);
+
+            let selectivity_json =
+                if let Some(sel_p) = args.get("selectivity_json_path").and_then(|v| v.as_str()) {
+                    let sel_raw = sandbox
+                        .read_string(Path::new(sel_p))
+                        .map_err(|e| (-32602, e.to_string()))?;
+                    let tmp_sel = stage_dir.join("selectivity_staged.json");
+                    std::fs::write(&tmp_sel, sel_raw).map_err(|e| (-32000, e.to_string()))?;
+                    Some(tmp_sel)
+                } else {
+                    None
+                };
+
+            let cfg = LeadOptConfig {
+                mode,
+                tpp_profile,
+                selectivity_json,
+                max_vectors,
+                max_analogs,
+                top_retro: 4,
+                use_external_craft_clis,
+                out_dir: stage_dir.clone(),
+            };
+            let report =
+                run_lead_optimization(&rec, &lig, &cfg).map_err(|e| (-32000, e.to_string()))?;
+
+            if let Some(out_sdf) = args.get("out_series_sdf_path").and_then(|v| v.as_str()) {
+                let series_raw = std::fs::read_to_string(&report.series_sdf_path)
+                    .map_err(|e| (-32000, e.to_string()))?;
+                sandbox
+                    .write_string(Path::new(out_sdf), &series_raw)
+                    .map_err(|e| (-32602, e.to_string()))?;
+            }
+            if let Some(out_md) = args.get("out_markdown_path").and_then(|v| v.as_str()) {
+                sandbox
+                    .write_string(Path::new(out_md), &report.render_markdown())
+                    .map_err(|e| (-32602, e.to_string()))?;
+            }
+            let _ = std::fs::remove_dir_all(&stage_dir);
+            serde_json::to_value(&report).map_err(|e| (-32000, e.to_string()))
+        }
+        "prepare_fep_network" => {
+            let env_status = check_fep_env(None);
+            let ligs_path = args
+                .get("ligands_sdf_path")
+                .and_then(|v| v.as_str())
+                .ok_or((-32602, "missing 'ligands_sdf_path'".to_string()))?;
+            let sdf_raw = sandbox
+                .read_string(Path::new(ligs_path))
+                .map_err(|e| (-32602, e.to_string()))?;
+            let ligs: Vec<Molecule3D> = parse_sdf_3d_with_limit(&sdf_raw, 12)
+                .into_iter()
+                .filter_map(Result::ok)
+                .collect();
+            if ligs.len() < 2 {
+                return Err((
+                    -32602,
+                    format!("need at least 2 valid 3D ligands in '{ligs_path}'"),
+                ));
+            }
+            let n_windows = args
+                .get("n_windows")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(11)
+                .clamp(5, 21) as usize;
+            let ns_per_window = args
+                .get("ns_per_window")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.5)
+                .clamp(0.01, 20.0);
+            let max_edges = args
+                .get("max_edges")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(12)
+                .clamp(1, 24) as usize;
+            let planned_edges = plan_rbfe_network(&ligs, max_edges);
+            if let Some(out_cfg) = args.get("out_config_path").and_then(|v| v.as_str()) {
+                let rec_p = args
+                    .get("receptor_path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("receptor.pdb");
+                let ot_p = args.get("offtarget_receptor_path").and_then(|v| v.as_str());
+                let cfg_str = serde_json::to_string_pretty(&json!({
+                    "receptor_path": rec_p,
+                    "offtarget_receptor_path": ot_p,
+                    "ligands_sdf_path": ligs_path,
+                    "n_windows": n_windows,
+                    "ns_per_window": ns_per_window,
+                    "planned_edges": planned_edges,
+                }))
+                .map_err(|e| (-32000, e.to_string()))?;
+                sandbox
+                    .write_string(Path::new(out_cfg), &cfg_str)
+                    .map_err(|e| (-32602, e.to_string()))?;
+            }
+            Ok(json!({
+                "env_status": env_status,
+                "ligand_count": ligs.len(),
+                "n_windows": n_windows,
+                "ns_per_window": ns_per_window,
+                "planned_edges": planned_edges,
+            }))
+        }
+        "rescore_poses_cnn" => {
+            let env_status = check_gnina_env(None);
+            let Some(rec_path) = args.get("receptor_path").and_then(|v| v.as_str()) else {
+                return Ok(json!({ "env_status": env_status }));
+            };
+            let Some(poses_path) = args.get("poses_sdf_path").and_then(|v| v.as_str()) else {
+                return Ok(json!({ "env_status": env_status }));
+            };
+            // Always enforce sandbox read validation before probing/executing GNINA
+            let rec_raw = sandbox
+                .read_string(Path::new(rec_path))
+                .map_err(|e| (-32602, e.to_string()))?;
+            let poses_raw = sandbox
+                .read_string(Path::new(poses_path))
+                .map_err(|e| (-32602, e.to_string()))?;
+            let rec = parse_receptor_by_path(Path::new(rec_path), &rec_raw, true)
+                .map_err(|e| (-32602, e))?;
+            if !env_status.available {
+                return Ok(json!({
+                    "env_status": env_status,
+                    "executed": false,
+                    "note": "GNINA binary is not installed; install at CRAFT_DATA_DIR/envs/gnina/gnina to execute live CNN rescoring."
+                }));
+            }
+            let stage_dir = std::env::temp_dir().join(format!(
+                "dockcraft_mcp_cnn_{}_{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_nanos())
+            ));
+            let _ = std::fs::create_dir_all(&stage_dir);
+            let tmp_rec = stage_dir.join("rec.pdb");
+            let tmp_poses = stage_dir.join("poses.sdf");
+            std::fs::write(&tmp_rec, &rec_raw).map_err(|e| (-32000, e.to_string()))?;
+            std::fs::write(&tmp_poses, &poses_raw).map_err(|e| (-32000, e.to_string()))?;
+            let force_cpu = args
+                .get("force_cpu")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let cfg = GninaRescoreConfig {
+                receptor_path: tmp_rec,
+                poses_sdf_path: tmp_poses,
+                out_sdf_path: None,
+                out_csv_path: None,
+                force_cpu,
+                gnina_override: None,
+            };
+            let report =
+                run_gnina_rescore(&cfg, Some(&rec)).map_err(|e| (-32000, e.to_string()))?;
+            if let Some(out_csv) = args.get("out_csv_path").and_then(|v| v.as_str()) {
+                sandbox
+                    .write_string(Path::new(out_csv), &report.to_csv())
+                    .map_err(|e| (-32602, e.to_string()))?;
+            }
+            let _ = std::fs::remove_dir_all(&stage_dir);
+            Ok(json!({
+                "env_status": env_status,
+                "executed": true,
+                "report": report,
+            }))
+        }
         other => Err((-32601, format!("unknown tool '{other}'"))),
     }
 }
@@ -1804,6 +2093,54 @@ mod tests {
         )
         .ok_or("expected response")?;
         assert_eq!(sp_esc["error"]["code"], -32602);
+
+        // 7d. Ola 2 MCP tools: run_lead_optimization, prepare_fep_network, rescore_poses_cnn + sandbox escape checks
+        let lo_resp = handle_mcp_line(
+            &sandbox,
+            &mut state,
+            r#"{"jsonrpc":"2.0","id":78,"method":"tools/call","params":{"name":"run_lead_optimization","arguments":{"receptor_path":"pocket.pdb","ligand_path":"docked.sdf","mode":"pocket-growth","max_vectors":2,"max_analogs":8,"use_external_clis":false,"out_series_sdf_path":"lead_series.sdf","out_markdown_path":"lead_opt.md"}}}"#,
+        )
+        .ok_or("expected response")?;
+        assert!(
+            lo_resp["result"]["structuredContent"]["valid_unique_analogs"]
+                .as_u64()
+                .unwrap_or(0)
+                >= 1
+        );
+        assert!(wdir.join("lead_series.sdf").exists());
+        assert!(wdir.join("lead_opt.md").exists());
+
+        std::fs::copy(wdir.join("lead_series.sdf"), rdir.join("lead_series.sdf"))?;
+        let fep_resp = handle_mcp_line(
+            &sandbox,
+            &mut state,
+            r#"{"jsonrpc":"2.0","id":79,"method":"tools/call","params":{"name":"prepare_fep_network","arguments":{"receptor_path":"pocket.pdb","ligands_sdf_path":"lead_series.sdf","n_windows":7,"ns_per_window":0.1,"out_config_path":"fep_cfg.json"}}}"#,
+        )
+        .ok_or("expected response")?;
+        assert!(fep_resp["result"]["structuredContent"]["env_status"].is_object());
+        assert!(
+            fep_resp["result"]["structuredContent"]["planned_edges"]
+                .as_array()
+                .map_or(0, Vec::len)
+                >= 1
+        );
+        assert!(wdir.join("fep_cfg.json").exists());
+
+        let cnn_probe = handle_mcp_line(
+            &sandbox,
+            &mut state,
+            r#"{"jsonrpc":"2.0","id":80,"method":"tools/call","params":{"name":"rescore_poses_cnn","arguments":{}}}"#,
+        )
+        .ok_or("expected response")?;
+        assert!(cnn_probe["result"]["structuredContent"]["env_status"].is_object());
+
+        let cnn_esc = handle_mcp_line(
+            &sandbox,
+            &mut state,
+            r#"{"jsonrpc":"2.0","id":81,"method":"tools/call","params":{"name":"rescore_poses_cnn","arguments":{"receptor_path":"escape.pdb","poses_sdf_path":"docked.sdf"}}}"#,
+        )
+        .ok_or("expected response")?;
+        assert_eq!(cnn_esc["error"]["code"], -32602);
 
         // 8. Reject oversized 200^3 A box DoS immediately
         let huge_box = handle_mcp_line(

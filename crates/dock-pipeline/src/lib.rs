@@ -4,7 +4,10 @@ pub mod admet;
 pub mod campaign;
 pub mod chimerax;
 pub mod chimerax_rest;
+pub mod cnn_rescore;
 pub mod export;
+pub mod fep_bridge;
+pub mod lead_opt;
 pub mod md_validate;
 pub mod orchestrator;
 pub mod results_sidecar;
@@ -25,14 +28,28 @@ pub use chimerax::{
 pub use chimerax_rest::{
     ChimeraXCommand, ChimeraXReply, ChimeraXRest, DEFAULT_REST_PORT, RestError,
 };
+pub use cnn_rescore::{
+    CnnRescoreError, CnnRescoreReport, CnnRescoredPose, GninaEnvStatus, GninaRescoreConfig,
+    check_gnina_env, compute_3way_consensus_kcal, parse_gnina_sdf_output, resolve_gnina_binary,
+    run_gnina_rescore,
+};
 pub use export::{
     InteropSceneBundle, SceneExportRequest, build_chimerax_export, build_pymol_export,
     canonical_export_target, write_sandboxed_scene_package,
 };
+pub use fep_bridge::{
+    FepBackend, FepConfig, FepCycleClosure, FepEdgeResult, FepEnvStatus, FepError, FepLegResult,
+    FepReport, RbfePlannedEdge, check_fep_env, compute_cycle_closures, plan_rbfe_network,
+    run_fep_network,
+};
+pub use lead_opt::{
+    LeadOptAnalog, LeadOptConfig, LeadOptError, LeadOptMode, LeadOptReport, run_lead_optimization,
+};
 pub use md_validate::{
     HBondPersistence, MdEnvStatus, MdError, MdPlatform, MdStabilityVerdict, MdValidateConfig,
-    MdValidateReport, build_chimerax_md_script, check_openmm_env, craft_data_dir,
-    resolve_openmm_python, run_md_validation,
+    MdValidateReport, MmgbsaBreakdown, ReplicateSummary, ResidueEnergyDecomp, ResidueRmsf,
+    build_chimerax_md_script, check_openmm_env, craft_data_dir, resolve_openmm_python,
+    run_md_validation,
 };
 pub use orchestrator::{
     CampaignLeadSummary, CampaignManifest, CampaignSpec, EnsembleSpecEntry, FileProvenance,

@@ -11,13 +11,15 @@ use dock_engine::{
     score_complex,
 };
 use dock_pipeline::{
-    CampaignSpec, ChimeraXRest, DEFAULT_MAX_FILE_BYTES, MdPlatform, MdValidateConfig, PathSandbox,
-    SafetyPanelConfig, SafetyPanelManifest, campaign_report_to_csv, check_openmm_env,
+    CampaignSpec, ChimeraXRest, DEFAULT_MAX_FILE_BYTES, FepBackend, FepConfig, GninaRescoreConfig,
+    LeadOptConfig, LeadOptMode, MdPlatform, MdValidateConfig, PathSandbox, SafetyPanelConfig,
+    SafetyPanelManifest, campaign_report_to_csv, check_fep_env, check_gnina_env, check_openmm_env,
     default_bowes_tier1_catalog, default_cdk2_campaign_template, default_chemcraft_results_dir,
     default_chimerax_export_dir, default_safety_panel_dir, default_safety_panel_manifest_path,
     grid_box_from_chimerax_selection, is_chimerax_available, launch_chimerax_for_scene,
-    load_ligand_library_bytes, run_campaign, run_md_validation, run_safety_panel,
-    run_screening_campaign, write_chimerax_session_bundle, write_results_sidecar,
+    load_ligand_library_bytes, run_campaign, run_fep_network, run_gnina_rescore,
+    run_lead_optimization, run_md_validation, run_safety_panel, run_screening_campaign,
+    write_chimerax_session_bundle, write_results_sidecar,
 };
 use flate2::read::GzDecoder;
 use hyde_scorer::{
@@ -59,6 +61,19 @@ enum CliMdPlatform {
     Cuda,
     Opencl,
     Cpu,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliLeadOptMode {
+    Combined,
+    PocketGrowth,
+    SomBlocking,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliFepBackend {
+    Openmm,
+    Openfe,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -492,12 +507,115 @@ enum Commands {
         charges: String,
         #[arg(long, value_enum, default_value_t = CliMdPlatform::Auto)]
         platform: CliMdPlatform,
+        /// Number of independent MD replicates (`1..=5`, distinct Langevin & velocity seeds)
+        #[arg(long, default_value_t = 1)]
+        replicates: usize,
+        /// Base random seed for Langevin thermostat & initial velocity generation
+        #[arg(long, default_value_t = 2026_1121)]
+        seed: u64,
+        /// Implicit-solvent Generalized Born model for GPU MM/GBSA (`obc2` | `gbn2`)
+        #[arg(long, default_value = "obc2")]
+        mmgbsa_model: String,
+        /// Interior solute dielectric constant for MM/GBSA (1.0 standard, 2.0 polar pockets)
+        #[arg(long, default_value_t = 1.0)]
+        solute_dielectric: f64,
         /// Explicit Python interpreter inside an OpenMM venv (overrides CRAFT_DATA_DIR/envs/openmm)
         #[arg(long)]
         python: Option<PathBuf>,
         /// Stage runnable OpenMM script + config + ChimeraX .cxc without launching GPU MD
         #[arg(long)]
         dry_run: bool,
+    },
+    /// Closed-loop multi-parameter lead optimization: 3D in-pocket substituent growth + ΔMIF selectivity +
+    /// metabolic SoM blocking + AdmetCraft v1.1 QSAR/Tox21/SEA/Metabolite Guard + ChemCraft Retro* Pareto ranking
+    LeadOpt {
+        #[arg(long)]
+        receptor: PathBuf,
+        #[arg(long)]
+        ligand: PathBuf,
+        /// Optional Ola 1 `selectivity_report.json` from `compare-pockets` to bias growth toward `SEL_*` hotspots
+        #[arg(long)]
+        selectivity_json: Option<PathBuf>,
+        #[arg(long, value_enum, default_value_t = CliLeadOptMode::Combined)]
+        mode: CliLeadOptMode,
+        /// AdmetCraft Target Product Profile (`oral` | `cns` | `peripheral` | `oncology`)
+        #[arg(long, default_value = "oncology")]
+        tpp: String,
+        #[arg(long, default_value_t = 5)]
+        max_vectors: usize,
+        #[arg(long, default_value_t = 30)]
+        max_analogs: usize,
+        /// Number of top Pareto leads audited with `chemcraft-cli retro`
+        #[arg(long, default_value_t = 6)]
+        top_retro: usize,
+        /// Skip calling external `admetcraft-cli` / `chemcraft-cli` (pure offline DockCraft scoring only)
+        #[arg(long)]
+        no_external_clis: bool,
+        #[arg(long, default_value = "./lead_opt")]
+        out_dir: PathBuf,
+    },
+    /// Opt-in Alchemical Relative Binding Free Energy (RBFE / FEP) perturbation network on GPU CUDA
+    /// (native OpenMM dual-softcore Beutler LJ + MBAR/TI, or external OpenFE bundle export)
+    Fep {
+        /// Probe the isolated OpenMM/pymbar/OpenFE environment and exit
+        #[arg(long)]
+        check_env: bool,
+        #[arg(long)]
+        receptor: Option<PathBuf>,
+        /// Optional off-target/paralog receptor PDB for 3-leg Selectivity FEP (`ΔΔG_sel`)
+        #[arg(long)]
+        offtarget_receptor: Option<PathBuf>,
+        /// Aligned 3D congeneric ligand series SDF (2..12 ligands, e.g. `lead_opt_series.sdf` or `fep_pair.sdf`)
+        #[arg(long)]
+        ligands_sdf: Option<PathBuf>,
+        #[arg(long, value_enum, default_value_t = CliFepBackend::Openmm)]
+        backend: CliFepBackend,
+        /// Number of λ-windows per alchemical leg (5..21, default 11)
+        #[arg(long, default_value_t = 11)]
+        windows: usize,
+        /// Production sampling length per λ-window in nanoseconds (default 0.5 ns; use 0.05 for fast checks)
+        #[arg(long, default_value_t = 0.5)]
+        ns_per_window: f64,
+        /// Equilibration length per λ-window in picoseconds
+        #[arg(long, default_value_t = 20.0)]
+        equil_ps: f64,
+        #[arg(long, default_value_t = 300.0)]
+        temp_k: f64,
+        #[arg(long, default_value_t = 0.95)]
+        padding_nm: f64,
+        #[arg(long, default_value = "nagl")]
+        charges: String,
+        #[arg(long, value_enum, default_value_t = CliMdPlatform::Auto)]
+        platform: CliMdPlatform,
+        #[arg(long, default_value_t = 12)]
+        max_edges: usize,
+        #[arg(long)]
+        python: Option<PathBuf>,
+        /// Plan perturbation graph and write runnable scripts/configs without launching GPU sampling
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long, default_value = "./fep_run")]
+        out_dir: PathBuf,
+    },
+    /// Opt-in GNINA `--score_only` 3D CNN pose rescoring with calibrated 3-way consensus (Vina + HYDE + CNN)
+    RescoreCnn {
+        /// Probe whether an external `gnina` binary is available and exit
+        #[arg(long)]
+        check_env: bool,
+        #[arg(long)]
+        receptor: Option<PathBuf>,
+        #[arg(long)]
+        poses: Option<PathBuf>,
+        #[arg(long)]
+        out_sdf: Option<PathBuf>,
+        #[arg(long)]
+        out_csv: Option<PathBuf>,
+        /// Force CPU execution (`--no_gpu`)
+        #[arg(long)]
+        cpu: bool,
+        /// Explicit path to the `gnina` binary
+        #[arg(long)]
+        gnina_bin: Option<PathBuf>,
     },
     /// Run a fully reproducible 7-stage SBDD -> ADMET -> MD -> Retrosynthesis campaign with SHA-256 provenance
     Campaign {
@@ -1757,6 +1875,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             padding_nm,
             charges,
             platform,
+            replicates,
+            seed,
+            mmgbsa_model,
+            solute_dielectric,
             python,
             dry_run,
         } => {
@@ -1784,11 +1906,152 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 padding_nm,
                 charge_method: charges,
                 platform: plat,
+                replicates,
+                seed,
+                mmgbsa_model,
+                solute_dielectric,
                 python_override: python,
                 dry_run,
                 ..Default::default()
             };
             let rep = run_md_validation(&cfg)?;
+            println!("{}", rep.render_markdown());
+        }
+        Commands::LeadOpt {
+            receptor,
+            ligand,
+            selectivity_json,
+            mode,
+            tpp,
+            max_vectors,
+            max_analogs,
+            top_retro,
+            no_external_clis,
+            out_dir,
+        } => {
+            let mut rec = read_receptor_file(&receptor, true)?;
+            if let Some(stem) = receptor.file_stem().and_then(|s| s.to_str()) {
+                rec.name = stem.to_string();
+            }
+            let lig_raw = std::fs::read_to_string(&ligand)?;
+            let ext = ligand
+                .extension()
+                .and_then(|s| s.to_str())
+                .unwrap_or("sdf")
+                .to_ascii_lowercase();
+            let mut lig = match ext.as_str() {
+                "pdbqt" => parse_pdbqt(&lig_raw)?,
+                "mol2" => parse_mol2(&lig_raw)?,
+                "pdb" => parse_pdb(&lig_raw, true)?,
+                _ => {
+                    let mut ligs = parse_sdf_3d_with_limit(&lig_raw, 1);
+                    ligs.pop().ok_or("empty ligand SDF")??
+                }
+            };
+            struct_core::perceive_all(&mut lig);
+            let lo_mode = match mode {
+                CliLeadOptMode::Combined => LeadOptMode::Combined,
+                CliLeadOptMode::PocketGrowth => LeadOptMode::PocketGrowth,
+                CliLeadOptMode::SomBlocking => LeadOptMode::SomBlocking,
+            };
+            let cfg = LeadOptConfig {
+                mode: lo_mode,
+                tpp_profile: tpp,
+                selectivity_json,
+                max_vectors,
+                max_analogs,
+                top_retro,
+                use_external_craft_clis: !no_external_clis,
+                out_dir,
+            };
+            let rep = run_lead_optimization(&rec, &lig, &cfg)?;
+            println!("{}", rep.render_markdown());
+        }
+        Commands::Fep {
+            check_env,
+            receptor,
+            offtarget_receptor,
+            ligands_sdf,
+            backend,
+            windows,
+            ns_per_window,
+            equil_ps,
+            temp_k,
+            padding_nm,
+            charges,
+            platform,
+            max_edges,
+            python,
+            dry_run,
+            out_dir,
+        } => {
+            if check_env {
+                let status = check_fep_env(python.as_deref());
+                println!("{}", serde_json::to_string_pretty(&status)?);
+                return Ok(());
+            }
+            let rec_p = receptor.ok_or("--receptor is required (or pass --check-env)")?;
+            let lig_p = ligands_sdf.ok_or("--ligands-sdf is required (or pass --check-env)")?;
+            let plat = match platform {
+                CliMdPlatform::Auto => MdPlatform::Auto,
+                CliMdPlatform::Cuda => MdPlatform::Cuda,
+                CliMdPlatform::Opencl => MdPlatform::OpenCl,
+                CliMdPlatform::Cpu => MdPlatform::Cpu,
+            };
+            let be = match backend {
+                CliFepBackend::Openmm => FepBackend::OpenmmAlchemical,
+                CliFepBackend::Openfe => FepBackend::OpenFe,
+            };
+            let cfg = FepConfig {
+                receptor_path: rec_p,
+                offtarget_receptor_path: offtarget_receptor,
+                ligands_sdf_path: lig_p,
+                out_dir,
+                backend: be,
+                n_windows: windows,
+                ns_per_window,
+                equil_ps_per_window: equil_ps,
+                temperature_k: temp_k,
+                padding_nm,
+                charge_method: charges,
+                platform: plat,
+                max_edges,
+                python_override: python,
+                dry_run,
+                ..Default::default()
+            };
+            let rep = run_fep_network(&cfg)?;
+            println!("{}", rep.render_markdown());
+        }
+        Commands::RescoreCnn {
+            check_env,
+            receptor,
+            poses,
+            out_sdf,
+            out_csv,
+            cpu,
+            gnina_bin,
+        } => {
+            if check_env {
+                let status = check_gnina_env(gnina_bin.as_deref());
+                println!("{}", serde_json::to_string_pretty(&status)?);
+                return Ok(());
+            }
+            let rec_p = receptor.ok_or("--receptor is required (or pass --check-env)")?;
+            let pos_p = poses.ok_or("--poses is required (or pass --check-env)")?;
+            let mut rec = read_receptor_file(&rec_p, true)?;
+            if let Some(stem) = rec_p.file_stem().and_then(|s| s.to_str()) {
+                rec.name = stem.to_string();
+            }
+            let cfg = GninaRescoreConfig {
+                receptor_path: rec_p,
+                poses_sdf_path: pos_p,
+                out_sdf_path: out_sdf,
+                out_csv_path: out_csv,
+                force_cpu: cpu,
+                gnina_override: gnina_bin,
+            };
+            let rep = run_gnina_rescore(&cfg, Some(&rec))?;
             println!("{}", rep.render_markdown());
         }
         Commands::Campaign {

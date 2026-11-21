@@ -95,6 +95,18 @@ pub struct CampaignSpec {
     /// Docking exhaustiveness for Stage 5b safety-panel inverse docking (default `3`).
     #[serde(default = "default_safety_exhaustiveness")]
     pub safety_panel_exhaustiveness: usize,
+    /// Number of independent MD replicates for Stage 6 (`1..=5`, default `1`).
+    #[serde(default = "default_md_replicates")]
+    pub md_replicates: usize,
+    /// Whether to run optional Stage 4b GNINA CNN 3-way rescoring when `gnina` is installed.
+    #[serde(default)]
+    pub rescore_cnn: bool,
+    /// Whether to run optional Stage 6b closed-loop `lead-opt` on the top prioritized lead.
+    #[serde(default)]
+    pub run_lead_opt: bool,
+    /// Whether to stage optional Stage 6c RBFE/FEP perturbation bundles (`--dry-run`) on `lead_opt_series.sdf`.
+    #[serde(default)]
+    pub stage_fep: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -140,6 +152,9 @@ fn default_synth_scale_mg() -> f64 {
 }
 fn default_safety_exhaustiveness() -> usize {
     3
+}
+fn default_md_replicates() -> usize {
+    1
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -339,6 +354,10 @@ pub fn default_cdk2_campaign_template() -> CampaignSpec {
         run_safety_panel: false,
         safety_panel_manifest: None,
         safety_panel_exhaustiveness: 3,
+        md_replicates: 1,
+        rescore_cnn: false,
+        run_lead_opt: false,
+        stage_fep: false,
     }
 }
 
@@ -754,6 +773,50 @@ pub fn run_campaign(spec: &CampaignSpec) -> Result<CampaignManifest, Orchestrato
         ]),
     });
 
+    // --- OPTIONAL STAGE 4b: GNINA CNN 3-Way Pose Rescoring ---
+    if spec.rescore_cnn && dock_sdf.exists() {
+        let t4b = Instant::now();
+        let cnn_csv = dock_dir.join("cnn_rescored.csv");
+        let cnn_sdf = dock_dir.join("cnn_rescored.sdf");
+        let mut cmd4b = Command::new(&dock_cli);
+        cmd4b
+            .args(["rescore-cnn", "--receptor"])
+            .arg(&prep_pdb)
+            .arg("--poses")
+            .arg(&dock_sdf)
+            .arg("--out-csv")
+            .arg(&cnn_csv)
+            .arg("--out-sdf")
+            .arg(&cnn_sdf);
+        if run_checked_cmd("04b_rescore_cnn", &mut cmd4b).is_ok() {
+            stages.push(StageRecord {
+                stage_number: 4,
+                stage_id: "rescore-cnn".to_string(),
+                tool: "dockcraft-cli rescore-cnn".to_string(),
+                verdict: GateVerdict::Go,
+                elapsed_ms: t4b.elapsed().as_millis(),
+                summary: format!(
+                    "GNINA CNN 3-way consensus rescoring ({} pose(s))",
+                    count_csv_data_rows(&cnn_csv)
+                ),
+                outputs: collect_provenance(&[
+                    ("CNN Rescored CSV", &cnn_csv),
+                    ("CNN Rescored SDF", &cnn_sdf),
+                ]),
+            });
+        } else {
+            stages.push(StageRecord {
+                stage_number: 4,
+                stage_id: "rescore-cnn".to_string(),
+                tool: "dockcraft-cli rescore-cnn".to_string(),
+                verdict: GateVerdict::Skipped,
+                elapsed_ms: t4b.elapsed().as_millis(),
+                summary: "GNINA binary unavailable; skipped optional CNN rescoring".to_string(),
+                outputs: Vec::new(),
+            });
+        }
+    }
+
     // Extract ranked top candidates with SMILES (lookup from input library if SDF/SMI)
     let ranked_hits = extract_top_docked_with_smiles(&dock_csv, &spec.library_path, spec.admet_top);
 
@@ -992,7 +1055,12 @@ pub fn run_campaign(spec: &CampaignSpec) -> Result<CampaignManifest, Orchestrato
             .arg(&lig_pose_src)
             .arg("--out-dir")
             .arg(&lead_md_dir)
-            .args(["--ns", &format!("{:.3}", spec.md_production_ns)]);
+            .args([
+                "--ns",
+                &format!("{:.3}", spec.md_production_ns),
+                "--replicates",
+                &spec.md_replicates.clamp(1, 5).to_string(),
+            ]);
         if !spec.run_md {
             cmd6.arg("--dry-run");
         }
@@ -1020,14 +1088,102 @@ pub fn run_campaign(spec: &CampaignSpec) -> Result<CampaignManifest, Orchestrato
         elapsed_ms: t6.elapsed().as_millis(),
         summary: if spec.run_md {
             format!(
-                "Executed OpenMM MD ({:.2} ns) on top lead",
+                "Executed OpenMM MD ({} replicate(s) × {:.2} ns) + GPU MM/GBSA on top lead",
+                spec.md_replicates.clamp(1, 5),
                 spec.md_production_ns
             )
         } else {
-            "Staged runnable OpenMM GPU MD bundle (pass run_md=true to launch GPU)".to_string()
+            "Staged runnable OpenMM GPU MD + MM/GBSA bundle (pass run_md=true to launch GPU)"
+                .to_string()
         },
         outputs: md_outs,
     });
+
+    // --- OPTIONAL STAGE 6b: Closed-Loop Lead Optimization (`lead-opt`) ---
+    let mut lead_opt_series_path: Option<PathBuf> = None;
+    if spec.run_lead_opt && lig_pose_src.exists() {
+        let t6b = Instant::now();
+        let lo_dir = spec.out_dir.join("06b_lead_opt");
+        std::fs::create_dir_all(&lo_dir)?;
+        let sel_json = spec.out_dir.join("02b_selectivity/selectivity_report.json");
+        let mut cmd6b = Command::new(&dock_cli);
+        cmd6b
+            .args(["lead-opt", "--receptor"])
+            .arg(&prep_pdb)
+            .arg("--ligand")
+            .arg(&lig_pose_src)
+            .args(["--tpp", &spec.tpp_profile])
+            .arg("--out-dir")
+            .arg(&lo_dir);
+        if sel_json.exists() {
+            cmd6b.arg("--selectivity-json").arg(&sel_json);
+        }
+        run_checked_cmd("06b_lead_opt", &mut cmd6b)?;
+        let lo_md = lo_dir.join("lead_opt_report.md");
+        let lo_sdf = lo_dir.join("lead_opt_series.sdf");
+        if lo_sdf.exists() {
+            lead_opt_series_path = Some(lo_sdf.clone());
+        }
+        stages.push(StageRecord {
+            stage_number: 6,
+            stage_id: "lead-opt".to_string(),
+            tool: "dockcraft-cli lead-opt".to_string(),
+            verdict: GateVerdict::Go,
+            elapsed_ms: t6b.elapsed().as_millis(),
+            summary: "Generated Pareto-ranked 3D congeneric lead series (DockCraft + AdmetCraft + ChemCraft)".to_string(),
+            outputs: collect_provenance(&[
+                ("Lead-Opt Report MD", &lo_md),
+                ("Lead-Opt Congeneric Series SDF", &lo_sdf),
+            ]),
+        });
+    }
+
+    // --- OPTIONAL STAGE 6c: Stage Alchemical RBFE/FEP Perturbation Network ---
+    if spec.stage_fep {
+        let t6c = Instant::now();
+        let fep_dir = spec.out_dir.join("06c_fep_rbfe");
+        let fep_src = lead_opt_series_path
+            .clone()
+            .filter(|p| p.exists())
+            .unwrap_or_else(|| lig_pose_src.clone());
+        let mut cmd6c = Command::new(&dock_cli);
+        cmd6c
+            .args(["fep", "--receptor"])
+            .arg(&prep_pdb)
+            .arg("--ligands-sdf")
+            .arg(&fep_src)
+            .arg("--out-dir")
+            .arg(&fep_dir)
+            .arg("--dry-run");
+        if run_checked_cmd("06c_fep_rbfe", &mut cmd6c).is_ok() {
+            let fep_md = fep_dir.join("fep_report.md");
+            let fep_cfg = fep_dir.join("fep_config.json");
+            stages.push(StageRecord {
+                stage_number: 6,
+                stage_id: "fep-rbfe".to_string(),
+                tool: "dockcraft-cli fep".to_string(),
+                verdict: GateVerdict::Go,
+                elapsed_ms: t6c.elapsed().as_millis(),
+                summary: "Staged OpenMM GPU dual-softcore RBFE/FEP perturbation network bundle"
+                    .to_string(),
+                outputs: collect_provenance(&[
+                    ("FEP Network Report MD", &fep_md),
+                    ("FEP Network Config JSON", &fep_cfg),
+                ]),
+            });
+        } else {
+            stages.push(StageRecord {
+                stage_number: 6,
+                stage_id: "fep-rbfe".to_string(),
+                tool: "dockcraft-cli fep".to_string(),
+                verdict: GateVerdict::Skipped,
+                elapsed_ms: t6c.elapsed().as_millis(),
+                summary: "Skipped FEP staging (need >= 2 aligned 3D congeneric ligands in SDF)"
+                    .to_string(),
+                outputs: Vec::new(),
+            });
+        }
+    }
 
     // --- STAGE 7: ChemCraft v0.3.0 Retrosynthesis (Buy-Before-Make + Retro*) ---
     let t7 = Instant::now();
