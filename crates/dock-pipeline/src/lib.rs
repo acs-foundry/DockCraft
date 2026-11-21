@@ -8,6 +8,7 @@ pub mod export;
 pub mod md_validate;
 pub mod orchestrator;
 pub mod results_sidecar;
+pub mod safety_panel;
 pub mod sandbox;
 
 pub use admet::{AdmetProfile, detect_sibling_clis, evaluate_admet};
@@ -41,6 +42,12 @@ pub use orchestrator::{
 pub use results_sidecar::{
     ResultsSidecar, SIDECAR_FORMAT, SIDECAR_VERSION, SidecarError, SidecarRow, SidecarRun,
     default_chemcraft_results_dir, write_results_sidecar,
+};
+pub use safety_panel::{
+    AntiTargetEntry, LigandSafetySummary, LoadedAntiTarget, OffTargetDockHit, PairRisk,
+    SafetyPanelConfig, SafetyPanelError, SafetyPanelManifest, SafetyPanelReport, SafetyVerdict,
+    default_bowes_tier1_catalog, default_safety_panel_dir, default_safety_panel_manifest_path,
+    load_safety_panel_receptors, run_safety_panel, run_safety_panel_loaded,
 };
 pub use sandbox::{
     DEFAULT_MAX_FILE_BYTES, MAX_ZIP_DECOMPRESSED_BYTES, PathSandbox, SandboxError,

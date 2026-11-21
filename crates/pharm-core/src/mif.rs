@@ -1697,3 +1697,438 @@ pub fn evaluate_holo_feature_recovery(
     }
     (recovered, total)
 }
+
+/// Ordered 7 pharmacophore probes evaluated by `evaluate_mif_at_points`.
+pub(crate) const PROBE_KINDS: [PharmacophoreKind; 7] = [
+    PharmacophoreKind::HDonor,
+    PharmacophoreKind::HAcceptor,
+    PharmacophoreKind::Hydrophobic,
+    PharmacophoreKind::Aromatic,
+    PharmacophoreKind::PositiveIonizable,
+    PharmacophoreKind::NegativeIonizable,
+    PharmacophoreKind::MetalChelate,
+];
+
+/// Exact 7-probe Molecular Interaction Field sample and steric wall clearance at a single 3D point.
+#[derive(Debug, Clone)]
+pub(crate) struct VoxelMifSample {
+    pub coords: [f64; 3],
+    pub steric_clash: bool,
+    pub min_wall_dist_a: f64,
+    pub nearest_wall_residue: String,
+    pub energies: [f64; 7],
+    pub key_residues: [String; 7],
+}
+
+/// Extracts the 6-connected main binding cavity voxel coordinates for `receptor` inside `grid_box`.
+pub(crate) fn extract_target_cavity_voxels(
+    receptor: &Molecule3D,
+    grid_box: &GridBox,
+    holo_ligands: &[&Molecule3D],
+    spacing_a: f64,
+) -> Result<(f64, Vec<[f64; 3]>), crate::PharmError> {
+    if receptor.heavy_atom_count() == 0 {
+        return Err(crate::PharmError::EmptyStructure);
+    }
+    let (rec_infos, rec_coords, _, _) = prepare_receptor_context(receptor, grid_box);
+    if rec_infos.is_empty() {
+        return Err(crate::PharmError::NoPocketAtoms);
+    }
+    let hash = SpatialHash::new(&rec_coords, 3.5);
+
+    let mut h = spacing_a.clamp(0.50, 1.25);
+    loop {
+        let nx = ((grid_box.size[0] / h).floor() as usize) + 1;
+        let ny = ((grid_box.size[1] / h).floor() as usize) + 1;
+        let nz = ((grid_box.size[2] / h).floor() as usize) + 1;
+        if nx.saturating_mul(ny).saturating_mul(nz) <= 120_000 || h >= 1.5 {
+            break;
+        }
+        h *= 1.12;
+    }
+
+    let lo = grid_box.min_corner();
+    let nx = ((grid_box.size[0] / h).floor() as usize) + 1;
+    let ny = ((grid_box.size[1] / h).floor() as usize) + 1;
+    let nz = ((grid_box.size[2] / h).floor() as usize) + 1;
+
+    const BURIAL_DIRS: [[f64; 3]; 14] = [
+        [1.0, 0.0, 0.0],
+        [-1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, -1.0, 0.0],
+        [0.0, 0.0, 1.0],
+        [0.0, 0.0, -1.0],
+        [0.577, 0.577, 0.577],
+        [-0.577, 0.577, 0.577],
+        [0.577, -0.577, 0.577],
+        [-0.577, -0.577, 0.577],
+        [0.577, 0.577, -0.577],
+        [-0.577, 0.577, -0.577],
+        [0.577, -0.577, -0.577],
+        [-0.577, -0.577, -0.577],
+    ];
+
+    let holo_atoms: Vec<[f64; 3]> = holo_ligands
+        .iter()
+        .flat_map(|l| l.atoms.iter().filter(|a| a.is_heavy()).map(|a| a.coords))
+        .collect();
+    let max_apo_r =
+        (0.5 * grid_box.size[0].min(grid_box.size[1]).min(grid_box.size[2])).clamp(7.5, 11.0);
+
+    type SliceVoxel = ([usize; 3], [f64; 3], bool);
+    let slice_pts: Vec<Vec<SliceVoxel>> = (0..nx)
+        .into_par_iter()
+        .map(|ix| {
+            let x = lo[0] + ix as f64 * h;
+            let mut near_6 = Vec::with_capacity(64);
+            let mut near_9 = Vec::with_capacity(160);
+            let mut pts = Vec::new();
+            for iy in 0..ny {
+                let y = lo[1] + iy as f64 * h;
+                for iz in 0..nz {
+                    let z = lo[2] + iz as f64 * h;
+                    let pos = [x, y, z];
+                    if !holo_atoms.is_empty() {
+                        if !holo_atoms.iter().any(|&hp| dist3(pos, hp) <= 4.5) {
+                            continue;
+                        }
+                    } else if dist3(pos, grid_box.center) > max_apo_r {
+                        continue;
+                    }
+                    hash.query_into(&rec_coords, pos, 6.0, &mut near_6);
+                    if near_6.len() < 3 {
+                        continue;
+                    }
+                    let mut clash = false;
+                    let mut min_d = 99.0_f64;
+                    for &ri in &near_6 {
+                        let rinfo = &rec_infos[ri];
+                        let d = dist3(pos, rinfo.coords);
+                        let min_allow = if rinfo.is_metal { 1.80 } else { 2.45 };
+                        if d < min_allow {
+                            clash = true;
+                            break;
+                        }
+                        if d < min_d {
+                            min_d = d;
+                        }
+                    }
+                    if clash || min_d > 4.8 {
+                        continue;
+                    }
+                    hash.query_into(&rec_coords, pos, 9.0, &mut near_9);
+                    let mut dirs_hit = 0u32;
+                    for &ri in &near_9 {
+                        let rc = rec_infos[ri].coords;
+                        let v = norm3([rc[0] - x, rc[1] - y, rc[2] - z]);
+                        for (di, &bdir) in BURIAL_DIRS.iter().enumerate() {
+                            if (dirs_hit & (1u32 << di)) == 0 && dot3(v, bdir) > 0.72 {
+                                dirs_hit |= 1u32 << di;
+                            }
+                        }
+                    }
+                    if dirs_hit.count_ones() < 5 && near_6.len() < 8 {
+                        continue;
+                    }
+                    pts.push(([ix, iy, iz], pos, false));
+                }
+            }
+            pts
+        })
+        .collect();
+
+    let mut occ_map: HashMap<[usize; 3], ([f64; 3], bool)> = HashMap::new();
+    for sl in slice_pts {
+        for (ijk, p, flag) in sl {
+            occ_map.insert(ijk, (p, flag));
+        }
+    }
+    let seed_ref = if !holo_atoms.is_empty() {
+        let k = holo_atoms.len() as f64;
+        let mut s = [0.0; 3];
+        for p in &holo_atoms {
+            s[0] += p[0] / k;
+            s[1] += p[1] / k;
+            s[2] += p[2] / k;
+        }
+        s
+    } else {
+        grid_box.center
+    };
+    let main_comp = extract_main_connected_cavity(&occ_map, seed_ref);
+    let mut coords: Vec<[f64; 3]> = main_comp
+        .into_iter()
+        .filter_map(|ijk| occ_map.get(&ijk).map(|&(p, _)| p))
+        .collect();
+    coords.sort_by(|a, b| {
+        a[0].total_cmp(&b[0])
+            .then_with(|| a[1].total_cmp(&b[1]))
+            .then_with(|| a[2].total_cmp(&b[2]))
+    });
+    Ok((h, coords))
+}
+
+/// Evaluates the exact 7-probe Molecular Interaction Field and steric clearance of `receptor`
+/// at an arbitrary list of 3D query points (used for voxel-matched ΔMIF selectivity analysis).
+pub(crate) fn evaluate_mif_at_points(
+    receptor: &Molecule3D,
+    grid_box: &GridBox,
+    points: &[[f64; 3]],
+) -> Vec<VoxelMifSample> {
+    let (rec_infos, rec_coords, arom_rings, _) = prepare_receptor_context(receptor, grid_box);
+    if rec_infos.is_empty() {
+        return points
+            .iter()
+            .map(|&p| VoxelMifSample {
+                coords: p,
+                steric_clash: false,
+                min_wall_dist_a: 99.0,
+                nearest_wall_residue: String::new(),
+                energies: [0.0; 7],
+                key_residues: std::array::from_fn(|_| String::new()),
+            })
+            .collect();
+    }
+    let hash = SpatialHash::new(&rec_coords, 3.5);
+    const BURIAL_DIRS: [[f64; 3]; 14] = [
+        [1.0, 0.0, 0.0],
+        [-1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, -1.0, 0.0],
+        [0.0, 0.0, 1.0],
+        [0.0, 0.0, -1.0],
+        [0.577, 0.577, 0.577],
+        [-0.577, 0.577, 0.577],
+        [0.577, -0.577, 0.577],
+        [-0.577, -0.577, 0.577],
+        [0.577, 0.577, -0.577],
+        [-0.577, 0.577, -0.577],
+        [0.577, -0.577, -0.577],
+        [-0.577, -0.577, -0.577],
+    ];
+
+    points
+        .par_iter()
+        .map(|&pos| {
+            let [x, y, z] = pos;
+            let mut near_6 = Vec::with_capacity(64);
+            let mut near_9 = Vec::with_capacity(128);
+            hash.query_into(&rec_coords, pos, 6.0, &mut near_6);
+
+            let mut steric_clash = false;
+            let mut min_d = 99.0_f64;
+            let mut nearest_res = String::new();
+            for &ri in &near_6 {
+                let ra = &rec_infos[ri];
+                let d = dist3(pos, ra.coords);
+                let min_allow = if ra.is_metal { 1.80 } else { 2.35 };
+                if d < min_allow {
+                    steric_clash = true;
+                }
+                if d < min_d {
+                    min_d = d;
+                    nearest_res = ra.label.clone();
+                }
+            }
+
+            if steric_clash || near_6.is_empty() {
+                return VoxelMifSample {
+                    coords: pos,
+                    steric_clash,
+                    min_wall_dist_a: min_d,
+                    nearest_wall_residue: nearest_res,
+                    energies: [0.0; 7],
+                    key_residues: std::array::from_fn(|_| String::new()),
+                };
+            }
+
+            hash.query_into(&rec_coords, pos, 9.0, &mut near_9);
+            let mut dirs_hit = 0u32;
+            for &ri in &near_9 {
+                let rc = rec_infos[ri].coords;
+                let v = norm3([rc[0] - x, rc[1] - y, rc[2] - z]);
+                for (di, &bdir) in BURIAL_DIRS.iter().enumerate() {
+                    if (dirs_hit & (1u32 << di)) == 0 && dot3(v, bdir) > 0.72 {
+                        dirs_hit |= 1u32 << di;
+                    }
+                }
+            }
+            let n_cones = dirs_hit.count_ones();
+            let burial_factor = 1.0 + 0.04 * (n_cones as f64 - 5.0).clamp(0.0, 7.0);
+
+            let (mut hbd_top1, mut hbd_top2, mut hbd_res) = (0.0_f64, 0.0_f64, String::new());
+            let (mut hba_top1, mut hba_top2, mut hba_res) = (0.0_f64, 0.0_f64, String::new());
+            let (mut hyd_e, mut hyd_best_c, mut hyd_res) = (0.0_f64, 0.0_f64, String::new());
+            let (mut pos_top1, mut pos_top2, mut pos_rep, mut pos_res) =
+                (0.0_f64, 0.0_f64, 0.0_f64, String::new());
+            let (mut neg_top1, mut neg_top2, mut neg_rep, mut neg_res) =
+                (0.0_f64, 0.0_f64, 0.0_f64, String::new());
+            let (mut met_e, mut met_res) = (0.0_f64, String::new());
+
+            for &ri in &near_6 {
+                let ra = &rec_infos[ri];
+                let d = dist3(pos, ra.coords);
+                let to_rec = norm3([ra.coords[0] - x, ra.coords[1] - y, ra.coords[2] - z]);
+                let from_rec = [-to_rec[0], -to_rec[1], -to_rec[2]];
+
+                if ra.h_acceptor && !ra.is_metal && (2.50..=3.45).contains(&d) {
+                    let t = (d - 2.88) / 0.34;
+                    let g = (-t * t).exp();
+                    let dir_w = if dot3(ra.acceptor_dir, ra.acceptor_dir) > 0.5 {
+                        let c = dot3(from_rec, ra.acceptor_dir);
+                        0.30 + 0.70 * ((c + 0.15) / 1.15).clamp(0.0, 1.0)
+                    } else {
+                        0.85
+                    };
+                    let mult = if ra.formal_charge < 0 {
+                        1.35
+                    } else if ra.is_backbone_polar {
+                        1.18
+                    } else {
+                        1.0
+                    };
+                    let pair_e = -1.65 * g * dir_w * mult * burial_factor;
+                    if pair_e < hbd_top1 {
+                        hbd_top2 = hbd_top1;
+                        hbd_top1 = pair_e;
+                        hbd_res = ra.label.clone();
+                    } else if pair_e < hbd_top2 {
+                        hbd_top2 = pair_e;
+                    }
+                }
+
+                if ra.h_donor && !ra.is_metal && (2.50..=3.45).contains(&d) {
+                    let t = (d - 2.88) / 0.34;
+                    let g = (-t * t).exp();
+                    let mut best_cos = 0.5_f64;
+                    if !ra.donor_dirs.is_empty() {
+                        best_cos = -1.0;
+                        for &dh in &ra.donor_dirs {
+                            let c = dot3(from_rec, dh);
+                            if c > best_cos {
+                                best_cos = c;
+                            }
+                        }
+                    }
+                    if best_cos >= 0.35 {
+                        let dir_w = 0.25 + 0.75 * ((best_cos - 0.35) / 0.65).clamp(0.0, 1.0);
+                        let mult = if ra.formal_charge > 0 {
+                            1.35
+                        } else if ra.is_backbone_polar {
+                            1.18
+                        } else {
+                            1.0
+                        };
+                        let pair_e = -1.65 * g * dir_w * mult * burial_factor;
+                        if pair_e < hba_top1 {
+                            hba_top2 = hba_top1;
+                            hba_top1 = pair_e;
+                            hba_res = ra.label.clone();
+                        } else if pair_e < hba_top2 {
+                            hba_top2 = pair_e;
+                        }
+                    }
+                }
+
+                if ra.hydrophobic && (3.15..=5.40).contains(&d) {
+                    let t = (d - 3.90) / 0.75;
+                    let pair_e = -0.36 * (-t * t).exp() * burial_factor;
+                    hyd_e += pair_e;
+                    if pair_e < hyd_best_c {
+                        hyd_best_c = pair_e;
+                        hyd_res = ra.label.clone();
+                    }
+                } else if (ra.h_donor || ra.h_acceptor || ra.formal_charge != 0) && d < 3.60 {
+                    hyd_e += 0.35 * (3.60 - d);
+                }
+
+                if ra.formal_charge < 0 && (2.60..=4.70).contains(&d) {
+                    let t = (d - 3.15) / 0.80;
+                    let pair_e = -2.25 * (-t * t).exp() * burial_factor;
+                    if pair_e < pos_top1 {
+                        pos_top2 = pos_top1;
+                        pos_top1 = pair_e;
+                        pos_res = ra.label.clone();
+                    } else if pair_e < pos_top2 {
+                        pos_top2 = pair_e;
+                    }
+                } else if ra.formal_charge > 0 && !ra.is_metal && d <= 5.20 {
+                    let t = (d - 3.00) / 1.15;
+                    pos_rep += 2.30 * (-t * t).exp();
+                }
+
+                if ra.formal_charge > 0 && !ra.is_metal && (2.60..=4.70).contains(&d) {
+                    let t = (d - 3.15) / 0.80;
+                    let pair_e = -2.25 * (-t * t).exp() * burial_factor;
+                    if pair_e < neg_top1 {
+                        neg_top2 = neg_top1;
+                        neg_top1 = pair_e;
+                        neg_res = ra.label.clone();
+                    } else if pair_e < neg_top2 {
+                        neg_top2 = pair_e;
+                    }
+                } else if ra.formal_charge < 0 && d <= 5.20 {
+                    let t = (d - 3.00) / 1.15;
+                    neg_rep += 2.30 * (-t * t).exp();
+                }
+
+                if ra.is_metal && (1.80..=2.70).contains(&d) {
+                    let t = (d - ra.metal_r_opt) / 0.30;
+                    let pair_e = -3.40 * (-t * t).exp();
+                    if pair_e < met_e {
+                        met_e = pair_e;
+                        met_res = ra.label.clone();
+                    }
+                }
+            }
+
+            let hbd_e = (hbd_top1 + 0.55 * hbd_top2).max(-3.60);
+            let hba_e = (hba_top1 + 0.55 * hba_top2).max(-3.60);
+            let hyd_e = hyd_e.clamp(-3.20, 0.0);
+            let pos_e = ((pos_top1 + 0.30 * pos_top2).max(-2.95) + pos_rep).min(0.0);
+            let neg_e = ((neg_top1 + 0.30 * neg_top2).max(-2.95) + neg_rep).min(0.0);
+
+            let mut aro_e = 0.0_f64;
+            let mut aro_res = String::new();
+            for ring in &arom_rings {
+                let d = dist3(pos, ring.center);
+                if (3.20..=5.80).contains(&d) {
+                    let v = norm3([
+                        pos[0] - ring.center[0],
+                        pos[1] - ring.center[1],
+                        pos[2] - ring.center[2],
+                    ]);
+                    let cos_n = dot3(v, ring.normal).abs();
+                    let pair_e = if cos_n >= 0.65 && d <= 4.5 {
+                        let t = (d - 3.75) / 0.45;
+                        -1.65 * (-t * t).exp() * burial_factor
+                    } else if (4.1..=5.6).contains(&d) {
+                        let t = (d - 4.85) / 0.55;
+                        -1.25 * (-t * t).exp() * burial_factor
+                    } else {
+                        0.0
+                    };
+                    if pair_e < aro_e {
+                        aro_e = pair_e;
+                        aro_res = ring.label.clone();
+                    }
+                }
+            }
+            if aro_e < -0.60 && hyd_e < -0.40 {
+                aro_e = (aro_e + 0.30 * hyd_e).max(-3.40);
+            }
+
+            VoxelMifSample {
+                coords: pos,
+                steric_clash: false,
+                min_wall_dist_a: min_d,
+                nearest_wall_residue: nearest_res,
+                energies: [hbd_e, hba_e, hyd_e, aro_e, pos_e, neg_e, met_e],
+                key_residues: [
+                    hbd_res, hba_res, hyd_res, aro_res, pos_res, neg_res, met_res,
+                ],
+            }
+        })
+        .collect()
+}

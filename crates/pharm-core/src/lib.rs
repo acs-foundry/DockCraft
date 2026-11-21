@@ -8,6 +8,7 @@ pub mod data_dir;
 pub mod kabsch;
 pub mod mif;
 pub mod screen;
+pub mod selectivity;
 
 use thiserror::Error;
 
@@ -24,6 +25,11 @@ pub use mif::{
 pub use screen::{
     LigandFeature, PharmScreenConfig, PharmScreenHit, PharmScreenReport, extract_ligand_features,
     screen_ligand_against_blueprint, screen_molecules_parallel, screen_smiles_stream,
+};
+pub use selectivity::{
+    OffTargetComparisonSummary, OffTargetPocketInput, PocketSelectivityConfig, ResidueSubstitution,
+    SelectivityAnalysisOutput, SelectivityHotspot, SelectivityHotspotKind, SelectivityReport,
+    analyze_pocket_selectivity,
 };
 
 #[derive(Debug, Error)]

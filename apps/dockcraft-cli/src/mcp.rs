@@ -8,14 +8,15 @@ use std::time::{Duration, Instant};
 
 use dock_engine::{DockingConfig, ScoringFunction, dock_ligand};
 use dock_pipeline::{
-    DEFAULT_MAX_FILE_BYTES, PathSandbox, SceneExportRequest, build_chimerax_md_script,
-    campaign_report_to_csv, canonical_export_target, check_openmm_env, load_ligand_library_bytes,
-    run_screening_campaign, write_chimerax_session_bundle, write_sandboxed_scene_package,
+    AntiTargetEntry, DEFAULT_MAX_FILE_BYTES, LoadedAntiTarget, PathSandbox, SafetyPanelConfig,
+    SceneExportRequest, build_chimerax_md_script, campaign_report_to_csv, canonical_export_target,
+    check_openmm_env, load_ligand_library_bytes, run_safety_panel_loaded, run_screening_campaign,
+    write_chimerax_session_bundle, write_sandboxed_scene_package,
 };
 use hyde_scorer::{SubstituentPreset, mutate_and_minimize_in_pocket, score_pose_hyde};
 use pharm_core::{
-    PharmScreenConfig, SiteAnalysisConfig, SiteBlueprint, analyze_binding_site,
-    screen_molecules_parallel,
+    OffTargetPocketInput, PharmScreenConfig, PocketSelectivityConfig, SiteAnalysisConfig,
+    SiteBlueprint, analyze_binding_site, analyze_pocket_selectivity, screen_molecules_parallel,
 };
 use pocket_detect::{GridBox, PocketDetectConfig, detect_pockets};
 use prot_prep::{
@@ -353,6 +354,56 @@ fn tool_definitions() -> Value {
                 "required": ["env_status"],
                 "properties": {
                     "env_status": { "type": "object" }
+                }
+            }
+        },
+        {
+            "name": "compare_pockets",
+            "description": "Compare target binding pocket vs 1..4 off-target/paralog receptors via rigid pocket alignment and 7-probe ΔMIF + steric-exclusivity selectivity analysis.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["target_path", "offtarget_paths", "box_center", "box_size"],
+                "properties": {
+                    "target_path": { "type": "string" },
+                    "offtarget_paths": { "type": "array", "items": { "type": "string" } },
+                    "box_center": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                    "box_size": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                    "pre_aligned": { "type": "boolean" },
+                    "out_markdown_path": { "type": "string" }
+                }
+            },
+            "outputSchema": {
+                "type": "object",
+                "required": ["selectivity_feasibility_score", "offtargets", "selectivity_hotspots"],
+                "properties": {
+                    "selectivity_feasibility_score": { "type": "number" },
+                    "offtargets": { "type": "array" },
+                    "selectivity_hotspots": { "type": "array" }
+                }
+            }
+        },
+        {
+            "name": "run_safety_panel",
+            "description": "Run Inverse Docking Safety Pharmacology screening of a ligand SMILES against 1..15 sandboxed anti-target receptor PDBs.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["anti_target_paths", "ligand_smiles", "box_center", "box_size"],
+                "properties": {
+                    "anti_target_paths": { "type": "array", "items": { "type": "string" } },
+                    "ligand_smiles": { "type": "string" },
+                    "box_center": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                    "box_size": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                    "target_dg_kcal": { "type": "number" },
+                    "exhaustiveness": { "type": "integer", "minimum": 1, "maximum": 16 },
+                    "out_markdown_path": { "type": "string" }
+                }
+            },
+            "outputSchema": {
+                "type": "object",
+                "required": ["targets_evaluated", "summaries"],
+                "properties": {
+                    "targets_evaluated": { "type": "integer" },
+                    "summaries": { "type": "array" }
                 }
             }
         }
@@ -1044,6 +1095,152 @@ fn handle_tool_call(
                 "production_ns": ns,
             }))
         }
+        "compare_pockets" => {
+            let tgt_path = args
+                .get("target_path")
+                .and_then(|v| v.as_str())
+                .ok_or((-32602, "missing 'target_path'".to_string()))?;
+            let ot_arr = args
+                .get("offtarget_paths")
+                .and_then(|v| v.as_array())
+                .filter(|a| !a.is_empty() && a.len() <= 4)
+                .ok_or((
+                    -32602,
+                    "'offtarget_paths' must be an array of 1..4 paths".to_string(),
+                ))?;
+            let center =
+                parse_vec3(args.get("box_center"), "box_center").map_err(|e| (-32602, e))?;
+            let size = parse_vec3(args.get("box_size"), "box_size").map_err(|e| (-32602, e))?;
+            let gbox = GridBox::from_center_size(center, size, 0.375)
+                .map_err(|e| (-32602, e.to_string()))?;
+            let pre_aligned = args
+                .get("pre_aligned")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+
+            let tgt_raw = sandbox
+                .read_string(Path::new(tgt_path))
+                .map_err(|e| (-32602, e.to_string()))?;
+            let tgt_rec = parse_receptor_by_path(Path::new(tgt_path), &tgt_raw, true)
+                .map_err(|e| (-32602, e))?;
+            let tgt_name = Path::new(tgt_path)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("Target");
+
+            let mut loaded_ots = Vec::with_capacity(ot_arr.len());
+            for v in ot_arr {
+                let p = v
+                    .as_str()
+                    .ok_or((-32602, "each offtarget path must be a string".to_string()))?;
+                let raw = sandbox
+                    .read_string(Path::new(p))
+                    .map_err(|e| (-32602, e.to_string()))?;
+                let rec =
+                    parse_receptor_by_path(Path::new(p), &raw, true).map_err(|e| (-32602, e))?;
+                let nm = Path::new(p)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("OffTarget")
+                    .to_string();
+                loaded_ots.push((nm, rec));
+            }
+            let inputs: Vec<OffTargetPocketInput<'_>> = loaded_ots
+                .iter()
+                .map(|(nm, r)| OffTargetPocketInput {
+                    name: nm.clone(),
+                    receptor: r,
+                    pocket_center: center,
+                })
+                .collect();
+            let cfg = PocketSelectivityConfig {
+                pre_aligned,
+                ..Default::default()
+            };
+            let out = analyze_pocket_selectivity(tgt_name, &tgt_rec, &gbox, &[], &inputs, &cfg)
+                .map_err(|e| (-32000, e.to_string()))?;
+            if let Some(out_md) = args.get("out_markdown_path").and_then(|v| v.as_str()) {
+                sandbox
+                    .write_string(Path::new(out_md), &out.report.render_markdown())
+                    .map_err(|e| (-32602, e.to_string()))?;
+            }
+            serde_json::to_value(&out.report).map_err(|e| (-32000, e.to_string()))
+        }
+        "run_safety_panel" => {
+            let at_arr = args
+                .get("anti_target_paths")
+                .and_then(|v| v.as_array())
+                .filter(|a| !a.is_empty() && a.len() <= 15)
+                .ok_or((
+                    -32602,
+                    "'anti_target_paths' must be an array of 1..15 paths".to_string(),
+                ))?;
+            let center =
+                parse_vec3(args.get("box_center"), "box_center").map_err(|e| (-32602, e))?;
+            let size = parse_vec3(args.get("box_size"), "box_size").map_err(|e| (-32602, e))?;
+            let gbox = GridBox::from_center_size(center, size, 0.375)
+                .map_err(|e| (-32602, e.to_string()))?;
+            let lig = parse_single_ligand(sandbox, args).map_err(|e| (-32602, e))?;
+            let target_dg = args.get("target_dg_kcal").and_then(|v| v.as_f64());
+            let exhaustiveness = args
+                .get("exhaustiveness")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(2)
+                .clamp(1, 16) as usize;
+
+            let mut loaded = Vec::with_capacity(at_arr.len());
+            for v in at_arr {
+                let p = v
+                    .as_str()
+                    .ok_or((-32602, "each anti-target path must be a string".to_string()))?;
+                let raw = sandbox
+                    .read_string(Path::new(p))
+                    .map_err(|e| (-32602, e.to_string()))?;
+                let rec =
+                    parse_receptor_by_path(Path::new(p), &raw, true).map_err(|e| (-32602, e))?;
+                let nm = Path::new(p)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("AntiTarget")
+                    .to_string();
+                loaded.push(LoadedAntiTarget {
+                    entry: AntiTargetEntry {
+                        id: nm.clone(),
+                        name: nm,
+                        pdb_id: "MCP".to_string(),
+                        chains: vec!['A'],
+                        prepared_pdb: Path::new(p).to_path_buf(),
+                        box_center: center,
+                        box_size: size,
+                        organ_system: "Safety Panel".to_string(),
+                        clinical_liability: "Sandboxed MCP anti-target".to_string(),
+                        alert_dg_kcal: -8.5,
+                        anchor_res_seqs: Vec::new(),
+                        enabled: true,
+                    },
+                    receptor: rec,
+                    grid_box: gbox.clone(),
+                });
+            }
+            let lig_rec = dock_pipeline::LigandInputRecord {
+                name: lig.name.clone(),
+                molecule: lig,
+                is_active: None,
+            };
+            let cfg = SafetyPanelConfig {
+                exhaustiveness,
+                target_affinity_kcal: target_dg,
+                ..Default::default()
+            };
+            let report = run_safety_panel_loaded(&[lig_rec], &loaded, "mcp-sandbox", &cfg)
+                .map_err(|e| (-32000, e.to_string()))?;
+            if let Some(out_md) = args.get("out_markdown_path").and_then(|v| v.as_str()) {
+                sandbox
+                    .write_string(Path::new(out_md), &report.render_markdown())
+                    .map_err(|e| (-32602, e.to_string()))?;
+            }
+            serde_json::to_value(&report).map_err(|e| (-32000, e.to_string()))
+        }
         other => Err((-32601, format!("unknown tool '{other}'"))),
     }
 }
@@ -1575,6 +1772,38 @@ mod tests {
         assert!(md_resp["result"]["structuredContent"]["env_status"].is_object());
         assert!(wdir.join("md_cfg.json").exists());
         assert!(wdir.join("md_view.cxc").exists());
+
+        // 7c. Ola 1 MCP tools: compare_pockets & run_safety_panel (plus sandbox escape rejection)
+        let sel_resp = handle_mcp_line(
+            &sandbox,
+            &mut state,
+            r#"{"jsonrpc":"2.0","id":75,"method":"tools/call","params":{"name":"compare_pockets","arguments":{"target_path":"pocket.pdb","offtarget_paths":["pocket.pdb"],"box_center":[0,0,0],"box_size":[12,12,12],"pre_aligned":true,"out_markdown_path":"selectivity.md"}}}"#,
+        )
+        .ok_or("expected response")?;
+        assert!(
+            sel_resp["result"]["structuredContent"]["selectivity_feasibility_score"].is_number()
+        );
+        assert!(wdir.join("selectivity.md").exists());
+
+        let sp_resp = handle_mcp_line(
+            &sandbox,
+            &mut state,
+            r#"{"jsonrpc":"2.0","id":76,"method":"tools/call","params":{"name":"run_safety_panel","arguments":{"anti_target_paths":["pocket.pdb"],"ligand_smiles":"CCO","box_center":[0,0,0],"box_size":[12,12,12],"target_dg_kcal":-9.0,"exhaustiveness":1,"out_markdown_path":"safety.md"}}}"#,
+        )
+        .ok_or("expected response")?;
+        assert_eq!(
+            sp_resp["result"]["structuredContent"]["targets_evaluated"],
+            1
+        );
+        assert!(wdir.join("safety.md").exists());
+
+        let sp_esc = handle_mcp_line(
+            &sandbox,
+            &mut state,
+            r#"{"jsonrpc":"2.0","id":77,"method":"tools/call","params":{"name":"run_safety_panel","arguments":{"anti_target_paths":["escape.pdb"],"ligand_smiles":"CCO","box_center":[0,0,0],"box_size":[12,12,12]}}}"#,
+        )
+        .ok_or("expected response")?;
+        assert_eq!(sp_esc["error"]["code"], -32602);
 
         // 8. Reject oversized 200^3 A box DoS immediately
         let huge_box = handle_mcp_line(

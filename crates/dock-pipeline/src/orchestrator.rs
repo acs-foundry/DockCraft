@@ -83,6 +83,18 @@ pub struct CampaignSpec {
     /// Target synthesis scale in mg for Stage 7 (`ChemCraft retro`).
     #[serde(default = "default_synth_scale_mg")]
     pub synth_scale_mg: f64,
+    /// Optional off-target / paralog receptors for Stage 2b structural selectivity (ΔMIF) analysis.
+    #[serde(default)]
+    pub offtarget_selectivity_receptors: Vec<EnsembleSpecEntry>,
+    /// Whether to run Stage 5b Inverse Docking Safety Panel against Tier-1 human anti-targets.
+    #[serde(default)]
+    pub run_safety_panel: bool,
+    /// Optional explicit safety-panel manifest path (defaults to `CRAFT_DATA_DIR/safety_panel/panel.json`).
+    #[serde(default)]
+    pub safety_panel_manifest: Option<PathBuf>,
+    /// Docking exhaustiveness for Stage 5b safety-panel inverse docking (default `3`).
+    #[serde(default = "default_safety_exhaustiveness")]
+    pub safety_panel_exhaustiveness: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -125,6 +137,9 @@ fn default_md_ns() -> f64 {
 }
 fn default_synth_scale_mg() -> f64 {
     100.0
+}
+fn default_safety_exhaustiveness() -> usize {
+    3
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -174,6 +189,16 @@ pub struct CampaignLeadSummary {
     pub dock_affinity_kcal: Option<f64>,
     pub tpp_mpo: Option<f64>,
     pub tpp_decision: Option<String>,
+    #[serde(default)]
+    pub tox21_alerts: Option<String>,
+    #[serde(default)]
+    pub sea_high_risk: Option<String>,
+    #[serde(default)]
+    pub metabolite_bioactivation: Option<usize>,
+    #[serde(default)]
+    pub safety_panel_verdict: Option<String>,
+    #[serde(default)]
+    pub safety_panel_min_margin_kcal: Option<f64>,
     pub md_verdict: Option<String>,
     pub synth_md_path: Option<String>,
 }
@@ -241,8 +266,8 @@ impl CampaignManifest {
         md.push('\n');
 
         if !self.final_leads.is_empty() {
-            md.push_str("## 3. Final Prioritized Leads (SBDD → ADMET → MD → Synthesis)\n\n");
-            md.push_str("| Rank | Compound | Dock ΔG | TPP MPO | Decision | MD | Synthesis Protocol |\n|---:|---|---:|---:|---|---|---|\n");
+            md.push_str("## 3. Final Prioritized Leads (SBDD → Selectivity → ADMET/Guard → Safety Panel → MD → Synthesis)\n\n");
+            md.push_str("| Rank | Compound | Dock ΔG | TPP MPO | Decision | Tox21 / SEA / Bioact | Safety Panel (ΔΔG) | MD | Synthesis Protocol |\n|---:|---|---:|---:|---|---|---|---|---|\n");
             for l in &self.final_leads {
                 let dg = l
                     .dock_affinity_kcal
@@ -251,6 +276,18 @@ impl CampaignManifest {
                     .tpp_mpo
                     .map_or_else(|| "—".to_string(), |v| format!("{v:.3}"));
                 let dec = l.tpp_decision.as_deref().unwrap_or("—");
+                let guard = format!(
+                    "{} / {} / {}",
+                    l.tox21_alerts.as_deref().unwrap_or("—"),
+                    l.sea_high_risk.as_deref().unwrap_or("—"),
+                    l.metabolite_bioactivation
+                        .map_or_else(|| "—".to_string(), |b| b.to_string())
+                );
+                let sp = match (&l.safety_panel_verdict, l.safety_panel_min_margin_kcal) {
+                    (Some(v), Some(m)) => format!("**{v}** ({m:+.2})"),
+                    (Some(v), None) => format!("**{v}**"),
+                    _ => "—".to_string(),
+                };
                 let mdv = l.md_verdict.as_deref().unwrap_or("staged");
                 let syn = l
                     .synth_md_path
@@ -258,8 +295,8 @@ impl CampaignManifest {
                     .map_or_else(|| "—".to_string(), |p| format!("`{p}`"));
                 let _ = writeln!(
                     md,
-                    "| {} | `{}` | {} | {} | {} | {} | {} |",
-                    l.rank, l.name, dg, mpo, dec, mdv, syn
+                    "| {} | `{}` | {} | {} | {} | {} | {} | {} | {} |",
+                    l.rank, l.name, dg, mpo, dec, guard, sp, mdv, syn
                 );
             }
             md.push('\n');
@@ -298,6 +335,10 @@ pub fn default_cdk2_campaign_template() -> CampaignSpec {
         run_md: false,
         md_production_ns: 20.0,
         synth_scale_mg: 100.0,
+        offtarget_selectivity_receptors: Vec::new(),
+        run_safety_panel: false,
+        safety_panel_manifest: None,
+        safety_panel_exhaustiveness: 3,
     }
 }
 
@@ -446,6 +487,112 @@ pub fn run_campaign(spec: &CampaignSpec) -> Result<CampaignManifest, Orchestrato
         ]),
     });
 
+    // --- OPTIONAL STAGE 2b: Structural Pocket Selectivity (ΔMIF) ---
+    let mut active_bp_json = bp_json.clone();
+    if !spec.offtarget_selectivity_receptors.is_empty() {
+        let t2b = Instant::now();
+        let sel_dir = spec.out_dir.join("02b_selectivity");
+        std::fs::create_dir_all(&sel_dir)?;
+        let mut ot_paths = Vec::new();
+        let mut ot_centers = Vec::new();
+        for (oi, ot) in spec.offtarget_selectivity_receptors.iter().enumerate() {
+            let ot_pdb = sel_dir.join(format!("offtarget_{}.pdb", oi + 1));
+            let mut c_ot = Command::new(&dock_cli);
+            c_ot.args(["prot-prep", "--input"])
+                .arg(&ot.receptor_pdb)
+                .arg("--out-pdb")
+                .arg(&ot_pdb)
+                .args(["--ph", &format!("{:.1}", spec.ph)]);
+            if !ot.chains.is_empty() {
+                let ch: String = ot
+                    .chains
+                    .iter()
+                    .map(char::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",");
+                c_ot.args(["--chains", &ch]);
+            }
+            run_checked_cmd("02b_offtarget_prot_prep", &mut c_ot)?;
+            ot_paths.push(ot_pdb.display().to_string());
+            ot_centers.push(format!(
+                "{:.3},{:.3},{:.3}",
+                ot.box_center[0], ot.box_center[1], ot.box_center[2]
+            ));
+        }
+        let sel_json = sel_dir.join("selectivity_report.json");
+        let sel_md = sel_dir.join("selectivity_report.md");
+        let sel_cxc = sel_dir.join("selectivity_overlay.cxc");
+        let sel_bp = sel_dir.join("site_selective.pharm.json");
+        let mut cmd2b = Command::new(&dock_cli);
+        cmd2b
+            .args(["compare-pockets", "--target"])
+            .arg(&prep_pdb)
+            .args([
+                "--off-targets",
+                &ot_paths.join(","),
+                "--target-center",
+                &format!(
+                    "{:.3},{:.3},{:.3}",
+                    bp_center[0], bp_center[1], bp_center[2]
+                ),
+                "--off-target-centers",
+                &ot_centers.join(";"),
+                "--size",
+                &format!(
+                    "{:.2},{:.2},{:.2}",
+                    spec.box_size[0], spec.box_size[1], spec.box_size[2]
+                ),
+            ])
+            .arg("--in-blueprint")
+            .arg(&bp_json)
+            .arg("--out-blueprint")
+            .arg(&sel_bp)
+            .arg("--out-json")
+            .arg(&sel_json)
+            .arg("--out-md")
+            .arg(&sel_md)
+            .arg("--out-cxc")
+            .arg(&sel_cxc);
+        run_checked_cmd("02b_selectivity", &mut cmd2b)?;
+        if sel_bp.exists() {
+            active_bp_json = sel_bp.clone();
+        }
+        let (feas, n_hs) = std::fs::read_to_string(&sel_json)
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .map_or((0.0, 0usize), |v| {
+                (
+                    v.get("selectivity_feasibility_score")
+                        .and_then(serde_json::Value::as_f64)
+                        .unwrap_or(0.0),
+                    v.get("selectivity_hotspots")
+                        .and_then(serde_json::Value::as_array)
+                        .map_or(0, Vec::len),
+                )
+            });
+        stages.push(StageRecord {
+            stage_number: 2,
+            stage_id: "pocket-selectivity".to_string(),
+            tool: "dockcraft-cli compare-pockets".to_string(),
+            verdict: if n_hs > 0 {
+                GateVerdict::Go
+            } else {
+                GateVerdict::Review
+            },
+            elapsed_ms: t2b.elapsed().as_millis(),
+            summary: format!(
+                "ΔMIF vs {} paralog(s): {n_hs} selectivity hotspot(s), feasibility={feas:.3}",
+                spec.offtarget_selectivity_receptors.len()
+            ),
+            outputs: collect_provenance(&[
+                ("Selectivity Report JSON", &sel_json),
+                ("Selectivity Report MD", &sel_md),
+                ("Selectivity ChimeraX Overlay", &sel_cxc),
+                ("Selective Blueprint JSON", &sel_bp),
+            ]),
+        });
+    }
+
     // --- STAGE 3: pharm-screen ---
     let t3 = Instant::now();
     let ps_dir = spec.out_dir.join("03_pharm_funnel");
@@ -454,7 +601,7 @@ pub fn run_campaign(spec: &CampaignSpec) -> Result<CampaignManifest, Orchestrato
     let ps_sdf = ps_dir.join("pharm_hits.sdf");
     let mut cmd3 = Command::new(&dock_cli);
     cmd3.args(["pharm-screen", "--blueprint"])
-        .arg(&bp_json)
+        .arg(&active_bp_json)
         .arg("--library")
         .arg(&spec.library_path)
         .args([
@@ -583,7 +730,7 @@ pub fn run_campaign(spec: &CampaignSpec) -> Result<CampaignManifest, Orchestrato
         .arg("--library")
         .arg(&stage4_lib)
         .arg("--pharmacophore-file")
-        .arg(&bp_json)
+        .arg(&active_bp_json)
         .arg("--out")
         .arg(&dock_csv);
         run_checked_cmd("04_docking", &mut cmd4)?;
@@ -638,9 +785,9 @@ pub fn run_campaign(spec: &CampaignSpec) -> Result<CampaignManifest, Orchestrato
         let admet_map = parse_admet_csv(&admet_csv);
         let mut passing = 0usize;
         for (name, smi, dg) in &ranked_hits {
-            let (mpo, dec) = admet_map.get(name).cloned().unwrap_or((None, None));
-            let passes = mpo.is_some_and(|v| v >= spec.min_tpp_mpo)
-                && !dec.as_deref().is_some_and(|d| d.contains("Hold"));
+            let row = admet_map.get(name).cloned().unwrap_or_default();
+            let passes = row.mpo.is_some_and(|v| v >= spec.min_tpp_mpo)
+                && !row.decision.as_deref().is_some_and(|d| d.contains("Hold"));
             if passes {
                 passing += 1;
             }
@@ -649,8 +796,13 @@ pub fn run_campaign(spec: &CampaignSpec) -> Result<CampaignManifest, Orchestrato
                 name: name.clone(),
                 smiles: smi.clone(),
                 dock_affinity_kcal: *dg,
-                tpp_mpo: mpo,
-                tpp_decision: dec,
+                tpp_mpo: row.mpo,
+                tpp_decision: row.decision,
+                tox21_alerts: row.tox21_alerts,
+                sea_high_risk: row.sea_high_risk,
+                metabolite_bioactivation: row.metabolite_bioactivation,
+                safety_panel_verdict: None,
+                safety_panel_min_margin_kcal: None,
                 md_verdict: None,
                 synth_md_path: None,
             });
@@ -688,7 +840,7 @@ pub fn run_campaign(spec: &CampaignSpec) -> Result<CampaignManifest, Orchestrato
             },
             elapsed_ms: t5.elapsed().as_millis(),
             summary: format!(
-                "{passing}/{} candidates passed TPP '{}' (MPO >= {:.2}, no red flags)",
+                "{passing}/{} candidates passed TPP '{}' (MPO >= {:.2}, Tox21 + SEA + Metabolite Guard)",
                 ranked_hits.len(),
                 spec.tpp_profile,
                 spec.min_tpp_mpo
@@ -704,6 +856,11 @@ pub fn run_campaign(spec: &CampaignSpec) -> Result<CampaignManifest, Orchestrato
                 dock_affinity_kcal: *dg,
                 tpp_mpo: None,
                 tpp_decision: None,
+                tox21_alerts: None,
+                sea_high_risk: None,
+                metabolite_bioactivation: None,
+                safety_panel_verdict: None,
+                safety_panel_min_margin_kcal: None,
                 md_verdict: None,
                 synth_md_path: None,
             });
@@ -716,6 +873,103 @@ pub fn run_campaign(spec: &CampaignSpec) -> Result<CampaignManifest, Orchestrato
             elapsed_ms: t5.elapsed().as_millis(),
             summary: "admetcraft-cli not found on PATH".to_string(),
             outputs: Vec::new(),
+        });
+    }
+
+    // --- OPTIONAL STAGE 5b: Inverse Docking Safety Panel ---
+    if spec.run_safety_panel && !final_leads.is_empty() {
+        let t5b = Instant::now();
+        let sp_dir = spec.out_dir.join("05b_safety_panel");
+        std::fs::create_dir_all(&sp_dir)?;
+        let sp_smi = sp_dir.join("leads.smi");
+        let sp_json = sp_dir.join("safety_panel_report.json");
+        let sp_md = sp_dir.join("safety_panel_report.md");
+        let sp_poses = sp_dir.join("flagged_poses");
+        {
+            let mut buf = String::new();
+            for l in &final_leads {
+                if !l.smiles.trim().is_empty() {
+                    let _ = writeln!(buf, "{} {}", l.smiles, l.name);
+                }
+            }
+            std::fs::write(&sp_smi, buf)?;
+        }
+        let ref_dg = final_leads
+            .first()
+            .and_then(|l| l.dock_affinity_kcal)
+            .unwrap_or(-10.0);
+        let mut cmd5b = Command::new(&dock_cli);
+        cmd5b
+            .args(["safety-panel", "--ligands"])
+            .arg(&sp_smi)
+            .args([
+                "--target-dg",
+                &format!("{ref_dg:.2}"),
+                "--exhaustiveness",
+                &spec.safety_panel_exhaustiveness.clamp(1, 16).to_string(),
+            ])
+            .arg("--out-json")
+            .arg(&sp_json)
+            .arg("--out-md")
+            .arg(&sp_md)
+            .arg("--out-poses-dir")
+            .arg(&sp_poses);
+        if let Some(mpath) = &spec.safety_panel_manifest {
+            cmd5b.arg("--manifest").arg(mpath);
+        }
+        run_checked_cmd("05b_safety_panel", &mut cmd5b)?;
+
+        let mut pass_cnt = 0usize;
+        let mut n_targets = 0usize;
+        if let Ok(raw_sp) = std::fs::read_to_string(&sp_json)
+            && let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw_sp)
+        {
+            n_targets = v
+                .get("targets_evaluated")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0) as usize;
+            if let Some(sums) = v.get("summaries").and_then(serde_json::Value::as_array) {
+                for s in sums {
+                    let lname = s
+                        .get("ligand_name")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("");
+                    let verd = s
+                        .get("verdict")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("Caution")
+                        .to_string();
+                    let min_m = s
+                        .get("min_selectivity_margin_kcal")
+                        .and_then(serde_json::Value::as_f64);
+                    if verd.eq_ignore_ascii_case("Pass") {
+                        pass_cnt += 1;
+                    }
+                    if let Some(lead) = final_leads.iter_mut().find(|l| l.name == lname) {
+                        lead.safety_panel_verdict = Some(verd);
+                        lead.safety_panel_min_margin_kcal = min_m;
+                    }
+                }
+            }
+        }
+        stages.push(StageRecord {
+            stage_number: 5,
+            stage_id: "safety-panel".to_string(),
+            tool: "dockcraft-cli safety-panel".to_string(),
+            verdict: if pass_cnt > 0 {
+                GateVerdict::Go
+            } else {
+                GateVerdict::Review
+            },
+            elapsed_ms: t5b.elapsed().as_millis(),
+            summary: format!(
+                "Inverse docked {} lead(s) across {n_targets} Bowes anti-targets ({pass_cnt} PASS)",
+                final_leads.len()
+            ),
+            outputs: collect_provenance(&[
+                ("Safety Panel JSON", &sp_json),
+                ("Safety Panel Report MD", &sp_md),
+            ]),
         });
     }
 
@@ -978,9 +1232,16 @@ fn extract_top_docked_with_smiles(
     out
 }
 
-fn parse_admet_csv(
-    path: &Path,
-) -> std::collections::HashMap<String, (Option<f64>, Option<String>)> {
+#[derive(Debug, Clone, Default)]
+struct AdmetCsvRow {
+    mpo: Option<f64>,
+    decision: Option<String>,
+    tox21_alerts: Option<String>,
+    sea_high_risk: Option<String>,
+    metabolite_bioactivation: Option<usize>,
+}
+
+fn parse_admet_csv(path: &Path) -> std::collections::HashMap<String, AdmetCsvRow> {
     let mut map = std::collections::HashMap::new();
     let Ok(mut rdr) = csv::Reader::from_path(path) else {
         return map;
@@ -998,6 +1259,15 @@ fn parse_admet_csv(
     let dec_col = headers
         .iter()
         .position(|h| h.eq_ignore_ascii_case("TPP Decision"));
+    let tox21_col = headers
+        .iter()
+        .position(|h| h.eq_ignore_ascii_case("Tox21 Alerts"));
+    let sea_col = headers
+        .iter()
+        .position(|h| h.eq_ignore_ascii_case("SEA Off-Target High"));
+    let bio_col = headers
+        .iter()
+        .position(|h| h.eq_ignore_ascii_case("Metabolite Bioactivation"));
     for rec in rdr.records().flatten() {
         let name = rec.get(mol_col).unwrap_or("").trim().to_string();
         if name.is_empty() {
@@ -1006,11 +1276,31 @@ fn parse_admet_csv(
         let mpo = mpo_col
             .and_then(|c| rec.get(c))
             .and_then(|s| s.trim().parse::<f64>().ok());
-        let dec = dec_col
+        let decision = dec_col
             .and_then(|c| rec.get(c))
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
-        map.insert(name, (mpo, dec));
+        let tox21_alerts = tox21_col
+            .and_then(|c| rec.get(c))
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let sea_high_risk = sea_col
+            .and_then(|c| rec.get(c))
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let metabolite_bioactivation = bio_col
+            .and_then(|c| rec.get(c))
+            .and_then(|s| s.trim().parse::<usize>().ok());
+        map.insert(
+            name,
+            AdmetCsvRow {
+                mpo,
+                decision,
+                tox21_alerts,
+                sea_high_risk,
+                metabolite_bioactivation,
+            },
+        );
     }
     map
 }
