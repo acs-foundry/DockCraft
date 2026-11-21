@@ -8,9 +8,9 @@ use std::time::{Duration, Instant};
 
 use dock_engine::{DockingConfig, ScoringFunction, dock_ligand};
 use dock_pipeline::{
-    DEFAULT_MAX_FILE_BYTES, PathSandbox, SceneExportRequest, campaign_report_to_csv,
-    canonical_export_target, load_ligand_library_bytes, run_screening_campaign,
-    write_chimerax_session_bundle, write_sandboxed_scene_package,
+    DEFAULT_MAX_FILE_BYTES, PathSandbox, SceneExportRequest, build_chimerax_md_script,
+    campaign_report_to_csv, canonical_export_target, check_openmm_env, load_ligand_library_bytes,
+    run_screening_campaign, write_chimerax_session_bundle, write_sandboxed_scene_package,
 };
 use hyde_scorer::{SubstituentPreset, mutate_and_minimize_in_pocket, score_pose_hyde};
 use pharm_core::{
@@ -332,6 +332,27 @@ fn tool_definitions() -> Value {
                 "properties": {
                     "receptor_labels": { "type": "array" },
                     "candidates": { "type": "array" }
+                }
+            }
+        },
+        {
+            "name": "prepare_md_validation",
+            "description": "Probes the isolated OpenMM GPU environment and stages a sandboxed explicit-solvent OpenMM MD validation bundle (config JSON + ChimeraX trajectory script) inside write_root without executing arbitrary host scripts.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "receptor_path": { "type": "string" },
+                    "ligand_path": { "type": "string" },
+                    "production_ns": { "type": "number" },
+                    "out_config_path": { "type": "string" },
+                    "out_chimerax_path": { "type": "string" }
+                }
+            },
+            "outputSchema": {
+                "type": "object",
+                "required": ["env_status"],
+                "properties": {
+                    "env_status": { "type": "object" }
                 }
             }
         }
@@ -978,6 +999,51 @@ fn handle_tool_call(
                 "candidates": compact,
             }))
         }
+        "prepare_md_validation" => {
+            let env_status = check_openmm_env(None);
+            let ns = args
+                .get("production_ns")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(20.0)
+                .clamp(0.01, 500.0);
+            if let Some(cfg_out) = args.get("out_config_path").and_then(|v| v.as_str()) {
+                let rec = args
+                    .get("receptor_path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("receptor.pdb");
+                let lig = args
+                    .get("ligand_path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("ligand.sdf");
+                let cfg_json = serde_json::to_string_pretty(&json!({
+                    "receptor_path": rec,
+                    "ligand_path": lig,
+                    "production_ns": ns,
+                    "nvt_ps": 50.0,
+                    "npt_ps": 100.0,
+                    "temperature_k": 300.0,
+                    "padding_nm": 1.0,
+                    "ionic_strength_m": 0.15,
+                    "platform": "auto"
+                }))
+                .map_err(|e| (-32000, e.to_string()))?;
+                sandbox
+                    .write_string(Path::new(cfg_out), &cfg_json)
+                    .map_err(|e| (-32602, e.to_string()))?;
+            }
+            if let Some(cxc_out) = args.get("out_chimerax_path").and_then(|v| v.as_str()) {
+                sandbox
+                    .write_string(
+                        Path::new(cxc_out),
+                        &build_chimerax_md_script("complex_equil.pdb", "production.dcd"),
+                    )
+                    .map_err(|e| (-32602, e.to_string()))?;
+            }
+            Ok(json!({
+                "env_status": env_status,
+                "production_ns": ns,
+            }))
+        }
         other => Err((-32601, format!("unknown tool '{other}'"))),
     }
 }
@@ -1499,6 +1565,16 @@ mod tests {
             Some(1)
         );
         assert!(wdir.join("ensemble.csv").exists());
+
+        let md_resp = handle_mcp_line(
+            &sandbox,
+            &mut state,
+            r#"{"jsonrpc":"2.0","id":74,"method":"tools/call","params":{"name":"prepare_md_validation","arguments":{"receptor_path":"pocket.pdb","ligand_path":"docked.sdf","production_ns":5.0,"out_config_path":"md_cfg.json","out_chimerax_path":"md_view.cxc"}}}"#,
+        )
+        .ok_or("expected response")?;
+        assert!(md_resp["result"]["structuredContent"]["env_status"].is_object());
+        assert!(wdir.join("md_cfg.json").exists());
+        assert!(wdir.join("md_view.cxc").exists());
 
         // 8. Reject oversized 200^3 A box DoS immediately
         let huge_box = handle_mcp_line(

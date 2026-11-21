@@ -11,10 +11,12 @@ use dock_engine::{
     score_complex,
 };
 use dock_pipeline::{
-    ChimeraXRest, DEFAULT_MAX_FILE_BYTES, PathSandbox, campaign_report_to_csv,
+    CampaignSpec, ChimeraXRest, DEFAULT_MAX_FILE_BYTES, MdPlatform, MdValidateConfig, PathSandbox,
+    campaign_report_to_csv, check_openmm_env, default_cdk2_campaign_template,
     default_chemcraft_results_dir, default_chimerax_export_dir, grid_box_from_chimerax_selection,
-    is_chimerax_available, launch_chimerax_for_scene, load_ligand_library_bytes,
-    run_screening_campaign, write_chimerax_session_bundle, write_results_sidecar,
+    is_chimerax_available, launch_chimerax_for_scene, load_ligand_library_bytes, run_campaign,
+    run_md_validation, run_screening_campaign, write_chimerax_session_bundle,
+    write_results_sidecar,
 };
 use flate2::read::GzDecoder;
 use hyde_scorer::{
@@ -47,6 +49,14 @@ enum CliAggregation {
     Best,
     Mean,
     Rrf,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliMdPlatform {
+    Auto,
+    Cuda,
+    Opencl,
+    Cpu,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -375,6 +385,53 @@ enum Commands {
         /// Spawn `chimerax` on the scene once it is written
         #[arg(long)]
         launch: bool,
+    },
+    /// Opt-in OpenMM GPU Molecular Dynamics validation (Amber14 + OpenFF Sage + TIP3P-FB + 150 mM NaCl)
+    /// using the isolated venv in CRAFT_DATA_DIR/envs/openmm (tuned for 12 GB RTX 4080 GPUs)
+    MdValidate {
+        /// Probe the isolated OpenMM GPU environment and exit
+        #[arg(long)]
+        check_env: bool,
+        #[arg(long)]
+        receptor: Option<PathBuf>,
+        #[arg(long)]
+        ligand: Option<PathBuf>,
+        #[arg(long, default_value = "./md_validation")]
+        out_dir: PathBuf,
+        /// Production MD length in nanoseconds (default 20.0 ns; use 0.05-0.5 ns for fast checks)
+        #[arg(long, default_value_t = 20.0)]
+        ns: f64,
+        /// NVT equilibration duration in picoseconds
+        #[arg(long, default_value_t = 50.0)]
+        nvt_ps: f64,
+        /// NPT equilibration duration in picoseconds
+        #[arg(long, default_value_t = 100.0)]
+        npt_ps: f64,
+        #[arg(long, default_value_t = 300.0)]
+        temp_k: f64,
+        /// Explicit water box padding in nm (default 1.0 nm for 12 GB VRAM)
+        #[arg(long, default_value_t = 1.0)]
+        padding_nm: f64,
+        /// Ligand partial charges (`nagl` | `mmff94` | `gasteiger` | `am1bcc`)
+        #[arg(long, default_value = "nagl")]
+        charges: String,
+        #[arg(long, value_enum, default_value_t = CliMdPlatform::Auto)]
+        platform: CliMdPlatform,
+        /// Explicit Python interpreter inside an OpenMM venv (overrides CRAFT_DATA_DIR/envs/openmm)
+        #[arg(long)]
+        python: Option<PathBuf>,
+        /// Stage runnable OpenMM script + config + ChimeraX .cxc without launching GPU MD
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Run a fully reproducible 7-stage SBDD -> ADMET -> MD -> Retrosynthesis campaign with SHA-256 provenance
+    Campaign {
+        /// Path to a declarative JSON `CampaignSpec` file
+        #[arg(long)]
+        spec: Option<PathBuf>,
+        /// Write a ready-to-edit CDK2 template `CampaignSpec` JSON file and exit
+        #[arg(long)]
+        init_template: Option<PathBuf>,
     },
     /// Start the hardened JSON-RPC 2.0 MCP server
     Mcp {
@@ -1279,6 +1336,71 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "launched": launch,
                 }))?
             );
+        }
+        Commands::MdValidate {
+            check_env,
+            receptor,
+            ligand,
+            out_dir,
+            ns,
+            nvt_ps,
+            npt_ps,
+            temp_k,
+            padding_nm,
+            charges,
+            platform,
+            python,
+            dry_run,
+        } => {
+            if check_env {
+                let status = check_openmm_env(python.as_deref());
+                println!("{}", serde_json::to_string_pretty(&status)?);
+                return Ok(());
+            }
+            let rec_p = receptor.ok_or("--receptor is required (or pass --check-env)")?;
+            let lig_p = ligand.ok_or("--ligand is required (or pass --check-env)")?;
+            let plat = match platform {
+                CliMdPlatform::Auto => MdPlatform::Auto,
+                CliMdPlatform::Cuda => MdPlatform::Cuda,
+                CliMdPlatform::Opencl => MdPlatform::OpenCl,
+                CliMdPlatform::Cpu => MdPlatform::Cpu,
+            };
+            let cfg = MdValidateConfig {
+                receptor_path: rec_p,
+                ligand_path: lig_p,
+                out_dir,
+                production_ns: ns,
+                nvt_ps,
+                npt_ps,
+                temperature_k: temp_k,
+                padding_nm,
+                charge_method: charges,
+                platform: plat,
+                python_override: python,
+                dry_run,
+                ..Default::default()
+            };
+            let rep = run_md_validation(&cfg)?;
+            println!("{}", rep.render_markdown());
+        }
+        Commands::Campaign {
+            spec,
+            init_template,
+        } => {
+            if let Some(tpl_path) = init_template {
+                let tpl = default_cdk2_campaign_template();
+                std::fs::write(&tpl_path, serde_json::to_string_pretty(&tpl)?)?;
+                println!(
+                    "Wrote reproducible CampaignSpec template -> {}",
+                    tpl_path.display()
+                );
+                return Ok(());
+            }
+            let sp = spec.ok_or("provide --spec <campaign.json> (or --init-template <path>)")?;
+            let raw = std::fs::read_to_string(&sp)?;
+            let parsed: CampaignSpec = serde_json::from_str(&raw)?;
+            let manifest = run_campaign(&parsed)?;
+            println!("{}", manifest.render_markdown());
         }
         Commands::Mcp {
             read_root,

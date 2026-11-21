@@ -5,6 +5,8 @@ pub mod campaign;
 pub mod chimerax;
 pub mod chimerax_rest;
 pub mod export;
+pub mod md_validate;
+pub mod orchestrator;
 pub mod results_sidecar;
 pub mod sandbox;
 
@@ -25,6 +27,16 @@ pub use chimerax_rest::{
 pub use export::{
     InteropSceneBundle, SceneExportRequest, build_chimerax_export, build_pymol_export,
     canonical_export_target, write_sandboxed_scene_package,
+};
+pub use md_validate::{
+    HBondPersistence, MdEnvStatus, MdError, MdPlatform, MdStabilityVerdict, MdValidateConfig,
+    MdValidateReport, build_chimerax_md_script, check_openmm_env, craft_data_dir,
+    resolve_openmm_python, run_md_validation,
+};
+pub use orchestrator::{
+    CampaignLeadSummary, CampaignManifest, CampaignSpec, EnsembleSpecEntry, FileProvenance,
+    GateVerdict, OrchestratorError, StageRecord, default_cdk2_campaign_template, run_campaign,
+    sha256_hex,
 };
 pub use results_sidecar::{
     ResultsSidecar, SIDECAR_FORMAT, SIDECAR_VERSION, SidecarError, SidecarRow, SidecarRun,
