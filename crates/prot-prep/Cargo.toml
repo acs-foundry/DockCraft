@@ -1,0 +1,20 @@
+[package]
+name = "prot-prep"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Rigorous receptor preparation, structural audit (PDB/mmCIF/AlphaFold), PROPKA-inspired pocket pKa/protonation, H-bond flip optimization, and ensemble docking for DockCraft"
+
+[lints]
+workspace = true
+
+[dependencies]
+struct-core = { path = "../struct-core" }
+pocket-detect = { path = "../pocket-detect" }
+dock-engine = { path = "../dock-engine" }
+hyde-scorer = { path = "../hyde-scorer" }
+dock-pipeline = { path = "../dock-pipeline" }
+rayon = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

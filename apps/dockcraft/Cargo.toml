@@ -14,6 +14,7 @@ pocket-detect = { path = "../../crates/pocket-detect" }
 dock-engine = { path = "../../crates/dock-engine" }
 hyde-scorer = { path = "../../crates/hyde-scorer" }
 pharm-core = { path = "../../crates/pharm-core" }
+prot-prep = { path = "../../crates/prot-prep" }
 dock-viewport = { path = "../../crates/dock-viewport" }
 dock-pipeline = { path = "../../crates/dock-pipeline" }
 egui = { workspace = true }

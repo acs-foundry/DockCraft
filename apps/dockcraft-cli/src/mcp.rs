@@ -18,6 +18,10 @@ use pharm_core::{
     screen_molecules_parallel,
 };
 use pocket_detect::{GridBox, PocketDetectConfig, detect_pockets};
+use prot_prep::{
+    EnsembleAggregation, EnsembleReceptor, PrepConfig, prepare_protein_from_str,
+    run_ensemble_docking,
+};
 use serde_json::{Value, json};
 use struct_core::{
     MAX_LIGAND_ATOMS, Molecule3D, parse_mmcif, parse_mol2, parse_pdb, parse_pdbqt,
@@ -272,6 +276,62 @@ fn tool_definitions() -> Value {
                     "total_evaluated": { "type": "integer" },
                     "passed_count": { "type": "integer" },
                     "hits": { "type": "array" }
+                }
+            }
+        },
+        {
+            "name": "prepare_protein",
+            "description": "Audits and prepares a PDB/mmCIF/AlphaFold receptor inside read_root: resolves highest-occupancy altlocs, audits missing loops/atoms/clashes/B-factors, assigns PROPKA-inspired local pKa protonation states (HID/HIE/HIP/ASH/GLH/LYN/CYM/CYX), optimizes 180° ASN/GLN/HIS H-bond flips & polar-H torsions, and writes prepared PDB/Markdown inside write_root.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["receptor_path"],
+                "properties": {
+                    "receptor_path": { "type": "string" },
+                    "ph": { "type": "number" },
+                    "chains": { "type": "array", "items": { "type": "string" } },
+                    "keep_cofactors": { "type": "boolean" },
+                    "keep_metals": { "type": "boolean" },
+                    "keep_bridging_waters": { "type": "boolean" },
+                    "optimize_hbonds": { "type": "boolean" },
+                    "out_pdb_path": { "type": "string" },
+                    "out_markdown_path": { "type": "string" }
+                }
+            },
+            "outputSchema": {
+                "type": "object",
+                "required": ["audit", "protonation", "hbond_opt"],
+                "properties": {
+                    "audit": { "type": "object" },
+                    "protonation": { "type": "object" },
+                    "hbond_opt": { "type": "object" }
+                }
+            }
+        },
+        {
+            "name": "ensemble_dock",
+            "description": "Runs parallel multi-conformation ensemble docking across 2..8 receptor conformations inside read_root with Boltzmann / Best / Mean / RRF consensus aggregation.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["receptor_paths", "box_center", "box_size"],
+                "properties": {
+                    "receptor_paths": { "type": "array", "items": { "type": "string" }, "minItems": 1, "maxItems": 8 },
+                    "ligand_smiles": { "type": "string" },
+                    "ligand_path": { "type": "string" },
+                    "library_path": { "type": "string" },
+                    "box_center": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                    "box_size": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                    "aggregation": { "type": "string", "enum": ["boltzmann", "best", "mean", "rrf"] },
+                    "exhaustiveness": { "type": "integer", "minimum": 1, "maximum": 32 },
+                    "out_csv_path": { "type": "string" },
+                    "out_sdf_path": { "type": "string" }
+                }
+            },
+            "outputSchema": {
+                "type": "object",
+                "required": ["receptor_labels", "candidates"],
+                "properties": {
+                    "receptor_labels": { "type": "array" },
+                    "candidates": { "type": "array" }
                 }
             }
         }
@@ -742,6 +802,180 @@ fn handle_tool_call(
                 "passed_count": rep.passed_count,
                 "elapsed_ms": rep.elapsed_ms,
                 "hits": compact,
+            }))
+        }
+        "prepare_protein" => {
+            let rec_path = args
+                .get("receptor_path")
+                .and_then(|v| v.as_str())
+                .ok_or((-32602, "missing 'receptor_path'".to_string()))?;
+            let raw = sandbox
+                .read_string(Path::new(rec_path))
+                .map_err(|e| (-32602, e.to_string()))?;
+            let ext = Path::new(rec_path)
+                .extension()
+                .and_then(|s| s.to_str())
+                .unwrap_or("pdb");
+            let chains: Vec<char> = args
+                .get("chains")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|x| x.as_str().and_then(|s| s.chars().next()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let cfg = PrepConfig {
+                ph: args.get("ph").and_then(|v| v.as_f64()).unwrap_or(7.4),
+                chains,
+                keep_cofactors: args
+                    .get("keep_cofactors")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true),
+                keep_metals: args
+                    .get("keep_metals")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true),
+                keep_bridging_waters: args
+                    .get("keep_bridging_waters")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+                optimize_hbonds: args
+                    .get("optimize_hbonds")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true),
+                ..Default::default()
+            };
+            let prep =
+                prepare_protein_from_str(&raw, ext, &cfg).map_err(|e| (-32000, e.to_string()))?;
+            if let Some(out_pdb) = args.get("out_pdb_path").and_then(|v| v.as_str()) {
+                sandbox
+                    .write_string(Path::new(out_pdb), &write_pdb(&prep.receptor))
+                    .map_err(|e| (-32602, e.to_string()))?;
+            }
+            if let Some(out_md) = args.get("out_markdown_path").and_then(|v| v.as_str()) {
+                sandbox
+                    .write_string(Path::new(out_md), &prep.render_markdown())
+                    .map_err(|e| (-32602, e.to_string()))?;
+            }
+            Ok(json!({
+                "audit": prep.audit,
+                "protonation": prep.protonation,
+                "hbond_opt": prep.hbond_opt,
+                "bridging_waters": prep.bridging_waters,
+                "extracted_ligand_count": prep.extracted_ligands.len(),
+                "final_atom_count": prep.receptor.atoms.len(),
+                "elapsed_ms": prep.elapsed_ms,
+            }))
+        }
+        "ensemble_dock" => {
+            let rec_arr = args
+                .get("receptor_paths")
+                .and_then(|v| v.as_array())
+                .filter(|a| !a.is_empty() && a.len() <= 8)
+                .ok_or((
+                    -32602,
+                    "'receptor_paths' must be an array of 1..8 paths".to_string(),
+                ))?;
+            let center =
+                parse_vec3(args.get("box_center"), "box_center").map_err(|e| (-32602, e))?;
+            let size = parse_vec3(args.get("box_size"), "box_size").map_err(|e| (-32602, e))?;
+            let gbox = GridBox::from_center_size(center, size, 0.375)
+                .map_err(|e| (-32602, e.to_string()))?;
+            let mut ens_recs = Vec::with_capacity(rec_arr.len());
+            for rp_val in rec_arr {
+                let rp_str = rp_val
+                    .as_str()
+                    .ok_or((-32602, "each receptor path must be a string".to_string()))?;
+                let raw = sandbox
+                    .read_string(Path::new(rp_str))
+                    .map_err(|e| (-32602, e.to_string()))?;
+                let rec = parse_receptor_by_path(Path::new(rp_str), &raw, true)
+                    .map_err(|e| (-32602, e))?;
+                let label = Path::new(rp_str)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("rec")
+                    .to_string();
+                ens_recs.push(EnsembleReceptor {
+                    label,
+                    receptor: rec,
+                    grid_box: gbox.clone(),
+                });
+            }
+            let lig_records =
+                if let Some(lib_str) = args.get("library_path").and_then(|v| v.as_str()) {
+                    let bytes = sandbox
+                        .read_bytes(Path::new(lib_str))
+                        .map_err(|e| (-32602, e.to_string()))?;
+                    let ext = Path::new(lib_str)
+                        .extension()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("smi");
+                    load_ligand_library_bytes(ext, &bytes, MAX_MCP_LIBRARY_RECORDS)
+                        .map_err(|e| (-32602, e.to_string()))?
+                } else {
+                    let lig = parse_single_ligand(sandbox, args).map_err(|e| (-32602, e))?;
+                    vec![dock_pipeline::LigandInputRecord {
+                        name: lig.name.clone(),
+                        molecule: lig,
+                        is_active: None,
+                    }]
+                };
+            let agg = match args.get("aggregation").and_then(|v| v.as_str()) {
+                Some("best") => EnsembleAggregation::BestConformation,
+                Some("mean") => EnsembleAggregation::Mean,
+                Some("rrf") => EnsembleAggregation::ReciprocalRank,
+                _ => EnsembleAggregation::Boltzmann,
+            };
+            let exhaustiveness = args
+                .get("exhaustiveness")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(4)
+                .clamp(1, 32) as usize;
+            let cfg = DockingConfig {
+                exhaustiveness,
+                ..Default::default()
+            };
+            let rep = run_ensemble_docking(&ens_recs, &lig_records, &cfg, agg, true)
+                .map_err(|e| (-32000, e))?;
+            if let Some(out_csv) = args.get("out_csv_path").and_then(|v| v.as_str()) {
+                sandbox
+                    .write_string(Path::new(out_csv), &rep.to_csv())
+                    .map_err(|e| (-32602, e.to_string()))?;
+            }
+            if let Some(out_sdf) = args.get("out_sdf_path").and_then(|v| v.as_str()) {
+                let refs: Vec<&Molecule3D> = rep
+                    .candidates
+                    .iter()
+                    .map(|c| &c.best_pose.molecule)
+                    .collect();
+                sandbox
+                    .write_string(Path::new(out_sdf), &write_sdf_3d(&refs))
+                    .map_err(|e| (-32602, e.to_string()))?;
+            }
+            let compact: Vec<Value> = rep
+                .candidates
+                .iter()
+                .take(50)
+                .map(|c| {
+                    json!({
+                        "rank": c.rank,
+                        "name": c.name,
+                        "ensemble_score_kcal": c.ensemble_score_kcal,
+                        "best_single_kcal": c.best_single_kcal,
+                        "mean_kcal": c.mean_kcal,
+                        "spread_std_kcal": c.spread_std_kcal,
+                        "best_receptor": c.best_receptor,
+                        "per_conformation": c.per_conformation,
+                    })
+                })
+                .collect();
+            Ok(json!({
+                "receptor_labels": rep.receptor_labels,
+                "aggregation": rep.aggregation.as_str(),
+                "elapsed_ms": rep.elapsed_ms,
+                "candidates": compact,
             }))
         }
         other => Err((-32601, format!("unknown tool '{other}'"))),
@@ -1240,6 +1474,31 @@ mod tests {
         .ok_or("expected response")?;
         assert_eq!(ps_resp["result"]["structuredContent"]["total_evaluated"], 2);
         assert!(wdir.join("pharm_hits.sdf").exists());
+
+        // 7b. Prepare protein + ensemble dock inside sandbox
+        let prep_resp = handle_mcp_line(
+            &sandbox,
+            &mut state,
+            r#"{"jsonrpc":"2.0","id":72,"method":"tools/call","params":{"name":"prepare_protein","arguments":{"receptor_path":"pocket.pdb","ph":7.4,"out_pdb_path":"prepared.pdb","out_markdown_path":"audit.md"}}}"#,
+        )
+        .ok_or("expected response")?;
+        assert!(prep_resp["result"]["structuredContent"]["audit"]["quality_grade"].is_string());
+        assert!(wdir.join("prepared.pdb").exists());
+        assert!(wdir.join("audit.md").exists());
+
+        let ens_resp = handle_mcp_line(
+            &sandbox,
+            &mut state,
+            r#"{"jsonrpc":"2.0","id":73,"method":"tools/call","params":{"name":"ensemble_dock","arguments":{"receptor_paths":["pocket.pdb","pocket.pdb"],"ligand_smiles":"CCO","box_center":[0,0,0],"box_size":[12,12,12],"aggregation":"boltzmann","exhaustiveness":2,"out_csv_path":"ensemble.csv"}}}"#,
+        )
+        .ok_or("expected response")?;
+        assert_eq!(
+            ens_resp["result"]["structuredContent"]["candidates"]
+                .as_array()
+                .map(Vec::len),
+            Some(1)
+        );
+        assert!(wdir.join("ensemble.csv").exists());
 
         // 8. Reject oversized 200^3 A box DoS immediately
         let huge_box = handle_mcp_line(

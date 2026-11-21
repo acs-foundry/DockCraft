@@ -293,13 +293,23 @@ fn apply_ph74_protonation_and_polar_h(mol: &mut Molecule3D) {
         let rn = mol.atoms[i].res_name.trim().to_ascii_uppercase();
 
         if !mol.atoms[i].is_hetatm {
-            // Protein standard residues at pH 7.4
+            // Protein standard & PROPKA-assigned protonation states
             if matches!(
                 (rn.as_str(), an.as_str()),
                 ("ASP", "OD1" | "OD2") | ("GLU", "OE1" | "OE2")
             ) {
                 mol.atoms[i].formal_charge = if an.ends_with('2') { -1 } else { 0 };
-            } else if matches!((rn.as_str(), an.as_str()), ("LYS", "NZ") | ("ARG", "NH1")) {
+            } else if matches!(
+                (rn.as_str(), an.as_str()),
+                ("ASH", "OD1" | "OD2") | ("GLH", "OE1" | "OE2") | ("LYN", "NZ") | ("CYX", "SG")
+            ) {
+                mol.atoms[i].formal_charge = 0;
+            } else if matches!((rn.as_str(), an.as_str()), ("CYM", "SG")) {
+                mol.atoms[i].formal_charge = -1;
+            } else if matches!(
+                (rn.as_str(), an.as_str()),
+                ("LYS", "NZ") | ("ARG", "NH1") | ("HIP", "NE2")
+            ) {
                 mol.atoms[i].formal_charge = 1;
             }
             continue;
@@ -403,6 +413,7 @@ fn apply_ph74_protonation_and_polar_h(mol: &mut Molecule3D) {
                     if (rn == "TRP" && an == "NE1")
                         || ((rn == "HIS" || rn == "HID") && an == "ND1")
                         || (rn == "HIE" && an == "NE2")
+                        || (rn == "HIP" && matches!(an.as_str(), "ND1" | "NE2"))
                     {
                         1
                     } else if existing_h > 0 {
@@ -437,8 +448,18 @@ fn apply_ph74_protonation_and_polar_h(mol: &mut Molecule3D) {
                 }
             }
             "O" => {
-                if is_water_res(&a.res_name) {
+                let rn = a.res_name.trim().to_ascii_uppercase();
+                let an = a.name.trim().to_ascii_uppercase();
+                if is_water_res(&rn) {
                     2
+                } else if !a.is_hetatm
+                    && ((rn == "ASH" && an == "OD1") || (rn == "GLH" && an == "OE1"))
+                {
+                    0
+                } else if !a.is_hetatm
+                    && ((rn == "ASH" && an == "OD2") || (rn == "GLH" && an == "OE2"))
+                {
+                    1
                 } else if a.formal_charge < 0 {
                     0
                 } else {
@@ -446,7 +467,12 @@ fn apply_ph74_protonation_and_polar_h(mol: &mut Molecule3D) {
                 }
             }
             "S" => {
-                if a.formal_charge < 0 || a.aromatic || bond_order_sum >= 2 {
+                let rn = a.res_name.trim().to_ascii_uppercase();
+                if a.formal_charge < 0
+                    || a.aromatic
+                    || bond_order_sum >= 2
+                    || (!a.is_hetatm && matches!(rn.as_str(), "CYX" | "CYM"))
+                {
                     0
                 } else {
                     2usize.saturating_sub(bond_order_sum)

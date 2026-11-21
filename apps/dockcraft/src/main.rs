@@ -32,6 +32,7 @@ use hyde_scorer::{
 };
 use pharm_core::{FeatureSource, SiteAnalysisConfig, SiteBlueprint, analyze_binding_site};
 use pocket_detect::{BindingPocket, GridBox, PocketDetectConfig, detect_pockets};
+use prot_prep::{AuditSeverity, PrepConfig, PreparedReceptor, prepare_protein_from_str};
 use struct_core::{
     Atom3D, BondOrder, BridgingWater, Molecule3D, assign_ad4_types_and_flags,
     detect_bridging_waters, parse_mmcif, parse_mol2, parse_pdb, parse_pdbqt,
@@ -188,7 +189,15 @@ struct DockCraftApp {
     receptor_path_input: String,
     ligand_path_input: String,
     raw_receptor_with_waters: Option<Molecule3D>,
+    raw_receptor_source: Option<(String, String)>,
     receptor: Option<Molecule3D>,
+    prep_ph: f64,
+    prep_chains_input: String,
+    prep_keep_metals: bool,
+    prep_keep_cofactors: bool,
+    prep_keep_bridging_waters: bool,
+    prep_optimize_hbonds: bool,
+    prep_result: Option<PreparedReceptor>,
     ligand: Option<Molecule3D>,
     pose_history: Vec<Molecule3D>,
     pockets: Vec<BindingPocket>,
@@ -245,7 +254,15 @@ impl DockCraftApp {
             receptor_path_input: String::new(),
             ligand_path_input: String::new(),
             raw_receptor_with_waters: Some(rec.clone()),
+            raw_receptor_source: None,
             receptor: Some(rec),
+            prep_ph: 7.4,
+            prep_chains_input: String::new(),
+            prep_keep_metals: true,
+            prep_keep_cofactors: true,
+            prep_keep_bridging_waters: false,
+            prep_optimize_hbonds: true,
+            prep_result: None,
             ligand: Some(lig),
             pose_history: Vec::new(),
             pockets: Vec::new(),
@@ -731,6 +748,8 @@ impl DockCraftApp {
                         .focus_on([c[0] as f32, c[1] as f32, c[2] as f32], 18.0);
                 }
                 self.raw_receptor_with_waters = Some(raw_rec);
+                self.raw_receptor_source = Some((raw, ext));
+                self.prep_result = None;
                 self.kept_water_resseqs.clear();
                 self.receptor = Some(rec);
                 self.detect_pockets_now();
@@ -738,6 +757,82 @@ impl DockCraftApp {
                 self.scene_dirty = true;
             }
             Err(e) => self.status_line = format!("Receptor parse error: {e}"),
+        }
+    }
+
+    fn run_prot_prep_now(&mut self) {
+        let (raw_txt, fmt) = if let Some((txt, ext)) = &self.raw_receptor_source {
+            (txt.clone(), ext.clone())
+        } else if let Some(rec) = self
+            .raw_receptor_with_waters
+            .as_ref()
+            .or(self.receptor.as_ref())
+        {
+            (write_pdb(rec), "pdb".to_string())
+        } else {
+            self.status_line = "Load a PDB/mmCIF receptor first to run ProtPrep.".to_string();
+            return;
+        };
+        let chains: Vec<char> = self
+            .prep_chains_input
+            .split(',')
+            .filter_map(|s| s.trim().chars().next())
+            .collect();
+        let cfg = PrepConfig {
+            ph: self.prep_ph,
+            chains,
+            keep_cofactors: self.prep_keep_cofactors,
+            keep_metals: self.prep_keep_metals,
+            strip_ligands: true,
+            keep_bridging_waters: self.prep_keep_bridging_waters,
+            optimize_hbonds: self.prep_optimize_hbonds,
+            pocket_center: Some(self.grid_box.center),
+            pocket_radius: 10.0,
+            ..Default::default()
+        };
+        match prepare_protein_from_str(&raw_txt, &fmt, &cfg) {
+            Ok(prep) => {
+                self.receptor = Some(prep.receptor.clone());
+                self.bridging_waters = prep.bridging_waters.clone();
+                if self.ligand.is_none()
+                    && let Some(ext_lig) = prep.extracted_ligands.first()
+                {
+                    self.ligand = Some(ext_lig.clone());
+                }
+                self.status_line = format!(
+                    "ProtPrep {}: Grade {} | pH {:.1} (q={:+}) | {} flips | {} polar-H rotors ({} ms)",
+                    prep.audit.structure_id,
+                    prep.audit.quality_grade,
+                    prep.protonation.target_ph,
+                    prep.protonation.total_protein_charge,
+                    prep.hbond_opt.flips_applied.len(),
+                    prep.hbond_opt.polar_h_rotors_optimized,
+                    prep.elapsed_ms
+                );
+                self.prep_result = Some(prep);
+                self.rescore_active_complex();
+                self.scene_dirty = true;
+            }
+            Err(e) => self.status_line = format!("ProtPrep error: {e}"),
+        }
+    }
+
+    fn export_prep_audit_dialog(&mut self) {
+        let Some(prep) = &self.prep_result else {
+            self.status_line = "Run ProtPrep before exporting the audit report.".to_string();
+            return;
+        };
+        let Some(path) = pick_save_file(
+            "Export Structural Audit Report (Markdown)",
+            "receptor_audit.md",
+            "Markdown Report",
+            "*.md",
+        ) else {
+            return;
+        };
+        match std::fs::write(&path, prep.render_markdown()) {
+            Ok(()) => self.status_line = format!("Exported receptor audit -> {path}"),
+            Err(e) => self.status_line = format!("Audit export failed: {e}"),
         }
     }
 
@@ -1354,6 +1449,13 @@ impl eframe::App for DockCraftApp {
                 });
 
                 ui.menu_button("Docking", |ui| {
+                    if ui
+                        .button("Prepare & Audit Receptor (pKa / H-Bond Flips)")
+                        .clicked()
+                    {
+                        self.run_prot_prep_now();
+                        ui.close_menu();
+                    }
                     if ui.button("Detect Binding Pockets").clicked() {
                         self.detect_pockets_now();
                         ui.close_menu();
@@ -1577,6 +1679,90 @@ impl eframe::App for DockCraftApp {
                     }
 
                     ui.separator();
+                    egui::CollapsingHeader::new("Receptor Prep & Audit (pKa / Flips)")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label("pH:");
+                                ui.add(
+                                    egui::DragValue::new(&mut self.prep_ph)
+                                        .speed(0.1)
+                                        .range(4.0..=10.0),
+                                );
+                                ui.label("Chains:");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.prep_chains_input)
+                                        .desired_width(52.0)
+                                        .hint_text("All"),
+                                );
+                            });
+                            ui.horizontal_wrapped(|ui| {
+                                ui.checkbox(&mut self.prep_keep_metals, "Metals");
+                                ui.checkbox(&mut self.prep_keep_cofactors, "Cofactors");
+                                ui.checkbox(&mut self.prep_optimize_hbonds, "H-Bond Flips");
+                                ui.checkbox(&mut self.prep_keep_bridging_waters, "Bridge HOH");
+                            });
+                            ui.horizontal(|ui| {
+                                if ui.button("Prepare & Audit").clicked() {
+                                    self.run_prot_prep_now();
+                                }
+                                if self.prep_result.is_some()
+                                    && ui.small_button("Export Audit (.md)").clicked()
+                                {
+                                    self.export_prep_audit_dialog();
+                                }
+                            });
+                            if let Some(prep) = &self.prep_result {
+                                let a = &prep.audit;
+                                let g_col = if a.quality_grade.starts_with('A') {
+                                    Color32::from_rgb(46, 204, 113)
+                                } else if a.quality_grade.starts_with('B') {
+                                    Color32::from_rgb(241, 196, 15)
+                                } else {
+                                    Color32::from_rgb(235, 77, 75)
+                                };
+                                ui.colored_label(g_col, RichText::new(&a.quality_grade).strong());
+                                if let Some(res) = a.resolution_a {
+                                    ui.small(format!(
+                                        "Res: {res:.2} A | R-free: {} | Net q: {:+}",
+                                        a.r_free.map_or_else(
+                                            || "n/a".to_string(),
+                                            |v| format!("{v:.3}")
+                                        ),
+                                        prep.protonation.total_protein_charge
+                                    ));
+                                } else if a.is_alphafold {
+                                    ui.small(format!(
+                                        "AlphaFold mean pLDDT: {:.1} | Net q: {:+}",
+                                        a.mean_b_factor_or_plddt,
+                                        prep.protonation.total_protein_charge
+                                    ));
+                                }
+                                ui.small(format!(
+                                    "Altlocs: {} | Missing atoms: {} | Flips: {} | OH rotors: {}",
+                                    a.altlocs_resolved.len(),
+                                    a.missing_heavy_atoms.len(),
+                                    prep.hbond_opt.flips_applied.len(),
+                                    prep.hbond_opt.polar_h_rotors_optimized
+                                ));
+                                for iss in a.issues.iter().take(4) {
+                                    let c = match iss.severity {
+                                        AuditSeverity::Critical => Color32::from_rgb(235, 77, 75),
+                                        AuditSeverity::Warning => Color32::from_rgb(241, 196, 15),
+                                        AuditSeverity::Info => Color32::from_rgb(130, 180, 240),
+                                    };
+                                    ui.colored_label(
+                                        c,
+                                        RichText::new(format!(
+                                            "• {}: {}",
+                                            iss.category, iss.message
+                                        ))
+                                        .small(),
+                                    );
+                                }
+                            }
+                        });
+
                     egui::CollapsingHeader::new("Site Blueprint (MIFs & Distances)")
                         .default_open(false)
                         .show(ui, |ui| {

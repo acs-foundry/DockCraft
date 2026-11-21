@@ -25,9 +25,12 @@ use pharm_core::{
     screen_molecules_parallel, screen_smiles_stream,
 };
 use pocket_detect::{GridBox, PocketDetectConfig, detect_pockets};
+use prot_prep::{
+    EnsembleAggregation, EnsembleReceptor, PrepConfig, prepare_protein_file, run_ensemble_docking,
+};
 use struct_core::{
     detect_bridging_waters, parse_mmcif, parse_mol2, parse_pdb, parse_pdbqt,
-    parse_sdf_3d_with_limit, prepare_receptor, prepare_receptor_keeping_waters,
+    parse_sdf_3d_with_limit, prepare_receptor, prepare_receptor_keeping_waters, write_pdb,
     write_pdbqt_receptor, write_sdf_3d,
 };
 
@@ -36,6 +39,14 @@ enum CliScoring {
     Vina,
     Vinardo,
     Hybrid,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliAggregation {
+    Boltzmann,
+    Best,
+    Mean,
+    Rrf,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -65,6 +76,97 @@ enum Commands {
         output: PathBuf,
         #[arg(long, default_value_t = true)]
         strip_waters: bool,
+    },
+    /// Rigorous receptor preparation & structural audit: PDB/mmCIF/AlphaFold audit, altloc occupancy
+    /// selection, PROPKA-inspired local pKa protonation (HID/HIE/HIP/ASH/GLH/LYN/CYM/CYX),
+    /// 180° ASN/GLN/HIS H-bond flips, polar-H orientation, and ligand/cofactor separation
+    ProtPrep {
+        #[arg(long)]
+        input: PathBuf,
+        /// Write clean prepared receptor PDB
+        #[arg(long)]
+        out_pdb: Option<PathBuf>,
+        /// Optional prepared receptor AutoDock PDBQT
+        #[arg(long)]
+        out_pdbqt: Option<PathBuf>,
+        /// Optional JSON structural audit + pKa + H-bond optimization report
+        #[arg(long)]
+        out_report: Option<PathBuf>,
+        /// Optional human-readable Markdown Structural Audit Report
+        #[arg(long)]
+        out_md: Option<PathBuf>,
+        /// Optional output path (`.sdf` or `.pdb`) for extracted primary cocrystallized organic ligand
+        #[arg(long)]
+        extract_ligand: Option<PathBuf>,
+        /// Comma-separated chain IDs to retain (e.g. `A,B`; omit to keep all chains)
+        #[arg(long, value_delimiter = ',')]
+        chains: Vec<char>,
+        /// Target physiological pH for local pKa assignment (default 7.4)
+        #[arg(long, default_value_t = 7.4)]
+        ph: f64,
+        /// Strip recognized biological cofactors (ATP/NAD/FAD/HEM/...) instead of keeping them
+        #[arg(long)]
+        no_cofactors: bool,
+        /// Strip catalytic divalent metal ions (Zn/Mg/Fe/Mn/Ca) instead of keeping them
+        #[arg(long)]
+        no_metals: bool,
+        /// Keep cocrystallized organic ligands inside the receptor (default strips & extracts them)
+        #[arg(long)]
+        keep_ligands: bool,
+        /// Automatically retain buried structural bridging waters (>= 2 receptor H-bonds inside pocket)
+        #[arg(long)]
+        keep_bridging_waters: bool,
+        /// Skip 180° ASN/GLN/HIS flip & polar-H torsion optimization
+        #[arg(long)]
+        no_flips: bool,
+        /// Optional active-site center `x,y,z` for pocket-focused audit & bridging-water retention
+        #[arg(long, value_delimiter = ',', allow_hyphen_values = true)]
+        center: Vec<f64>,
+        /// Pocket neighborhood radius in Å (default 10.0)
+        #[arg(long, default_value_t = 10.0)]
+        radius: f64,
+    },
+    /// Multi-conformation Ensemble Docking across 2..N receptor states with Boltzmann / Best / Mean / RRF consensus
+    EnsembleDock {
+        /// Comma-separated or repeated receptor PDB/PDBQT files representing distinct target conformations
+        #[arg(long, value_delimiter = ',', required = true)]
+        receptors: Vec<PathBuf>,
+        /// Single ligand file (`.sdf`/`.mol2`/`.pdb`/`.pdbqt`)
+        #[arg(long)]
+        ligand: Option<PathBuf>,
+        /// Or screening library (`.sdf`/`.smi`/`.csv`/`.chemcraft`)
+        #[arg(long)]
+        library: Option<PathBuf>,
+        /// Single shared center `x,y,z` OR per-receptor centers `x1,y1,z1;x2,y2,z2` (omit to auto-detect top pocket per receptor)
+        #[arg(long, allow_hyphen_values = true)]
+        center: Option<String>,
+        #[arg(
+            long,
+            value_delimiter = ',',
+            allow_hyphen_values = true,
+            default_values_t = vec![20.0, 20.0, 20.0]
+        )]
+        size: Vec<f64>,
+        #[arg(long, value_enum, default_value_t = CliScoring::Vina)]
+        scoring: CliScoring,
+        #[arg(long, value_enum, default_value_t = CliAggregation::Boltzmann)]
+        aggregation: CliAggregation,
+        #[arg(long, default_value_t = 6)]
+        exhaustiveness: usize,
+        /// Use raw docking score without HYDE consensus blending
+        #[arg(long)]
+        no_hyde_consensus: bool,
+        #[arg(long, default_value_t = 250)]
+        max_ligands: usize,
+        /// Optional ranked ensemble CSV output
+        #[arg(long)]
+        out_csv: Option<PathBuf>,
+        /// Optional best-conformation 3D poses SDF output
+        #[arg(long)]
+        out_sdf: Option<PathBuf>,
+        /// Optional Markdown ensemble report output
+        #[arg(long)]
+        out_md: Option<PathBuf>,
     },
     /// Run a PyRx-style parallel virtual screening campaign
     Screen {
@@ -326,6 +428,219 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 rec.heavy_atom_count(),
                 output.display()
             );
+        }
+        Commands::ProtPrep {
+            input,
+            out_pdb,
+            out_pdbqt,
+            out_report,
+            out_md,
+            extract_ligand,
+            chains,
+            ph,
+            no_cofactors,
+            no_metals,
+            keep_ligands,
+            keep_bridging_waters,
+            no_flips,
+            center,
+            radius,
+        } => {
+            let pocket_center = if center.len() == 3 {
+                Some([center[0], center[1], center[2]])
+            } else {
+                None
+            };
+            let cfg = PrepConfig {
+                ph,
+                chains,
+                keep_cofactors: !no_cofactors,
+                keep_metals: !no_metals,
+                strip_ligands: !keep_ligands,
+                keep_bridging_waters,
+                optimize_hbonds: !no_flips,
+                pocket_center,
+                pocket_radius: radius,
+                ..Default::default()
+            };
+            let prep = prepare_protein_file(&input, &cfg)?;
+            if let Some(p) = &out_pdb {
+                std::fs::write(p, write_pdb(&prep.receptor))?;
+            }
+            if let Some(p) = &out_pdbqt {
+                std::fs::write(p, write_pdbqt_receptor(&prep.receptor))?;
+            }
+            if let Some(p) = &out_report {
+                let summary_json = serde_json::json!({
+                    "audit": prep.audit,
+                    "protonation": prep.protonation,
+                    "hbond_opt": prep.hbond_opt,
+                    "bridging_waters": prep.bridging_waters,
+                    "extracted_ligand_count": prep.extracted_ligands.len(),
+                    "final_atom_count": prep.receptor.atoms.len(),
+                    "elapsed_ms": prep.elapsed_ms,
+                });
+                std::fs::write(p, serde_json::to_string_pretty(&summary_json)?)?;
+            }
+            let md = prep.render_markdown();
+            if let Some(p) = &out_md {
+                std::fs::write(p, &md)?;
+            }
+            if let Some(p) = &extract_ligand
+                && let Some(primary_lig) = prep
+                    .extracted_ligands
+                    .iter()
+                    .max_by_key(|l| l.heavy_atom_count())
+            {
+                let ext = p
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("sdf")
+                    .to_ascii_lowercase();
+                if ext == "pdb" {
+                    std::fs::write(p, write_pdb(primary_lig))?;
+                } else {
+                    std::fs::write(p, write_sdf_3d(&[primary_lig]))?;
+                }
+            }
+            println!("{md}");
+        }
+        Commands::EnsembleDock {
+            receptors,
+            ligand,
+            library,
+            center,
+            size,
+            scoring,
+            aggregation,
+            exhaustiveness,
+            no_hyde_consensus,
+            max_ligands,
+            out_csv,
+            out_sdf,
+            out_md,
+        } => {
+            if size.len() != 3 {
+                return Err("--size must provide 3 comma-separated floats".into());
+            }
+            let sz = [size[0], size[1], size[2]];
+            let parsed_centers: Vec<[f64; 3]> = if let Some(c_str) = &center {
+                let mut out = Vec::new();
+                for group in c_str.split(';') {
+                    let vals: Vec<f64> = group
+                        .split(',')
+                        .map(|s| s.trim().parse::<f64>())
+                        .collect::<Result<_, _>>()?;
+                    if vals.len() != 3 {
+                        return Err(
+                            format!("invalid --center entry '{group}' (expected x,y,z)").into()
+                        );
+                    }
+                    out.push([vals[0], vals[1], vals[2]]);
+                }
+                out
+            } else {
+                Vec::new()
+            };
+            let mut ens_recs = Vec::with_capacity(receptors.len());
+            for (ri, rp) in receptors.iter().enumerate() {
+                let rec = read_receptor_file(rp, true)?;
+                let label = rp
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("receptor")
+                    .to_string();
+                let ctr =
+                    if let Some(&c) = parsed_centers.get(ri).or_else(|| parsed_centers.first()) {
+                        c
+                    } else {
+                        let pockets = detect_pockets(&rec, &PocketDetectConfig::default())?;
+                        pockets
+                            .first()
+                            .map(|p| p.center)
+                            .ok_or_else(|| format!("no pockets detected in '{}'", rp.display()))?
+                    };
+                let gbox = GridBox::from_center_size(ctr, sz, 0.375)?;
+                ens_recs.push(EnsembleReceptor {
+                    label,
+                    receptor: rec,
+                    grid_box: gbox,
+                });
+            }
+            let lig_records = if let Some(lib_path) = &library {
+                let bytes = std::fs::read(lib_path)?;
+                let ext = lib_path
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("sdf");
+                load_ligand_library_bytes(ext, &bytes, max_ligands)?
+            } else if let Some(lig_path) = &ligand {
+                let raw = std::fs::read_to_string(lig_path)?;
+                let ext = lig_path
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("sdf")
+                    .to_ascii_lowercase();
+                let mut mol = match ext.as_str() {
+                    "pdbqt" => parse_pdbqt(&raw)?,
+                    "mol2" => parse_mol2(&raw)?,
+                    "pdb" => parse_pdb(&raw, true)?,
+                    _ => {
+                        let mut v = parse_sdf_3d_with_limit(&raw, 1);
+                        v.pop().ok_or("empty ligand SDF")??
+                    }
+                };
+                struct_core::perceive_all(&mut mol);
+                let nm = if mol.name.trim().is_empty() {
+                    lig_path
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("ligand")
+                        .to_string()
+                } else {
+                    mol.name.clone()
+                };
+                vec![dock_pipeline::LigandInputRecord {
+                    name: nm,
+                    molecule: mol,
+                    is_active: None,
+                }]
+            } else {
+                return Err("provide either --ligand or --library for ensemble-dock".into());
+            };
+            let sf = match scoring {
+                CliScoring::Vina => ScoringFunction::Vina,
+                CliScoring::Vinardo => ScoringFunction::Vinardo,
+                CliScoring::Hybrid => ScoringFunction::DockCraftHybrid,
+            };
+            let agg = match aggregation {
+                CliAggregation::Boltzmann => EnsembleAggregation::Boltzmann,
+                CliAggregation::Best => EnsembleAggregation::BestConformation,
+                CliAggregation::Mean => EnsembleAggregation::Mean,
+                CliAggregation::Rrf => EnsembleAggregation::ReciprocalRank,
+            };
+            let cfg = DockingConfig {
+                scoring: sf,
+                exhaustiveness,
+                ..Default::default()
+            };
+            let rep = run_ensemble_docking(&ens_recs, &lig_records, &cfg, agg, !no_hyde_consensus)?;
+            if let Some(p) = &out_csv {
+                std::fs::write(p, rep.to_csv())?;
+            }
+            if let Some(p) = &out_sdf {
+                let refs: Vec<&struct_core::Molecule3D> = rep
+                    .candidates
+                    .iter()
+                    .map(|c| &c.best_pose.molecule)
+                    .collect();
+                std::fs::write(p, write_sdf_3d(&refs))?;
+            }
+            let md = rep.to_markdown();
+            if let Some(p) = &out_md {
+                std::fs::write(p, &md)?;
+            }
+            println!("{md}");
         }
         Commands::Screen {
             receptor,
