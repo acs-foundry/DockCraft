@@ -15,11 +15,12 @@ use dock_engine::{
     score_complex,
 };
 use dock_pipeline::{
-    AdmetProfile, CampaignReport, ChimeraXRest, LigandInputRecord, build_chimerax_export,
-    build_pymol_export, campaign_report_to_csv, default_chemcraft_results_dir,
-    default_chimerax_export_dir, evaluate_admet, grid_box_from_chimerax_selection,
+    AdmetProfile, BiomolBundleExtras, CampaignReport, ChimeraXRest, DockPoseInput,
+    LigandInputRecord, build_chimerax_export, build_dockcraft_scene_bundle, build_pymol_export,
+    campaign_report_to_csv, default_chemcraft_results_dir, default_chimerax_export_dir,
+    evaluate_admet, grid_box_from_biomolcraft_selection, grid_box_from_chimerax_selection,
     launch_chimerax_for_scene, load_ligand_library_bytes, run_screening_campaign,
-    write_results_sidecar,
+    send_or_launch_biomolcraft, write_results_sidecar,
 };
 use dock_viewport::{
     Camera3D, DockPaintCallback, DockWgpuResources, SharedViewportPayload, ViewportOptions,
@@ -1092,6 +1093,141 @@ impl DockCraftApp {
         }
     }
 
+    fn send_to_biomolcraft_now(&mut self) {
+        let Some(rec) = &self.receptor else {
+            self.status_line = "Load a receptor structure before opening BiomolCraft.".to_string();
+            return;
+        };
+        let mut hyde_owned: Vec<Option<HydeReport>> = Vec::new();
+        let mut pose_mols: Vec<(usize, String, Option<String>, Molecule3D, f64)> = Vec::new();
+        if !self.dock_poses.is_empty() {
+            for p in &self.dock_poses {
+                let h = score_pose_hyde(rec, &p.molecule).ok();
+                hyde_owned.push(h);
+                let nm = if p.molecule.name.trim().is_empty() {
+                    format!("Mode_{}", p.mode)
+                } else {
+                    format!("{}_Mode{}", p.molecule.name, p.mode)
+                };
+                pose_mols.push((
+                    p.mode,
+                    nm,
+                    p.molecule.source_smiles.clone(),
+                    p.molecule.clone(),
+                    p.affinity_kcal_mol,
+                ));
+            }
+        } else if let Some(lig) = &self.ligand {
+            let h = self
+                .hyde_report
+                .clone()
+                .or_else(|| score_pose_hyde(rec, lig).ok());
+            hyde_owned.push(h);
+            let vina = self
+                .vina_score_kcal
+                .unwrap_or_else(|| score_complex(rec, lig, self.scoring).total_affinity_kcal);
+            let nm = if lig.name.trim().is_empty() {
+                "ActiveLigand".to_string()
+            } else {
+                lig.name.clone()
+            };
+            pose_mols.push((1, nm, lig.source_smiles.clone(), lig.clone(), vina));
+        }
+
+        let pose_inputs: Vec<DockPoseInput<'_>> = pose_mols
+            .iter()
+            .zip(hyde_owned.iter())
+            .map(|((id, name, smi, mol, vina), h)| DockPoseInput {
+                pose_id: *id,
+                name: name.clone(),
+                canonical_smiles: smi.clone(),
+                molecule: mol,
+                vina_kcal: *vina,
+                hyde: h.as_ref(),
+                cnn_score: None,
+                mpo_score: None,
+            })
+            .collect();
+
+        let title = format!(
+            "{} — ViewDockX ({} poses)",
+            if rec.name.trim().is_empty() {
+                "DockCraft"
+            } else {
+                rec.name.as_str()
+            },
+            pose_inputs.len()
+        );
+        let rec_path = if self.receptor_path_input.trim().is_empty() {
+            None
+        } else {
+            Some(self.receptor_path_input.clone())
+        };
+        let bundle = build_dockcraft_scene_bundle(
+            &title,
+            rec,
+            rec_path,
+            &pose_inputs,
+            &BiomolBundleExtras {
+                grid_box: Some(&self.grid_box),
+                constraints: &self.constraints,
+                site_blueprint: self.site_blueprint.as_ref(),
+                selectivity: None,
+                bridging_waters: &self.bridging_waters,
+                ..Default::default()
+            },
+        );
+        let stem = if rec.name.trim().is_empty() {
+            "dockcraft_complex"
+        } else {
+            rec.name.as_str()
+        };
+        match send_or_launch_biomolcraft(stem, &bundle, None) {
+            Ok(rep) => {
+                if rep.pushed_live {
+                    self.status_line = format!(
+                        "Craft Link v1 → BiomolCraft ViewDockX live ({} pose(s), HYDE + torsions + GridBox).",
+                        rep.pose_count
+                    );
+                } else {
+                    self.status_line = format!(
+                        "Launched BiomolCraft ViewDockX ({} pose(s)) -> {}",
+                        rep.pose_count,
+                        rep.bundle_path.display()
+                    );
+                }
+            }
+            Err(e) => self.status_line = format!("BiomolCraft Craft Link error: {e}"),
+        }
+    }
+
+    fn grab_box_from_biomolcraft(&mut self) {
+        match grid_box_from_biomolcraft_selection(5.0) {
+            Ok(sel) => {
+                self.grid_box = sel.grid_box;
+                self.camera.focus_on(
+                    [
+                        self.grid_box.center[0] as f32,
+                        self.grid_box.center[1] as f32,
+                        self.grid_box.center[2] as f32,
+                    ],
+                    16.0,
+                );
+                self.detect_waters_now();
+                self.scene_dirty = true;
+                self.status_line = format!(
+                    "GridBox synced from BiomolCraft '{}' ({} residues, {} atoms) via Craft Link v1.",
+                    sel.source_model,
+                    sel.selected_residues.len(),
+                    sel.heavy_atoms
+                );
+            }
+            Err(e) => {
+                self.status_line = format!("BiomolCraft Box sync: {e}");
+            }
+        }
+    }
+
     fn launch_chimerax_now(&mut self) {
         let (Some(rec), Some(lig), Some(hyde)) = (&self.receptor, &self.ligand, &self.hyde_report)
         else {
@@ -1500,6 +1636,24 @@ impl eframe::App for DockCraftApp {
                 });
 
                 ui.menu_button("Apps", |ui| {
+                    if ui
+                        .button(
+                            RichText::new("Visualizar en BiomolCraft (ViewDockX · Craft Link)")
+                                .strong(),
+                        )
+                        .clicked()
+                    {
+                        self.send_to_biomolcraft_now();
+                        ui.close_menu();
+                    }
+                    if ui
+                        .button("Tomar GridBox desde BiomolCraft (Craft Link)")
+                        .clicked()
+                    {
+                        self.grab_box_from_biomolcraft();
+                        ui.close_menu();
+                    }
+                    ui.separator();
                     if ui.button("Abrir en AdmetCraft (ADMET & PK)").clicked() {
                         self.open_in_admetcraft();
                         ui.close_menu();
@@ -1509,14 +1663,16 @@ impl eframe::App for DockCraftApp {
                         ui.close_menu();
                     }
                     ui.separator();
-                    if ui.button("Visualizar en ChimeraX").clicked() {
-                        self.launch_chimerax_now();
-                        ui.close_menu();
-                    }
-                    if ui.button("Tomar caja desde ChimeraX").clicked() {
-                        self.grab_box_from_chimerax();
-                        ui.close_menu();
-                    }
+                    ui.menu_button("ChimeraX (fallback)", |ui| {
+                        if ui.button("Visualizar en ChimeraX").clicked() {
+                            self.launch_chimerax_now();
+                            ui.close_menu();
+                        }
+                        if ui.button("Tomar caja desde ChimeraX").clicked() {
+                            self.grab_box_from_chimerax();
+                            ui.close_menu();
+                        }
+                    });
                 });
             });
         });
@@ -1568,11 +1724,11 @@ impl eframe::App for DockCraftApp {
                 if ui.button(RichText::new("AdmetCraft").strong()).clicked() {
                     self.open_in_admetcraft();
                 }
-                if ui.button("ChimeraX").clicked() {
-                    self.launch_chimerax_now();
+                if ui.button(RichText::new("BiomolCraft").strong()).clicked() {
+                    self.send_to_biomolcraft_now();
                 }
-                if ui.button("Box <- ChimeraX").clicked() {
-                    self.grab_box_from_chimerax();
+                if ui.button("Box ← BiomolCraft").clicked() {
+                    self.grab_box_from_biomolcraft();
                 }
             });
         });
@@ -2258,8 +2414,10 @@ impl eframe::App for DockCraftApp {
                         ("Toggle Torsion Traffic-Lights", 4),
                         ("Open in AdmetCraft (ADMET & PK)", 5),
                         ("Send to ChemCraft (SAR)", 6),
-                        ("Launch ChimeraX Scene", 7),
-                        ("Grab GridBox from ChimeraX", 8),
+                        ("Open in BiomolCraft ViewDockX (Craft Link)", 12),
+                        ("Grab GridBox from BiomolCraft (Craft Link)", 13),
+                        ("Launch ChimeraX Scene (fallback)", 7),
+                        ("Grab GridBox from ChimeraX (fallback)", 8),
                         ("Export PyMOL (.pml)", 9),
                         ("Export ChimeraX (.cxc)", 10),
                         ("Reset 3D Camera", 11),
@@ -2289,6 +2447,8 @@ impl eframe::App for DockCraftApp {
                                 8 => self.grab_box_from_chimerax(),
                                 9 => self.export_interop_dialog(true),
                                 10 => self.export_interop_dialog(false),
+                                12 => self.send_to_biomolcraft_now(),
+                                13 => self.grab_box_from_biomolcraft(),
                                 _ => {
                                     self.camera = Camera3D::default();
                                 }

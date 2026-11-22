@@ -508,8 +508,8 @@ dependencies = [
 
 [[package]]
 name = "craftbio-scene"
-version = "0.2.0"
-source = "git+https://github.com/acs-foundry/craftbio-libs?tag=v0.2.0#39ceaf76991738fd6b56deacd4eecb4400b0bc79"
+version = "0.4.0"
+source = "git+https://github.com/acs-foundry/craftbio-libs?tag=v0.4.0#96db820dd8d493881083432f36d4afad5b902625"
 dependencies = [
  "craft-ipc",
  "serde",
@@ -642,7 +642,7 @@ dependencies = [
 
 [[package]]
 name = "dock-engine"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "pocket-detect",
  "rand",
@@ -654,12 +654,14 @@ dependencies = [
 
 [[package]]
 name = "dock-pipeline"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
+ "craftbio-scene",
  "csv",
  "dock-engine",
  "flate2",
  "hyde-scorer",
+ "pharm-core",
  "pocket-detect",
  "rayon",
  "rustix 1.1.6",
@@ -671,7 +673,7 @@ dependencies = [
 
 [[package]]
 name = "dock-viewport"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "bytemuck",
  "egui",
@@ -685,8 +687,9 @@ dependencies = [
 
 [[package]]
 name = "dockcraft"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
+ "craftbio-scene",
  "dock-engine",
  "dock-pipeline",
  "dock-viewport",
@@ -703,7 +706,7 @@ dependencies = [
 
 [[package]]
 name = "dockcraft-cli"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "clap",
  "craftbio-scene",
@@ -1265,7 +1268,7 @@ checksum = "dfa686283ad6dd069f105e5ab091b04c62850d3e4cf5d67debad1933f55023df"
 
 [[package]]
 name = "hyde-scorer"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "pocket-detect",
  "serde",
@@ -2122,7 +2125,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "pharm-core"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "dock-engine",
  "pocket-detect",
@@ -2186,7 +2189,7 @@ dependencies = [
 
 [[package]]
 name = "pocket-detect"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "rayon",
  "serde",
@@ -2264,7 +2267,7 @@ checksum = "3d595e54a326bc53c1c197b32d295e14b169e3cfeaa8dc82b529f947fba6bcf5"
 
 [[package]]
 name = "prot-prep"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "dock-engine",
  "dock-pipeline",
@@ -2710,7 +2713,7 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 
 [[package]]
 name = "struct-core"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "serde",
  "thiserror 2.0.21",

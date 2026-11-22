@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod admet;
+pub mod biomol_link;
 pub mod campaign;
 pub mod chimerax;
 pub mod chimerax_rest;
@@ -17,6 +18,11 @@ pub mod safety_panel;
 pub mod sandbox;
 
 pub use admet::{AdmetProfile, detect_sibling_clis, evaluate_admet};
+pub use biomol_link::{
+    BiomolBundleExtras, BiomolDeliveryReport, BiomolLinkError, BiomolSelectionBox, DockPoseInput,
+    build_dockcraft_scene_bundle, default_biomolcraft_handoff_dir,
+    grid_box_from_biomolcraft_selection, send_or_launch_biomolcraft, write_biomol_handoff_bundle,
+};
 pub use campaign::{
     CampaignError, CampaignReport, EnrichmentMetrics, LigandInputRecord, ScreenedCandidate,
     campaign_report_to_csv, compute_enrichment_metrics, compute_mpo_score,

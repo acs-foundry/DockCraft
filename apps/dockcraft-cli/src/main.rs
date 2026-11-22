@@ -11,26 +11,28 @@ use dock_engine::{
     score_complex,
 };
 use dock_pipeline::{
-    CampaignSpec, ChimeraXRest, CoFoldBackend, CoFoldConfig, CoFoldEntity, DEFAULT_MAX_FILE_BYTES,
-    FepBackend, FepConfig, GninaRescoreConfig, HtmlDossierConfig, LeadOptConfig, LeadOptMode,
-    MdPlatform, MdValidateConfig, PathSandbox, SafetyPanelConfig, SafetyPanelManifest,
-    campaign_report_to_csv, check_cofold_env, check_fep_env, check_gnina_env, check_openmm_env,
+    BiomolBundleExtras, CampaignSpec, ChimeraXRest, CoFoldBackend, CoFoldConfig, CoFoldEntity,
+    DEFAULT_MAX_FILE_BYTES, DockPoseInput, FepBackend, FepConfig, GninaRescoreConfig,
+    HtmlDossierConfig, LeadOptConfig, LeadOptMode, MdPlatform, MdValidateConfig, PathSandbox,
+    SafetyPanelConfig, SafetyPanelManifest, build_dockcraft_scene_bundle, campaign_report_to_csv,
+    check_cofold_env, check_fep_env, check_gnina_env, check_openmm_env,
     default_bowes_tier1_catalog, default_cdk2_campaign_template, default_chemcraft_results_dir,
     default_chimerax_export_dir, default_safety_panel_dir, default_safety_panel_manifest_path,
-    extract_protein_sequences_from_mol, grid_box_from_chimerax_selection, is_chimerax_available,
-    launch_chimerax_for_scene, load_ligand_library_bytes, run_campaign, run_cofold_prediction,
-    run_fep_network, run_gnina_rescore, run_lead_optimization, run_md_validation, run_safety_panel,
-    run_screening_campaign, write_chimerax_session_bundle, write_interactive_html_dossier,
-    write_results_sidecar,
+    extract_protein_sequences_from_mol, grid_box_from_biomolcraft_selection,
+    grid_box_from_chimerax_selection, is_chimerax_available, launch_chimerax_for_scene,
+    load_ligand_library_bytes, run_campaign, run_cofold_prediction, run_fep_network,
+    run_gnina_rescore, run_lead_optimization, run_md_validation, run_safety_panel,
+    run_screening_campaign, send_or_launch_biomolcraft, write_chimerax_session_bundle,
+    write_interactive_html_dossier, write_results_sidecar,
 };
 use flate2::read::GzDecoder;
 use hyde_scorer::{
-    analyze_torsions, consensus_affinity_kcal, score_pose_hyde, validate_pose_geometry,
+    HydeReport, analyze_torsions, consensus_affinity_kcal, score_pose_hyde, validate_pose_geometry,
 };
 use pharm_core::{
-    OffTargetPocketInput, PharmScreenConfig, PocketSelectivityConfig, SiteAnalysisConfig,
-    SiteBlueprint, analyze_binding_site, analyze_pocket_selectivity, craft_data_dir,
-    screen_molecules_parallel, screen_smiles_stream,
+    OffTargetPocketInput, PharmScreenConfig, PocketSelectivityConfig, SelectivityReport,
+    SiteAnalysisConfig, SiteBlueprint, analyze_binding_site, analyze_pocket_selectivity,
+    craft_data_dir, screen_molecules_parallel, screen_smiles_stream,
 };
 use pocket_detect::{GridBox, PocketDetectConfig, detect_pockets};
 use prot_prep::{
@@ -215,11 +217,13 @@ enum Commands {
         center: Vec<f64>,
         #[arg(long, value_delimiter = ',', allow_hyphen_values = true)]
         size: Vec<f64>,
-        /// Take the box from what is selected right now in a running ChimeraX, instead of
-        /// --center/--size. Select the binding-site residues on screen first.
+        /// Take the box synchronously from a running BiomolCraft instance over Craft Link v1
+        #[arg(long)]
+        box_from_biomolcraft: bool,
+        /// Take the box from what is selected right now in a running ChimeraX (fallback)
         #[arg(long)]
         box_from_chimerax: bool,
-        /// Padding in angstroms around the selected atoms when --box-from-chimerax is used
+        /// Padding in angstroms around the selected atoms when --box-from-biomolcraft/chimerax is used
         #[arg(long, default_value_t = 5.0)]
         box_padding: f64,
         #[arg(long, value_enum, default_value_t = CliScoring::Vina)]
@@ -242,6 +246,9 @@ enum Commands {
         /// Directory for the sidecar, overriding the default
         #[arg(long)]
         sidecar_dir: Option<PathBuf>,
+        /// Optional BiomolCraft ViewDockX JSON bundle (top 25 hits + HYDE + GridBox + pharmacophores)
+        #[arg(long)]
+        out_dock_bundle: Option<PathBuf>,
     },
     /// Profile an active site with 7-probe 3D MIFs, PCA dimensions, optimal inter-feature distance
     /// matrix, wall exclusion spheres, and water assessment (emits `.pharm.json` + Markdown blueprint)
@@ -448,11 +455,23 @@ enum Commands {
         /// Flexible receptor sidechain residue specs (e.g. `A:ASP189,A:TRP79`)
         #[arg(long, value_delimiter = ',')]
         flex_residues: Vec<String>,
+        /// Take the GridBox synchronously from a running BiomolCraft instance over Craft Link v1
+        #[arg(long)]
+        box_from_biomolcraft: bool,
+        /// Padding in Å when --box-from-biomolcraft is used
+        #[arg(long, default_value_t = 5.0)]
+        box_padding: f64,
+        /// Optional `selectivity_report.json` from `compare-pockets` to include ΔMIF hotspots in `--out-dock-bundle`
+        #[arg(long)]
+        selectivity_json: Option<PathBuf>,
         /// Covalent attachment constraint `rec_atom_idx,lig_atom_idx,bond_len_a`
         #[arg(long)]
         covalent: Option<String>,
         #[arg(long)]
         out_sdf: Option<PathBuf>,
+        /// Optional rich BiomolCraft ViewDockX JSON bundle (receptor + all poses + HYDE coronas + torsion lights + interactions + pharmacophores + ΔMIF + GridBox)
+        #[arg(long)]
+        out_dock_bundle: Option<PathBuf>,
     },
     /// Score a docked complex with Vina + HYDE per-atom desolvation/H-bond/steric breakdown
     ScorePose {
@@ -712,12 +731,22 @@ enum Commands {
         #[arg(long)]
         init_template: Option<PathBuf>,
     },
-    /// Push a docked complex PDB (and optional OpenMM .dcd trajectory) live into BiomolCraft over Craft Link v1 (`craft-ipc`).
+    /// Push a docked complex PDB, trajectory DCD, or rich ViewDockX bundle (poses SDF + HYDE + pharmacophores + ΔMIF) to BiomolCraft over Craft Link v1.
     LinkBiomol {
         #[arg(long)]
         pdb: PathBuf,
         #[arg(long)]
         dcd: Option<PathBuf>,
+        #[arg(long)]
+        poses_sdf: Option<PathBuf>,
+        #[arg(long)]
+        blueprint: Option<PathBuf>,
+        #[arg(long)]
+        selectivity_json: Option<PathBuf>,
+        #[arg(long)]
+        out_bundle: Option<PathBuf>,
+        #[arg(long)]
+        launch: bool,
         #[arg(long)]
         module: Option<String>,
     },
@@ -1012,6 +1041,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             out,
             center,
             size,
+            box_from_biomolcraft,
             box_from_chimerax,
             box_padding,
             scoring,
@@ -1021,6 +1051,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             pharm_weight,
             sidecar,
             sidecar_dir,
+            out_dock_bundle,
         } => {
             let rec = read_receptor_file(&receptor, true)?;
             let blueprint_opt = if let Some(pf) = &pharmacophore_file {
@@ -1029,7 +1060,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 None
             };
-            let gbox = if box_from_chimerax {
+            let gbox = if box_from_biomolcraft {
+                let selection = grid_box_from_biomolcraft_selection(box_padding)?;
+                eprintln!(
+                    "Box from BiomolCraft '{}' (Craft Link v1): {} residues, {} atoms, centre [{:.2}, {:.2}, {:.2}], size [{:.1}, {:.1}, {:.1}]",
+                    selection.source_model,
+                    selection.selected_residues.len(),
+                    selection.heavy_atoms,
+                    selection.grid_box.center[0],
+                    selection.grid_box.center[1],
+                    selection.grid_box.center[2],
+                    selection.grid_box.size[0],
+                    selection.grid_box.size[1],
+                    selection.grid_box.size[2],
+                );
+                selection.grid_box
+            } else if box_from_chimerax {
                 let root = default_chimerax_export_dir();
                 std::fs::create_dir_all(&root)?;
                 let client = ChimeraXRest::with_default_port(root.clone());
@@ -1109,6 +1155,51 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     stem,
                 )?;
                 eprintln!("Results sidecar for ChemCraft: {}", path.display());
+            }
+            if let Some(bundle_path) = &out_dock_bundle {
+                let top_n = report.results.len().min(25);
+                let hydes: Vec<Option<HydeReport>> = report.results[..top_n]
+                    .iter()
+                    .map(|c| score_pose_hyde(&rec, &c.best_pose.molecule).ok())
+                    .collect();
+                let pose_inputs: Vec<DockPoseInput<'_>> = report.results[..top_n]
+                    .iter()
+                    .zip(hydes.iter())
+                    .map(|(c, h)| DockPoseInput {
+                        pose_id: c.rank,
+                        name: c.name.clone(),
+                        canonical_smiles: c
+                            .source_properties
+                            .get("ChemCraft_canonical_smiles")
+                            .cloned(),
+                        molecule: &c.best_pose.molecule,
+                        vina_kcal: c.best_affinity_kcal,
+                        hyde: h.as_ref(),
+                        cnn_score: None,
+                        mpo_score: Some(c.mpo_score),
+                    })
+                    .collect();
+                let bundle = build_dockcraft_scene_bundle(
+                    &format!("{} Virtual Screen (Top {top_n})", rec.name),
+                    &rec,
+                    Some(receptor.display().to_string()),
+                    &pose_inputs,
+                    &BiomolBundleExtras {
+                        grid_box: Some(&gbox),
+                        site_blueprint: blueprint_opt.as_ref(),
+                        ..Default::default()
+                    },
+                );
+                if let Some(par) = bundle_path.parent()
+                    && !par.as_os_str().is_empty()
+                {
+                    std::fs::create_dir_all(par)?;
+                }
+                std::fs::write(bundle_path, serde_json::to_string_pretty(&bundle)?)?;
+                eprintln!(
+                    "ViewDockX bundle for BiomolCraft: {}",
+                    bundle_path.display()
+                );
             }
             println!(
                 "Screened {} compounds in {} ms -> {}",
@@ -1715,8 +1806,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             pharmacophore_file,
             pharm_weight,
             flex_residues,
+            box_from_biomolcraft,
+            box_padding,
+            selectivity_json,
             covalent,
             out_sdf,
+            out_dock_bundle,
         } => {
             let blueprint_opt = if let Some(pf) = &pharmacophore_file {
                 let raw_bp = std::fs::read_to_string(pf)?;
@@ -1724,7 +1819,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 None
             };
-            let (ctr, sz) = if center.len() == 3 && size.len() == 3 {
+            let (ctr, sz) = if box_from_biomolcraft {
+                let sel = grid_box_from_biomolcraft_selection(box_padding)?;
+                (sel.grid_box.center, sel.grid_box.size)
+            } else if center.len() == 3 && size.len() == 3 {
                 (
                     [center[0], center[1], center[2]],
                     [size[0], size[1], size[2]],
@@ -1733,7 +1831,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 (bp.grid_box.center, bp.grid_box.size)
             } else {
                 return Err(
-                    "--center and --size must be comma-separated 3-vectors x,y,z (or pass --pharmacophore-file)"
+                    "--center and --size must be comma-separated 3-vectors x,y,z (or pass --box-from-biomolcraft / --pharmacophore-file)"
                         .into(),
                 );
             };
@@ -1859,6 +1957,69 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let pose_refs: Vec<&struct_core::Molecule3D> =
                     report.poses.iter().map(|p| &p.molecule).collect();
                 std::fs::write(sdf_path, write_sdf_3d(&pose_refs))?;
+            }
+            if let Some(bundle_path) = &out_dock_bundle {
+                let eval_rec = report.flex_receptor.as_ref().unwrap_or(&rec);
+                let sel_opt: Option<SelectivityReport> = if let Some(sp) = &selectivity_json {
+                    let raw_sel = std::fs::read_to_string(sp)?;
+                    serde_json::from_str(&raw_sel).ok()
+                } else {
+                    None
+                };
+                let hydes: Vec<Option<HydeReport>> = report
+                    .poses
+                    .iter()
+                    .map(|p| score_pose_hyde(eval_rec, &p.molecule).ok())
+                    .collect();
+                let pose_inputs: Vec<DockPoseInput<'_>> = report
+                    .poses
+                    .iter()
+                    .zip(hydes.iter())
+                    .map(|(p, h)| DockPoseInput {
+                        pose_id: p.mode,
+                        name: if p.molecule.name.trim().is_empty() {
+                            format!("Mode_{}", p.mode)
+                        } else {
+                            format!("{}_Mode{}", p.molecule.name, p.mode)
+                        },
+                        canonical_smiles: p.molecule.source_smiles.clone(),
+                        molecule: &p.molecule,
+                        vina_kcal: p.affinity_kcal_mol,
+                        hyde: h.as_ref(),
+                        cnn_score: None,
+                        mpo_score: None,
+                    })
+                    .collect();
+                let bw = detect_bridging_waters(
+                    &rec,
+                    gbox.center,
+                    0.5 * gbox.size[0].max(gbox.size[1]).max(gbox.size[2]),
+                    2,
+                );
+                let bundle = build_dockcraft_scene_bundle(
+                    &format!("{} — {} DockCraft ViewDockX", rec.name, lig.name),
+                    eval_rec,
+                    Some(receptor.display().to_string()),
+                    &pose_inputs,
+                    &BiomolBundleExtras {
+                        grid_box: Some(&gbox),
+                        constraints: &cfg.constraints,
+                        site_blueprint: blueprint_opt.as_ref(),
+                        selectivity: sel_opt.as_ref(),
+                        bridging_waters: &bw,
+                        ..Default::default()
+                    },
+                );
+                if let Some(par) = bundle_path.parent()
+                    && !par.as_os_str().is_empty()
+                {
+                    std::fs::create_dir_all(par)?;
+                }
+                std::fs::write(bundle_path, serde_json::to_string_pretty(&bundle)?)?;
+                eprintln!(
+                    "Wrote BiomolCraft ViewDockX bundle -> {}",
+                    bundle_path.display()
+                );
             }
             let modes: Vec<serde_json::Value> = report
                 .poses
@@ -2288,8 +2449,118 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let manifest = run_campaign(&parsed)?;
             println!("{}", manifest.render_markdown());
         }
-        Commands::LinkBiomol { pdb, dcd, module } => {
-            if let Some(d) = dcd {
+        Commands::LinkBiomol {
+            pdb,
+            dcd,
+            poses_sdf,
+            blueprint,
+            selectivity_json,
+            out_bundle,
+            launch,
+            module,
+        } => {
+            if let Some(sdf_p) = poses_sdf {
+                let mut rec = read_receptor_file(&pdb, true)?;
+                if let Some(stem) = pdb.file_stem().and_then(|s| s.to_str()) {
+                    rec.name = stem.to_string();
+                }
+                let raw_sdf = std::fs::read_to_string(&sdf_p)?;
+                let mut pose_mols: Vec<struct_core::Molecule3D> =
+                    parse_sdf_3d_with_limit(&raw_sdf, 50)
+                        .into_iter()
+                        .filter_map(Result::ok)
+                        .collect();
+                for m in &mut pose_mols {
+                    struct_core::perceive_all(m);
+                }
+                let bp_opt = if let Some(bp_p) = &blueprint {
+                    let s = std::fs::read_to_string(bp_p)?;
+                    Some(SiteBlueprint::from_json_str(&s)?)
+                } else {
+                    None
+                };
+                let sel_opt: Option<SelectivityReport> = if let Some(sp) = &selectivity_json {
+                    let s = std::fs::read_to_string(sp)?;
+                    serde_json::from_str(&s).ok()
+                } else {
+                    None
+                };
+                let hydes: Vec<Option<HydeReport>> = pose_mols
+                    .iter()
+                    .map(|m| score_pose_hyde(&rec, m).ok())
+                    .collect();
+                let vinas: Vec<f64> = pose_mols
+                    .iter()
+                    .map(|m| score_complex(&rec, m, ScoringFunction::Vina).total_affinity_kcal)
+                    .collect();
+                let pose_inputs: Vec<DockPoseInput<'_>> = pose_mols
+                    .iter()
+                    .enumerate()
+                    .map(|(i, m)| DockPoseInput {
+                        pose_id: i + 1,
+                        name: if m.name.trim().is_empty() {
+                            format!("Pose_{}", i + 1)
+                        } else {
+                            m.name.clone()
+                        },
+                        canonical_smiles: m.source_smiles.clone(),
+                        molecule: m,
+                        vina_kcal: vinas[i],
+                        hyde: hydes[i].as_ref(),
+                        cnn_score: None,
+                        mpo_score: None,
+                    })
+                    .collect();
+                let gbox = bp_opt.as_ref().map(|b| b.grid_box.clone()).or_else(|| {
+                    pose_mols
+                        .first()
+                        .and_then(|m| GridBox::from_ligand(m, 5.5).ok())
+                });
+                let bundle = build_dockcraft_scene_bundle(
+                    &format!("{} ViewDockX", rec.name),
+                    &rec,
+                    Some(pdb.display().to_string()),
+                    &pose_inputs,
+                    &BiomolBundleExtras {
+                        grid_box: gbox.as_ref(),
+                        site_blueprint: bp_opt.as_ref(),
+                        selectivity: sel_opt.as_ref(),
+                        trajectory_dcd_path: dcd.as_ref().map(|d| d.display().to_string()),
+                        ..Default::default()
+                    },
+                );
+                if let Some(ob) = &out_bundle {
+                    if let Some(par) = ob.parent()
+                        && !par.as_os_str().is_empty()
+                    {
+                        std::fs::create_dir_all(par)?;
+                    }
+                    std::fs::write(ob, serde_json::to_string_pretty(&bundle)?)?;
+                    println!(
+                        "Wrote ViewDockX bundle ({} poses) -> {}",
+                        bundle.poses.len(),
+                        ob.display()
+                    );
+                }
+                if launch {
+                    let rep = send_or_launch_biomolcraft(&rec.name, &bundle, None)?;
+                    println!(
+                        "ViewDockX delivered to BiomolCraft (live={}, launched={}, poses={}) -> {}",
+                        rep.pushed_live,
+                        rep.launched_new_instance,
+                        rep.pose_count,
+                        rep.bundle_path.display()
+                    );
+                } else if out_bundle.is_none() {
+                    let live = craftbio_scene::discover_craft_instances(None, Some("biomolcraft"))?;
+                    let target = live
+                        .first()
+                        .ok_or("no running BiomolCraft instance on Craft Link v1 (pass --launch or --out-bundle)")?;
+                    let reply =
+                        craftbio_scene::push_dockcraft_bundle_via_craft_link(target, &bundle)?;
+                    println!("Craft Link v1 → BiomolCraft ViewDockX: {reply}");
+                }
+            } else if let Some(d) = dcd {
                 let live = craftbio_scene::discover_craft_instances(None, Some("biomolcraft"))?;
                 let target = live
                     .first()
