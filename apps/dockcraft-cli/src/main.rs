@@ -712,6 +712,15 @@ enum Commands {
         #[arg(long)]
         init_template: Option<PathBuf>,
     },
+    /// Push a docked complex PDB (and optional OpenMM .dcd trajectory) live into BiomolCraft over Craft Link v1 (`craft-ipc`).
+    LinkBiomol {
+        #[arg(long)]
+        pdb: PathBuf,
+        #[arg(long)]
+        dcd: Option<PathBuf>,
+        #[arg(long)]
+        module: Option<String>,
+    },
     /// Start the hardened JSON-RPC 2.0 MCP server
     Mcp {
         #[arg(long)]
@@ -2278,6 +2287,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let parsed: CampaignSpec = serde_json::from_str(&raw)?;
             let manifest = run_campaign(&parsed)?;
             println!("{}", manifest.render_markdown());
+        }
+        Commands::LinkBiomol { pdb, dcd, module } => {
+            if let Some(d) = dcd {
+                let live = craftbio_scene::discover_craft_instances(None, Some("biomolcraft"))?;
+                let target = live
+                    .first()
+                    .ok_or("no running BiomolCraft instance on Craft Link v1")?;
+                let reply = craftbio_scene::send_trajectory_via_craft_link(
+                    target,
+                    "dockcraft",
+                    &pdb.display().to_string(),
+                    &d.display().to_string(),
+                )?;
+                println!("Craft Link v1 → BiomolCraft trajectory: {reply}");
+            } else {
+                let reply = craftbio_scene::push_pdb_to_live_biomolcraft(
+                    "dockcraft",
+                    &pdb.display().to_string(),
+                    module.as_deref(),
+                )?;
+                println!("Craft Link v1 → BiomolCraft: {reply}");
+            }
         }
         Commands::Mcp {
             read_root,

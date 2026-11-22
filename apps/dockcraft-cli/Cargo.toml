@@ -16,6 +16,7 @@ hyde-scorer = { path = "../../crates/hyde-scorer" }
 pharm-core = { path = "../../crates/pharm-core" }
 prot-prep = { path = "../../crates/prot-prep" }
 dock-pipeline = { path = "../../crates/dock-pipeline" }
+craftbio-scene = { path = "../../../craftbio-libs/crates/scene" }
 clap = { workspace = true }
 flate2 = { workspace = true }
 serde = { workspace = true }
