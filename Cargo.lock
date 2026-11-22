@@ -509,6 +509,7 @@ dependencies = [
 [[package]]
 name = "craftbio-scene"
 version = "0.2.0"
+source = "git+https://github.com/acs-foundry/craftbio-libs?tag=v0.2.0#39ceaf76991738fd6b56deacd4eecb4400b0bc79"
 dependencies = [
  "craft-ipc",
  "serde",
