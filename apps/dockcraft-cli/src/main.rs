@@ -11,15 +11,17 @@ use dock_engine::{
     score_complex,
 };
 use dock_pipeline::{
-    CampaignSpec, ChimeraXRest, DEFAULT_MAX_FILE_BYTES, FepBackend, FepConfig, GninaRescoreConfig,
-    LeadOptConfig, LeadOptMode, MdPlatform, MdValidateConfig, PathSandbox, SafetyPanelConfig,
-    SafetyPanelManifest, campaign_report_to_csv, check_fep_env, check_gnina_env, check_openmm_env,
+    CampaignSpec, ChimeraXRest, CoFoldBackend, CoFoldConfig, CoFoldEntity, DEFAULT_MAX_FILE_BYTES,
+    FepBackend, FepConfig, GninaRescoreConfig, HtmlDossierConfig, LeadOptConfig, LeadOptMode,
+    MdPlatform, MdValidateConfig, PathSandbox, SafetyPanelConfig, SafetyPanelManifest,
+    campaign_report_to_csv, check_cofold_env, check_fep_env, check_gnina_env, check_openmm_env,
     default_bowes_tier1_catalog, default_cdk2_campaign_template, default_chemcraft_results_dir,
     default_chimerax_export_dir, default_safety_panel_dir, default_safety_panel_manifest_path,
-    grid_box_from_chimerax_selection, is_chimerax_available, launch_chimerax_for_scene,
-    load_ligand_library_bytes, run_campaign, run_fep_network, run_gnina_rescore,
-    run_lead_optimization, run_md_validation, run_safety_panel, run_screening_campaign,
-    write_chimerax_session_bundle, write_results_sidecar,
+    extract_protein_sequences_from_mol, grid_box_from_chimerax_selection, is_chimerax_available,
+    launch_chimerax_for_scene, load_ligand_library_bytes, run_campaign, run_cofold_prediction,
+    run_fep_network, run_gnina_rescore, run_lead_optimization, run_md_validation, run_safety_panel,
+    run_screening_campaign, write_chimerax_session_bundle, write_interactive_html_dossier,
+    write_results_sidecar,
 };
 use flate2::read::GzDecoder;
 use hyde_scorer::{
@@ -74,6 +76,12 @@ enum CliLeadOptMode {
 enum CliFepBackend {
     Openmm,
     Openfe,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliCoFoldBackend {
+    Boltz,
+    Chai,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -616,6 +624,84 @@ enum Commands {
         /// Explicit path to the `gnina` binary
         #[arg(long)]
         gnina_bin: Option<PathBuf>,
+    },
+    /// Opt-in AI Co-Folding (Boltz-2 / Boltz-1 / Chai-1) for protein + ligand / peptide / multimer
+    /// complexes with automatic DockCraft PoseBusters + HYDE v2 + Torsion anti-hallucination gate
+    CoFold {
+        /// Probe whether the opt-in Boltz or Chai co-folding engine is installed and exit
+        #[arg(long)]
+        check_env: bool,
+        #[arg(long, value_enum, default_value_t = CliCoFoldBackend::Boltz)]
+        backend: CliCoFoldBackend,
+        /// Optional job name used for output manifests
+        #[arg(long, default_value = "cofold_complex")]
+        name: String,
+        /// Receptor PDB/mmCIF whose chain sequences are extracted automatically
+        #[arg(long)]
+        receptor_pdb: Option<PathBuf>,
+        /// Or explicit 1-letter protein amino-acid sequence (chain A)
+        #[arg(long)]
+        sequence: Option<String>,
+        /// Optional partner protein or peptide 1-letter sequence (chain B; supports peptide/biologic complexes)
+        #[arg(long)]
+        partner_sequence: Option<String>,
+        /// Optional small-molecule ligand SMILES (chain L)
+        #[arg(long)]
+        ligand_smiles: Option<String>,
+        /// Optional ion / cofactor CCD codes (e.g. `--ion ZN --ion MG`)
+        #[arg(long)]
+        ion: Vec<String>,
+        /// Optional reference crystal/docked ligand SDF for symmetry-aware RMSD comparison
+        #[arg(long)]
+        reference_ligand: Option<PathBuf>,
+        /// Disable Boltz-2 binding affinity head
+        #[arg(long)]
+        no_affinity: bool,
+        /// Allow online ColabFold MSA server (`--use_msa_server`)
+        #[arg(long)]
+        use_msa_server: bool,
+        /// Number of diffusion samples to generate
+        #[arg(long, default_value_t = 1)]
+        samples: usize,
+        /// Explicit path to `boltz` or `chai-lab` executable
+        #[arg(long)]
+        bin: Option<PathBuf>,
+        /// Emit Boltz YAML / Chai FASTA manifest without launching GPU co-folding
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long, default_value = "./cofold_run")]
+        out_dir: PathBuf,
+    },
+    /// Export a self-contained interactive 3D HTML scientific dossier (Mol* WebGL + offline Canvas 3D fallback)
+    /// uniting receptor, multi-analog ligand series, HYDE/PoseBusters, ΔMIF selectivity, MD/MM-GBSA, FEP & PK/PBPK
+    ExportHtml {
+        #[arg(long)]
+        receptor: PathBuf,
+        /// Docked pose SDF/MOL2/PDB or multi-analog congeneric series SDF (e.g. `lead_opt_series.sdf`)
+        #[arg(long)]
+        ligand: PathBuf,
+        #[arg(long, default_value = "DockCraft Interactive 3D Dossier")]
+        title: String,
+        /// Optional Ola 1 `selectivity_report.json`
+        #[arg(long)]
+        selectivity_json: Option<PathBuf>,
+        /// Optional Ola 2 `md_metrics.json`
+        #[arg(long)]
+        md_metrics: Option<PathBuf>,
+        /// Optional Ola 2 `fep_metrics.json`
+        #[arg(long)]
+        fep_metrics: Option<PathBuf>,
+        /// Optional Ola 3 AdmetCraft `pk_dose.json`
+        #[arg(long)]
+        pk_json: Option<PathBuf>,
+        /// Optional Ola 3 AdmetCraft `pk_profile.svg`
+        #[arg(long)]
+        pk_svg: Option<PathBuf>,
+        /// Skip embedding locally cached offline Mol* bundle (use CDN + Canvas3D fallback)
+        #[arg(long)]
+        no_offline_molstar: bool,
+        #[arg(long)]
+        out: PathBuf,
     },
     /// Run a fully reproducible 7-stage SBDD -> ADMET -> MD -> Retrosynthesis campaign with SHA-256 provenance
     Campaign {
@@ -2053,6 +2139,126 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             let rep = run_gnina_rescore(&cfg, Some(&rec))?;
             println!("{}", rep.render_markdown());
+        }
+        Commands::CoFold {
+            check_env,
+            backend,
+            name,
+            receptor_pdb,
+            sequence,
+            partner_sequence,
+            ligand_smiles,
+            ion,
+            reference_ligand,
+            no_affinity,
+            use_msa_server,
+            samples,
+            bin,
+            dry_run,
+            out_dir,
+        } => {
+            let be = match backend {
+                CliCoFoldBackend::Boltz => CoFoldBackend::Boltz,
+                CliCoFoldBackend::Chai => CoFoldBackend::Chai,
+            };
+            if check_env {
+                let st = check_cofold_env(be, bin.as_deref());
+                println!("{}", serde_json::to_string_pretty(&st)?);
+                return Ok(());
+            }
+            let mut entities: Vec<CoFoldEntity> = Vec::new();
+            if let Some(seq) = sequence {
+                entities.push(CoFoldEntity::Protein {
+                    chain_id: "A".to_string(),
+                    sequence: seq.trim().to_ascii_uppercase(),
+                });
+            } else if let Some(rp) = receptor_pdb {
+                let rec = read_receptor_file(&rp, true)?;
+                for (cid, seq) in extract_protein_sequences_from_mol(&rec) {
+                    entities.push(CoFoldEntity::Protein {
+                        chain_id: cid,
+                        sequence: seq,
+                    });
+                }
+            }
+            if let Some(pseq) = partner_sequence {
+                entities.push(CoFoldEntity::Protein {
+                    chain_id: "P".to_string(),
+                    sequence: pseq.trim().to_ascii_uppercase(),
+                });
+            }
+            if let Some(smi) = ligand_smiles {
+                entities.push(CoFoldEntity::LigandSmiles {
+                    chain_id: "L".to_string(),
+                    smiles: smi.trim().to_string(),
+                });
+            }
+            for (ii, ccd) in ion.iter().enumerate() {
+                entities.push(CoFoldEntity::IonOrCcd {
+                    chain_id: format!("I{}", ii + 1),
+                    ccd_code: ccd.trim().to_ascii_uppercase(),
+                });
+            }
+            let cfg = CoFoldConfig {
+                job_name: name,
+                backend: be,
+                entities,
+                predict_affinity: !no_affinity,
+                use_msa_server,
+                diffusion_samples: samples,
+                reference_ligand_path: reference_ligand,
+                bin_override: bin,
+                dry_run,
+                out_dir,
+            };
+            let rep = run_cofold_prediction(&cfg)?;
+            println!("{}", rep.render_markdown());
+        }
+        Commands::ExportHtml {
+            receptor,
+            ligand,
+            title,
+            selectivity_json,
+            md_metrics,
+            fep_metrics,
+            pk_json,
+            pk_svg,
+            no_offline_molstar,
+            out,
+        } => {
+            let mut rec = read_receptor_file(&receptor, true)?;
+            if let Some(stem) = receptor.file_stem().and_then(|s| s.to_str()) {
+                rec.name = stem.to_string();
+            }
+            let lig_raw = std::fs::read_to_string(&ligand)?;
+            let ext = ligand
+                .extension()
+                .and_then(|s| s.to_str())
+                .unwrap_or("sdf")
+                .to_ascii_lowercase();
+            let mut ligs: Vec<struct_core::Molecule3D> = match ext.as_str() {
+                "pdbqt" => vec![parse_pdbqt(&lig_raw)?],
+                "mol2" => vec![parse_mol2(&lig_raw)?],
+                "pdb" => vec![parse_pdb(&lig_raw, true)?],
+                _ => parse_sdf_3d_with_limit(&lig_raw, 30)
+                    .into_iter()
+                    .filter_map(Result::ok)
+                    .collect(),
+            };
+            for m in &mut ligs {
+                struct_core::perceive_all(m);
+            }
+            let cfg = HtmlDossierConfig {
+                title,
+                selectivity_json,
+                md_metrics_json: md_metrics,
+                fep_metrics_json: fep_metrics,
+                pk_dose_json: pk_json,
+                pk_svg_path: pk_svg,
+                offline_embed_molstar: !no_offline_molstar,
+            };
+            let summary = write_interactive_html_dossier(&rec, &ligs, &cfg, &out)?;
+            println!("{}", serde_json::to_string_pretty(&summary)?);
         }
         Commands::Campaign {
             spec,

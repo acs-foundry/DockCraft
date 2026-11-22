@@ -5,8 +5,10 @@ pub mod campaign;
 pub mod chimerax;
 pub mod chimerax_rest;
 pub mod cnn_rescore;
+pub mod cofold_bridge;
 pub mod export;
 pub mod fep_bridge;
+pub mod html_viewer;
 pub mod lead_opt;
 pub mod md_validate;
 pub mod orchestrator;
@@ -33,6 +35,13 @@ pub use cnn_rescore::{
     check_gnina_env, compute_3way_consensus_kcal, parse_gnina_sdf_output, resolve_gnina_binary,
     run_gnina_rescore,
 };
+pub use cofold_bridge::{
+    CoFoldAuditReport, CoFoldBackend, CoFoldConfidence, CoFoldConfig, CoFoldEntity,
+    CoFoldEnvStatus, CoFoldError, CoFoldVerdict, audit_cofold_prediction, check_cofold_env,
+    extract_protein_sequences_from_mol, parse_cofold_confidence, render_boltz_yaml,
+    render_chai_fasta, res3_to_aa1, resolve_cofold_binary, run_cofold_prediction,
+    split_complex_receptor_and_ligand,
+};
 pub use export::{
     InteropSceneBundle, SceneExportRequest, build_chimerax_export, build_pymol_export,
     canonical_export_target, write_sandboxed_scene_package,
@@ -41,6 +50,10 @@ pub use fep_bridge::{
     FepBackend, FepConfig, FepCycleClosure, FepEdgeResult, FepEnvStatus, FepError, FepLegResult,
     FepReport, RbfePlannedEdge, check_fep_env, compute_cycle_closures, plan_rbfe_network,
     run_fep_network,
+};
+pub use html_viewer::{
+    HtmlDossierConfig, HtmlDossierSummary, HtmlExportError, build_interactive_html_dossier,
+    escape_html, write_interactive_html_dossier,
 };
 pub use lead_opt::{
     LeadOptAnalog, LeadOptConfig, LeadOptError, LeadOptMode, LeadOptReport, run_lead_optimization,

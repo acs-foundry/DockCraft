@@ -11,7 +11,7 @@
 # then packaging/install.sh, or regenerate the tarball and rerun makepkg here.
 pkgname=dockcraft-bin
 _pkgname=dockcraft
-pkgver=0.7.0
+pkgver=0.8.0
 pkgrel=1
 pkgdesc="Pure-Rust virtual screening (PyRx/Vina/Vinardo) and HYDE-style 3D structure-based design workstation (prebuilt)"
 arch=('x86_64')
@@ -22,7 +22,7 @@ conflicts=("$_pkgname")
 # Prebuilt binaries: let makepkg leave them alone.
 options=('!strip' '!debug')
 source=("$_pkgname-$pkgver-linux-x86_64.tar.gz::file://${startdir}/../dist/$_pkgname-$pkgver-linux-x86_64.tar.gz")
-sha256sums=('c4f66a951a88c116d6111d8f1c45381a7a1db29776a910aa62c11469bc76544c')
+sha256sums=('296d22c279115c19d02ab2bd3c577715e15f2b3050a9994e223c2ad6f1cf87b0')
 
 package() {
     cd "$srcdir/$_pkgname-$pkgver-linux-x86_64"

@@ -8,12 +8,15 @@ use std::time::{Duration, Instant};
 
 use dock_engine::{DockingConfig, ScoringFunction, dock_ligand};
 use dock_pipeline::{
-    AntiTargetEntry, DEFAULT_MAX_FILE_BYTES, GninaRescoreConfig, LeadOptConfig, LeadOptMode,
-    LoadedAntiTarget, PathSandbox, SafetyPanelConfig, SceneExportRequest, build_chimerax_md_script,
-    campaign_report_to_csv, canonical_export_target, check_fep_env, check_gnina_env,
-    check_openmm_env, load_ligand_library_bytes, plan_rbfe_network, run_gnina_rescore,
-    run_lead_optimization, run_safety_panel_loaded, run_screening_campaign,
-    write_chimerax_session_bundle, write_sandboxed_scene_package,
+    AntiTargetEntry, CoFoldBackend, CoFoldEntity, DEFAULT_MAX_FILE_BYTES, GninaRescoreConfig,
+    HtmlDossierConfig, LeadOptConfig, LeadOptMode, LoadedAntiTarget, PathSandbox,
+    SafetyPanelConfig, SceneExportRequest, build_chimerax_md_script,
+    build_interactive_html_dossier, campaign_report_to_csv, canonical_export_target,
+    check_cofold_env, check_fep_env, check_gnina_env, check_openmm_env,
+    extract_protein_sequences_from_mol, load_ligand_library_bytes, plan_rbfe_network,
+    render_boltz_yaml, render_chai_fasta, run_gnina_rescore, run_lead_optimization,
+    run_safety_panel_loaded, run_screening_campaign, write_chimerax_session_bundle,
+    write_sandboxed_scene_package,
 };
 use hyde_scorer::{SubstituentPreset, mutate_and_minimize_in_pocket, score_pose_hyde};
 use pharm_core::{
@@ -480,6 +483,54 @@ fn tool_definitions() -> Value {
                 "required": ["env_status"],
                 "properties": {
                     "env_status": { "type": "object" }
+                }
+            }
+        },
+        {
+            "name": "prepare_cofold_prediction",
+            "description": "Probes opt-in Boltz-2/Chai-1 co-folding availability, extracts protein sequences from a sandboxed PDB/mmCIF (or explicit sequence/partner peptide), and stages a native Boltz YAML or Chai FASTA manifest inside write_root.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "backend": { "type": "string", "enum": ["boltz", "chai"] },
+                    "receptor_path": { "type": "string" },
+                    "sequence": { "type": "string" },
+                    "partner_sequence": { "type": "string" },
+                    "ligand_smiles": { "type": "string" },
+                    "predict_affinity": { "type": "boolean" },
+                    "out_manifest_path": { "type": "string" }
+                }
+            },
+            "outputSchema": {
+                "type": "object",
+                "required": ["env_status", "entity_count", "manifest"],
+                "properties": {
+                    "env_status": { "type": "object" },
+                    "entity_count": { "type": "integer" },
+                    "manifest": { "type": "string" }
+                }
+            }
+        },
+        {
+            "name": "export_interactive_html",
+            "description": "Exports a self-contained XSS-safe interactive 3D HTML scientific dossier (Mol* WebGL + offline Canvas 3D fallback) uniting receptor, multi-pose ligand series, HYDE/PoseBusters, and optional selectivity/MD/FEP/PK JSONs inside write_root.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["receptor_path", "ligand_path", "out_html_path"],
+                "properties": {
+                    "receptor_path": { "type": "string" },
+                    "ligand_path": { "type": "string" },
+                    "title": { "type": "string" },
+                    "out_html_path": { "type": "string" }
+                }
+            },
+            "outputSchema": {
+                "type": "object",
+                "required": ["out_path", "bytes", "poses_embedded"],
+                "properties": {
+                    "out_path": { "type": "string" },
+                    "bytes": { "type": "integer" },
+                    "poses_embedded": { "type": "integer" }
                 }
             }
         }
@@ -1530,6 +1581,113 @@ fn handle_tool_call(
                 "report": report,
             }))
         }
+        "prepare_cofold_prediction" => {
+            let backend = match args.get("backend").and_then(|v| v.as_str()) {
+                Some("chai") => CoFoldBackend::Chai,
+                _ => CoFoldBackend::Boltz,
+            };
+            let env_status = check_cofold_env(backend, None);
+            let mut entities = Vec::new();
+            if let Some(seq) = args.get("sequence").and_then(|v| v.as_str()) {
+                entities.push(CoFoldEntity::Protein {
+                    chain_id: "A".to_string(),
+                    sequence: seq.trim().to_ascii_uppercase(),
+                });
+            } else if let Some(rp) = args.get("receptor_path").and_then(|v| v.as_str()) {
+                let raw = sandbox
+                    .read_string(Path::new(rp))
+                    .map_err(|e| (-32602, e.to_string()))?;
+                let rec =
+                    parse_receptor_by_path(Path::new(rp), &raw, true).map_err(|e| (-32602, e))?;
+                for (cid, seq) in extract_protein_sequences_from_mol(&rec) {
+                    entities.push(CoFoldEntity::Protein {
+                        chain_id: cid,
+                        sequence: seq,
+                    });
+                }
+            }
+            if let Some(pseq) = args.get("partner_sequence").and_then(|v| v.as_str()) {
+                entities.push(CoFoldEntity::Protein {
+                    chain_id: "P".to_string(),
+                    sequence: pseq.trim().to_ascii_uppercase(),
+                });
+            }
+            if let Some(smi) = args.get("ligand_smiles").and_then(|v| v.as_str()) {
+                entities.push(CoFoldEntity::LigandSmiles {
+                    chain_id: "L".to_string(),
+                    smiles: smi.trim().to_string(),
+                });
+            }
+            let pred_aff = args
+                .get("predict_affinity")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            let manifest = match backend {
+                CoFoldBackend::Boltz => render_boltz_yaml(&entities, pred_aff),
+                CoFoldBackend::Chai => render_chai_fasta(&entities),
+            };
+            if let Some(out_m) = args.get("out_manifest_path").and_then(|v| v.as_str()) {
+                sandbox
+                    .write_string(Path::new(out_m), &manifest)
+                    .map_err(|e| (-32602, e.to_string()))?;
+            }
+            Ok(json!({
+                "env_status": env_status,
+                "backend": backend.as_str(),
+                "entity_count": entities.len(),
+                "manifest": manifest,
+            }))
+        }
+        "export_interactive_html" => {
+            let rec_path = args
+                .get("receptor_path")
+                .and_then(|v| v.as_str())
+                .ok_or((-32602, "missing 'receptor_path'".to_string()))?;
+            let lig_path = args
+                .get("ligand_path")
+                .and_then(|v| v.as_str())
+                .ok_or((-32602, "missing 'ligand_path'".to_string()))?;
+            let out_html = args
+                .get("out_html_path")
+                .and_then(|v| v.as_str())
+                .ok_or((-32602, "missing 'out_html_path'".to_string()))?;
+            let rec_raw = sandbox
+                .read_string(Path::new(rec_path))
+                .map_err(|e| (-32602, e.to_string()))?;
+            let rec = parse_receptor_by_path(Path::new(rec_path), &rec_raw, true)
+                .map_err(|e| (-32602, e))?;
+            let lig_raw = sandbox
+                .read_string(Path::new(lig_path))
+                .map_err(|e| (-32602, e.to_string()))?;
+            let mut ligs: Vec<Molecule3D> = parse_sdf_3d_with_limit(&lig_raw, 20)
+                .into_iter()
+                .filter_map(Result::ok)
+                .collect();
+            if ligs.is_empty() {
+                ligs.push(parse_single_ligand(sandbox, args).map_err(|e| (-32602, e))?);
+            } else {
+                for m in &mut ligs {
+                    struct_core::perceive_all(m);
+                }
+            }
+            let title = args
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or("DockCraft Interactive 3D Dossier")
+                .to_string();
+            let cfg = HtmlDossierConfig {
+                title,
+                offline_embed_molstar: false,
+                ..Default::default()
+            };
+            let (html, mut summary) = build_interactive_html_dossier(&rec, &ligs, &cfg)
+                .map_err(|e| (-32000, e.to_string()))?;
+            sandbox
+                .write_string(Path::new(out_html), &html)
+                .map_err(|e| (-32602, e.to_string()))?;
+            summary.out_path = out_html.to_string();
+            serde_json::to_value(&summary).map_err(|e| (-32000, e.to_string()))
+        }
         other => Err((-32601, format!("unknown tool '{other}'"))),
     }
 }
@@ -2141,6 +2299,43 @@ mod tests {
         )
         .ok_or("expected response")?;
         assert_eq!(cnn_esc["error"]["code"], -32602);
+
+        // 7e. Ola 3 MCP tools: prepare_cofold_prediction & export_interactive_html + escape check
+        let cf_resp = handle_mcp_line(
+            &sandbox,
+            &mut state,
+            r#"{"jsonrpc":"2.0","id":82,"method":"tools/call","params":{"name":"prepare_cofold_prediction","arguments":{"backend":"boltz","receptor_path":"pocket.pdb","ligand_smiles":"CCO","out_manifest_path":"cofold.yaml"}}}"#,
+        )
+        .ok_or("expected response")?;
+        assert!(
+            cf_resp["result"]["structuredContent"]["manifest"]
+                .as_str()
+                .unwrap_or("")
+                .contains("version: 1")
+        );
+        assert!(wdir.join("cofold.yaml").exists());
+
+        let html_resp = handle_mcp_line(
+            &sandbox,
+            &mut state,
+            r#"{"jsonrpc":"2.0","id":83,"method":"tools/call","params":{"name":"export_interactive_html","arguments":{"receptor_path":"pocket.pdb","ligand_path":"lead_series.sdf","title":"MCP Dossier","out_html_path":"dossier.html"}}}"#,
+        )
+        .ok_or("expected response")?;
+        assert!(
+            html_resp["result"]["structuredContent"]["poses_embedded"]
+                .as_u64()
+                .unwrap_or(0)
+                >= 1
+        );
+        assert!(wdir.join("dossier.html").exists());
+
+        let html_esc = handle_mcp_line(
+            &sandbox,
+            &mut state,
+            r#"{"jsonrpc":"2.0","id":84,"method":"tools/call","params":{"name":"export_interactive_html","arguments":{"receptor_path":"escape.pdb","ligand_path":"lead_series.sdf","out_html_path":"bad.html"}}}"#,
+        )
+        .ok_or("expected response")?;
+        assert_eq!(html_esc["error"]["code"], -32602);
 
         // 8. Reject oversized 200^3 A box DoS immediately
         let huge_box = handle_mcp_line(

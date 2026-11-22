@@ -107,6 +107,12 @@ pub struct CampaignSpec {
     /// Whether to stage optional Stage 6c RBFE/FEP perturbation bundles (`--dry-run`) on `lead_opt_series.sdf`.
     #[serde(default)]
     pub stage_fep: bool,
+    /// Whether to run optional Stage 7b Human PK/PBPK dose estimation (`admetcraft-cli pk-dose`).
+    #[serde(default)]
+    pub run_pk_dose: bool,
+    /// Whether to generate optional Stage 8 self-contained interactive 3D HTML dossier (`CAMPAIGN_VIEWER.html`).
+    #[serde(default)]
+    pub export_html: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -358,6 +364,8 @@ pub fn default_cdk2_campaign_template() -> CampaignSpec {
         rescore_cnn: false,
         run_lead_opt: false,
         stage_fep: false,
+        run_pk_dose: false,
+        export_html: false,
     }
 }
 
@@ -1244,6 +1252,115 @@ pub fn run_campaign(spec: &CampaignSpec) -> Result<CampaignManifest, Orchestrato
             summary: "chemcraft-cli not found on PATH".to_string(),
             outputs: Vec::new(),
         });
+    }
+
+    // --- OPTIONAL STAGE 7b: Human PK / Minimal-PBPK Dose Estimation ---
+    let mut pk_json_path: Option<PathBuf> = None;
+    let mut pk_svg_path: Option<PathBuf> = None;
+    if spec.run_pk_dose
+        && let Some(ac) = &admet_cli
+        && let Some(top_lead) = final_leads.first()
+        && !top_lead.smiles.trim().is_empty()
+    {
+        let t7b = Instant::now();
+        let pk_dir = spec.out_dir.join("07b_pk_dose");
+        std::fs::create_dir_all(&pk_dir)?;
+        let out_j = pk_dir.join("pk_dose.json");
+        let out_s = pk_dir.join("pk_profile.svg");
+        let out_m = pk_dir.join("pk_dose.md");
+        let dg = top_lead.dock_affinity_kcal.unwrap_or(-10.5);
+        let mut cmd7b = Command::new(ac);
+        cmd7b
+            .args([
+                "pk-dose",
+                &top_lead.smiles,
+                "--name",
+                &top_lead.name,
+                "--dg-kcal",
+                &format!("{dg:.2}"),
+                "--tpp",
+                &spec.tpp_profile,
+            ])
+            .arg("--out-json")
+            .arg(&out_j)
+            .arg("--out-svg")
+            .arg(&out_s)
+            .arg("--out-md")
+            .arg(&out_m);
+        if run_checked_cmd("07b_pk_dose", &mut cmd7b).is_ok() {
+            pk_json_path = Some(out_j.clone());
+            pk_svg_path = Some(out_s.clone());
+            stages.push(StageRecord {
+                stage_number: 7,
+                stage_id: "pk-dose".to_string(),
+                tool: "admetcraft-cli pk-dose".to_string(),
+                verdict: GateVerdict::Go,
+                elapsed_ms: t7b.elapsed().as_millis(),
+                summary: format!(
+                    "Simulated IVIVE -> Minimal-PBPK human dose for top lead '{}'",
+                    top_lead.name
+                ),
+                outputs: collect_provenance(&[
+                    ("Human PK/PBPK JSON", &out_j),
+                    ("Human PK Curve SVG", &out_s),
+                    ("Human PK Report MD", &out_m),
+                ]),
+            });
+        }
+    }
+
+    // --- OPTIONAL STAGE 8: Self-Contained Interactive 3D HTML Dossier (Mol* + Canvas3D) ---
+    if spec.export_html && lig_pose_src.exists() {
+        let t8 = Instant::now();
+        let html_out = spec.out_dir.join("CAMPAIGN_VIEWER.html");
+        let series_or_pose = lead_opt_series_path
+            .clone()
+            .filter(|p| p.exists())
+            .unwrap_or_else(|| lig_pose_src.clone());
+        let mut cmd8 = Command::new(&dock_cli);
+        cmd8.args(["export-html", "--receptor"])
+            .arg(&prep_pdb)
+            .arg("--ligand")
+            .arg(&series_or_pose)
+            .args([
+                "--title",
+                &format!("{} — {}", spec.campaign_name, spec.target_name),
+            ])
+            .arg("--out")
+            .arg(&html_out);
+        let sel_j = spec.out_dir.join("02b_selectivity/selectivity_report.json");
+        if sel_j.exists() {
+            cmd8.arg("--selectivity-json").arg(&sel_j);
+        }
+        if let Some(top_lead) = final_leads.first() {
+            let md_j = md_root.join(&top_lead.name).join("md_metrics.json");
+            if md_j.exists() {
+                cmd8.arg("--md-metrics").arg(&md_j);
+            }
+        }
+        let fep_j = spec.out_dir.join("06c_fep_rbfe/fep_metrics.json");
+        if fep_j.exists() {
+            cmd8.arg("--fep-metrics").arg(&fep_j);
+        }
+        if let Some(pj) = &pk_json_path {
+            cmd8.arg("--pk-json").arg(pj);
+        }
+        if let Some(ps) = &pk_svg_path {
+            cmd8.arg("--pk-svg").arg(ps);
+        }
+        if run_checked_cmd("08_export_html", &mut cmd8).is_ok() {
+            stages.push(StageRecord {
+                stage_number: 8,
+                stage_id: "export-html".to_string(),
+                tool: "dockcraft-cli export-html".to_string(),
+                verdict: GateVerdict::Go,
+                elapsed_ms: t8.elapsed().as_millis(),
+                summary:
+                    "Generated self-contained interactive 3D HTML dossier (Mol* + offline Canvas3D)"
+                        .to_string(),
+                outputs: collect_provenance(&[("Interactive 3D HTML Dossier", &html_out)]),
+            });
+        }
     }
 
     let ts = SystemTime::now()
