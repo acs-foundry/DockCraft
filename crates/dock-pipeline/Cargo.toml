@@ -15,6 +15,7 @@ dock-engine = { path = "../dock-engine" }
 hyde-scorer = { path = "../hyde-scorer" }
 pharm-core = { path = "../pharm-core" }
 craftbio-scene = { workspace = true }
+craftbio-report = { workspace = true }
 rustix = { workspace = true }
 flate2 = { workspace = true }
 csv = { workspace = true }

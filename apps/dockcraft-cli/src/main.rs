@@ -18,12 +18,12 @@ use dock_pipeline::{
     check_cofold_env, check_fep_env, check_gnina_env, check_openmm_env,
     default_bowes_tier1_catalog, default_cdk2_campaign_template, default_chemcraft_results_dir,
     default_chimerax_export_dir, default_safety_panel_dir, default_safety_panel_manifest_path,
-    extract_protein_sequences_from_mol, grid_box_from_biomolcraft_selection,
-    grid_box_from_chimerax_selection, is_chimerax_available, launch_chimerax_for_scene,
-    load_ligand_library_bytes, run_campaign, run_cofold_prediction, run_fep_network,
-    run_gnina_rescore, run_lead_optimization, run_md_validation, run_safety_panel,
-    run_screening_campaign, send_or_launch_biomolcraft, write_chimerax_session_bundle,
-    write_interactive_html_dossier, write_results_sidecar,
+    export_dockcraft_artcraft_report, extract_protein_sequences_from_mol,
+    grid_box_from_biomolcraft_selection, grid_box_from_chimerax_selection, is_chimerax_available,
+    launch_chimerax_for_scene, load_ligand_library_bytes, run_campaign, run_cofold_prediction,
+    run_fep_network, run_gnina_rescore, run_lead_optimization, run_md_validation, run_safety_panel,
+    run_screening_campaign, send_or_launch_biomolcraft, write_biomol_session_zip,
+    write_chimerax_session_bundle, write_interactive_html_dossier, write_results_sidecar,
 };
 use flate2::read::GzDecoder;
 use hyde_scorer::{
@@ -472,6 +472,9 @@ enum Commands {
         /// Optional rich BiomolCraft ViewDockX JSON bundle (receptor + all poses + HYDE coronas + torsion lights + interactions + pharmacophores + ΔMIF + GridBox)
         #[arg(long)]
         out_dock_bundle: Option<PathBuf>,
+        /// Optional CRC-32 verified portable `.biomol.zip` session directly openable in BiomolCraft v1.0+
+        #[arg(long)]
+        out_biomol_zip: Option<PathBuf>,
     },
     /// Score a docked complex with Vina + HYDE per-atom desolvation/H-bond/steric breakdown
     ScorePose {
@@ -745,6 +748,12 @@ enum Commands {
         selectivity_json: Option<PathBuf>,
         #[arg(long)]
         out_bundle: Option<PathBuf>,
+        /// Optional CRC-32 verified portable `.biomol.zip` session for BiomolCraft v1.0+
+        #[arg(long)]
+        out_biomol_zip: Option<PathBuf>,
+        /// Optional ArtCraft Suite report directory (renders 3D ViewDockX PNG + WordCraft .docx + DeckCraft .pptx + GridCraft .xlsx)
+        #[arg(long)]
+        out_artcraft_dir: Option<PathBuf>,
         #[arg(long)]
         launch: bool,
         #[arg(long)]
@@ -1812,6 +1821,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             covalent,
             out_sdf,
             out_dock_bundle,
+            out_biomol_zip,
         } => {
             let blueprint_opt = if let Some(pf) = &pharmacophore_file {
                 let raw_bp = std::fs::read_to_string(pf)?;
@@ -1958,7 +1968,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     report.poses.iter().map(|p| &p.molecule).collect();
                 std::fs::write(sdf_path, write_sdf_3d(&pose_refs))?;
             }
-            if let Some(bundle_path) = &out_dock_bundle {
+            if out_dock_bundle.is_some() || out_biomol_zip.is_some() {
                 let eval_rec = report.flex_receptor.as_ref().unwrap_or(&rec);
                 let sel_opt: Option<SelectivityReport> = if let Some(sp) = &selectivity_json {
                     let raw_sel = std::fs::read_to_string(sp)?;
@@ -2010,16 +2020,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         ..Default::default()
                     },
                 );
-                if let Some(par) = bundle_path.parent()
-                    && !par.as_os_str().is_empty()
-                {
-                    std::fs::create_dir_all(par)?;
+                if let Some(bundle_path) = &out_dock_bundle {
+                    if let Some(par) = bundle_path.parent()
+                        && !par.as_os_str().is_empty()
+                    {
+                        std::fs::create_dir_all(par)?;
+                    }
+                    std::fs::write(bundle_path, serde_json::to_string_pretty(&bundle)?)?;
+                    eprintln!(
+                        "Wrote BiomolCraft ViewDockX bundle -> {}",
+                        bundle_path.display()
+                    );
                 }
-                std::fs::write(bundle_path, serde_json::to_string_pretty(&bundle)?)?;
-                eprintln!(
-                    "Wrote BiomolCraft ViewDockX bundle -> {}",
-                    bundle_path.display()
-                );
+                if let Some(zip_path) = &out_biomol_zip {
+                    let bytes = write_biomol_session_zip(&bundle, zip_path)?;
+                    eprintln!(
+                        "Wrote verified portable BiomolCraft session -> {} ({bytes} bytes)",
+                        zip_path.display()
+                    );
+                }
             }
             let modes: Vec<serde_json::Value> = report
                 .poses
@@ -2456,6 +2475,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             blueprint,
             selectivity_json,
             out_bundle,
+            out_biomol_zip,
+            out_artcraft_dir,
             launch,
             module,
         } => {
@@ -2542,6 +2563,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         ob.display()
                     );
                 }
+                if let Some(zp) = &out_biomol_zip {
+                    let bytes = write_biomol_session_zip(&bundle, zp)?;
+                    println!(
+                        "Wrote verified portable .biomol.zip session ({} poses, {bytes} bytes) -> {}",
+                        bundle.poses.len(),
+                        zp.display()
+                    );
+                }
+                if let Some(ad) = &out_artcraft_dir {
+                    let sum = export_dockcraft_artcraft_report(&bundle, ad)?;
+                    println!(
+                        "Exported DockCraft ArtCraft report -> {} (DOCX={:?}, PPTX={:?}, XLSX={:?})",
+                        sum.out_dir, sum.wordcraft_docx, sum.deckcraft_pptx, sum.gridcraft_xlsx
+                    );
+                }
                 if launch {
                     let rep = send_or_launch_biomolcraft(&rec.name, &bundle, None)?;
                     println!(
@@ -2551,7 +2587,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         rep.pose_count,
                         rep.bundle_path.display()
                     );
-                } else if out_bundle.is_none() {
+                } else if out_bundle.is_none()
+                    && out_biomol_zip.is_none()
+                    && out_artcraft_dir.is_none()
+                {
                     let live = craftbio_scene::discover_craft_instances(None, Some("biomolcraft"))?;
                     let target = live
                         .first()

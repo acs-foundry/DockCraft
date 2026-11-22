@@ -3,13 +3,16 @@
 //! Native Bidirectional **`DockCraft ↔ BiomolCraft`** Craft Link v1 Bridge (`ViewDockX` +
 //! Synchronous 3D `GridBox` Selection over authenticated Unix sockets — supersedes Flatpak ChimeraX HTTP).
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
+use craftbio_report::{ArtCraftBundleSummary, export_artcraft_bundle};
 use craftbio_scene::{
-    DockCraftSceneBundle, DockPoseEntry, GridBox3D, HydeAtomCorona, LineOverlay, ProvenanceEntry,
-    ProvenanceKind, SphereOverlay, TorsionBondLight, discover_and_request_selection_box,
-    discover_craft_instances, push_dockcraft_bundle_via_craft_link,
+    ColorScheme, DockCraftSceneBundle, DockPoseEntry, GridBox3D, HydeAtomCorona, LightingPreset,
+    LineOverlay, ProvenanceEntry, ProvenanceKind, RepresentationKind, SphereOverlay,
+    TorsionBondLight, discover_and_request_selection_box, discover_craft_instances,
+    push_dockcraft_bundle_via_craft_link, write_verified_zip,
 };
 use dock_engine::{DockingConstraint, PharmacophoreKind};
 use hyde_scorer::{HydeReport, InteractionKind, TorsionStatus, consensus_affinity_kcal};
@@ -452,6 +455,287 @@ pub fn grid_box_from_biomolcraft_selection(
     })
 }
 
+fn render_viewdock_markdown(bundle: &DockCraftSceneBundle) -> String {
+    let mut md = format!(
+        "## DockCraft ViewDockX Summary — {}\n\n- **Receptor:** `{}`\n- **Docked Poses:** `{}`\n- **Pharmacophore Spheres:** `{}` | **ΔMIF Selectivity Hotspots:** `{}` | **Bridging Waters:** `{}`\n\n",
+        bundle.title,
+        bundle.receptor_name,
+        bundle.poses.len(),
+        bundle.pharmacophore_spheres.len(),
+        bundle.selectivity_dmif_hotspots.len(),
+        bundle.bridging_waters.len()
+    );
+    if !bundle.poses.is_empty() {
+        md.push_str(
+            "| Pose | Name | Vina (kcal/mol) | HYDE (kcal/mol) | Consensus | Est. Ki (nM) | LE | PoseBusters |\n|---:|---|---:|---:|---:|---:|---:|---|\n",
+        );
+        for p in bundle.poses.iter().take(25) {
+            let hyde_s = p
+                .hyde_kcal
+                .map_or_else(|| "—".to_string(), |v| format!("{v:.2}"));
+            let cons_s = p
+                .consensus_kcal
+                .map_or_else(|| "—".to_string(), |v| format!("{v:.2}"));
+            let ki_s = p
+                .estimated_ki_nm
+                .map_or_else(|| "—".to_string(), |v| format!("{v:.1}"));
+            let le_s = p
+                .ligand_efficiency
+                .map_or_else(|| "—".to_string(), |v| format!("{v:.2}"));
+            let pb_s = p.posebusters_summary.as_deref().unwrap_or("—");
+            let _ = writeln!(
+                md,
+                "| {} | `{}` | {:.2} | {} | {} | {} | {} | {} |",
+                p.pose_id, p.name, p.vina_kcal, hyde_s, cons_s, ki_s, le_s, pb_s
+            );
+        }
+    }
+    md
+}
+
+/// Write a CRC-32 verified portable `.biomol.zip` session directly from a `DockCraftSceneBundle`
+/// so `BiomolCraft v1.0+` opens the receptor, docked poses, HYDE coronas, torsion traffic-lights,
+/// pharmacophores, ΔMIF hotspots, bridging waters, and `GridBox` natively in 1 file.
+pub fn write_biomol_session_zip(
+    bundle: &DockCraftSceneBundle,
+    out_path: &Path,
+) -> Result<usize, BiomolLinkError> {
+    let rec_pdb = if let Some(ref txt) = bundle.receptor_pdb_inline
+        && !txt.trim().is_empty()
+    {
+        txt.clone()
+    } else if let Some(ref p) = bundle.receptor_pdb_path {
+        std::fs::read_to_string(p)?
+    } else {
+        return Err(BiomolLinkError::Link(
+            "DockCraftSceneBundle missing receptor PDB for .biomol.zip export".to_string(),
+        ));
+    };
+
+    let atom_count = rec_pdb
+        .lines()
+        .filter(|l| l.starts_with("ATOM  ") || l.starts_with("HETATM"))
+        .count();
+
+    let (target, distance) = if let Some(gb) = bundle.grid_box {
+        let span = gb.size[0].max(gb.size[1]).max(gb.size[2]).max(12.0);
+        (
+            [
+                gb.center[0] as f32,
+                gb.center[1] as f32,
+                gb.center[2] as f32,
+            ],
+            (span as f32 * 1.65).clamp(18.0, 90.0),
+        )
+    } else {
+        ([0.0_f32, 0.0, 0.0], 55.0_f32)
+    };
+
+    let render_opts = serde_json::json!({
+        "representation": RepresentationKind::Cartoon,
+        "color_scheme": ColorScheme::Chain,
+        "show_surface_shell": false,
+        "surface_alpha": 0.72_f32,
+        "surface_wireframe": false,
+        "show_ligands_sticks": true,
+        "show_waters": false,
+        "show_rna_base_pairs": true,
+        "show_silhouettes": true,
+        "lighting": LightingPreset::PublicationWhite,
+        "ssao_strength": 0.65_f32,
+        "background": [1.0_f32, 1.0, 1.0, 1.0],
+        "residue_highlights": [],
+        "sphere_overlays": [],
+        "line_overlays": [],
+        "grid_box": bundle.grid_box,
+        "show_snfg_glycans": false,
+        "show_unit_cell": false,
+    });
+
+    let summary_md = render_viewdock_markdown(bundle);
+    let manifest = serde_json::json!({
+        "schema_version": "biomol-session/v1",
+        "app_version": env!("CARGO_PKG_VERSION"),
+        "active_model_idx": 0usize,
+        "next_model_id": 2u32,
+        "camera": {
+            "target": target,
+            "yaw": 0.65_f32,
+            "pitch": 0.30_f32,
+            "distance": distance,
+            "fov_y_rad": 42.0_f32.to_radians(),
+            "orthographic": false,
+            "clip_slab_enabled": false,
+            "clip_near_a": 35.0_f32,
+            "clip_far_a": 60.0_f32,
+        },
+        "global_render_opts": render_opts,
+        "models": [{
+            "model_id": 1u32,
+            "name": bundle.receptor_name,
+            "role": "receptor",
+            "visible": true,
+            "source_path": bundle.receptor_pdb_path,
+            "pdb_entry": "models/m1.pdb",
+            "atom_count": atom_count,
+            "active_frame": 0usize,
+            "render_opts": render_opts,
+        }],
+        "scenes": {},
+        "labels_3d": [],
+        "labels_2d": [{
+            "id": "dockcraft_title",
+            "text": bundle.title,
+            "norm_pos": [0.03_f32, 0.03_f32],
+            "rgba": [0.95_f32, 0.97_f32, 1.0_f32, 1.0_f32],
+            "font_scale": 1.0_f32,
+        }],
+        "color_key": serde_json::Value::Null,
+        "scale_bar": {
+            "length_a": 10.0_f32,
+            "label": "10 A",
+        },
+        "axes": [],
+        "planes": [],
+        "measurements_log": [],
+        "last_module_markdown": summary_md,
+        "msa": serde_json::Value::Null,
+        "pae": serde_json::Value::Null,
+        "volume_sigma": 1.5_f64,
+        "volume_wireframe": false,
+        "show_orthoplanes": false,
+        "orthoplane_frac": [0.5_f32, 0.5_f32, 0.5_f32],
+        "volume_label": serde_json::Value::Null,
+        "has_volume_mrc": false,
+        "has_viewdock": true,
+        "viewdock_poses": bundle.poses.len(),
+        "provenance": bundle.provenance,
+        "command_history": [],
+    });
+
+    let pose_tags: Vec<&str> = vec!["Unreviewed"; bundle.poses.len()];
+    let viewdock = serde_json::json!({
+        "bundle": bundle,
+        "active_pose_idx": 0usize,
+        "pose_tags": pose_tags,
+        "show_hyde_coronas": true,
+        "show_torsion_lights": true,
+        "show_interactions": true,
+        "show_pharmacophores": true,
+        "show_dmif_hotspots": true,
+        "show_bridging_waters": true,
+        "show_grid_box": true,
+        "editable_grid_box": bundle.grid_box,
+    });
+
+    let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
+    let viewdock_bytes = serde_json::to_vec_pretty(&viewdock)?;
+
+    write_verified_zip(
+        out_path,
+        &[
+            ("manifest.json", &manifest_bytes),
+            ("models/m1.pdb", rec_pdb.as_bytes()),
+            ("viewdock.json", &viewdock_bytes),
+        ],
+    )
+    .map_err(|e| BiomolLinkError::Link(e.to_string()))
+}
+
+fn resolve_local_bin(name: &str) -> Option<PathBuf> {
+    if let Ok(path_var) = std::env::var("PATH") {
+        for d in std::env::split_paths(&path_var) {
+            let cand = d.join(name);
+            if cand.is_file() {
+                return Some(cand);
+            }
+        }
+    }
+    if let Ok(home) = std::env::var("HOME")
+        && !home.trim().is_empty()
+    {
+        let cand = PathBuf::from(home).join(".local").join("bin").join(name);
+        if cand.is_file() {
+            return Some(cand);
+        }
+    }
+    None
+}
+
+/// Export a complete ArtCraft Suite report bundle (3D ViewDockX PNG + GridCraft TSV/XLSX +
+/// WordCraft MD/DOCX + DeckCraft MD/PPTX) directly from a `DockCraftSceneBundle`.
+pub fn export_dockcraft_artcraft_report(
+    bundle: &DockCraftSceneBundle,
+    out_dir: &Path,
+) -> Result<ArtCraftBundleSummary, BiomolLinkError> {
+    std::fs::create_dir_all(out_dir).map_err(|e| BiomolLinkError::Directory {
+        dir: out_dir.display().to_string(),
+        msg: e.to_string(),
+    })?;
+
+    // Write verified .biomol.zip right inside out_dir and render 3D ViewDockX PNG via biomolcraft-cli if available
+    let zip_path = out_dir.join("viewdock_session.biomol.zip");
+    let _ = write_biomol_session_zip(bundle, &zip_path)?;
+    let tmp_png = out_dir.join("_render_viewdock.png");
+    let png_bytes = if let Some(cli) = resolve_local_bin("biomolcraft-cli")
+        && Command::new(cli)
+            .args(["session", "--action", "render", "--session"])
+            .arg(&zip_path)
+            .args(["--out-png"])
+            .arg(&tmp_png)
+            .args(["--width", "1600", "--height", "1200"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+        && tmp_png.is_file()
+    {
+        let b = std::fs::read(&tmp_png)?;
+        let _ = std::fs::remove_file(&tmp_png);
+        b
+    } else {
+        // Minimal valid 1x1 PNG fallback when biomolcraft-cli is absent
+        vec![
+            0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, b'I', b'H',
+            b'D', b'R', 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00,
+            0x00, 0x90, 0x77, 0x53, 0xde, 0x00, 0x00, 0x00, 0x0c, b'I', b'D', b'A', b'T', 0x08,
+            0xd7, 0x63, 0xf8, 0xff, 0xff, 0x3f, 0x00, 0x05, 0xfe, 0x02, 0xfe, 0xdc, 0xcc, 0x59,
+            0xe7, 0x00, 0x00, 0x00, 0x00, b'I', b'E', b'N', b'D', 0xae, 0x42, 0x60, 0x82,
+        ]
+    };
+
+    let mut rows = vec![
+        ("Receptor", bundle.receptor_name.clone()),
+        ("Docking Poses", bundle.poses.len().to_string()),
+        (
+            "Pharmacophore Features",
+            bundle.pharmacophore_spheres.len().to_string(),
+        ),
+        (
+            "ΔMIF Selectivity Hotspots",
+            bundle.selectivity_dmif_hotspots.len().to_string(),
+        ),
+        ("Bridging Waters", bundle.bridging_waters.len().to_string()),
+    ];
+    if let Some(top) = bundle.poses.first() {
+        rows.push(("Top Pose", top.name.clone()));
+        rows.push(("Top Vina (kcal/mol)", format!("{:.2}", top.vina_kcal)));
+        if let Some(h) = top.hyde_kcal {
+            rows.push(("Top HYDE (kcal/mol)", format!("{h:.2}")));
+        }
+        if let Some(ki) = top.estimated_ki_nm {
+            rows.push(("Est. Ki (nM)", format!("{ki:.1}")));
+        }
+        if let Some(ref pb) = top.posebusters_summary {
+            rows.push(("PoseBusters", pb.clone()));
+        }
+    }
+    let summary_md = render_viewdock_markdown(bundle);
+    export_artcraft_bundle(&bundle.title, &png_bytes, &rows, &summary_md, out_dir)
+        .map_err(BiomolLinkError::Link)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -508,6 +792,16 @@ mod tests {
         let rt: DockCraftSceneBundle = serde_json::from_str(&raw)?;
         assert_eq!(rt.title, "CDK2 Pilot");
         assert_eq!(rt.poses.len(), 1);
+
+        // Verified portable .biomol.zip roundtrip check
+        let zip_out = tmp.join("cdk2_pilot.biomol.zip");
+        let n_bytes = write_biomol_session_zip(&bundle, &zip_out)?;
+        assert!(n_bytes > 200);
+        let entries = craftbio_scene::read_verified_zip(&zip_out)?;
+        assert!(entries.contains_key("manifest.json"));
+        assert!(entries.contains_key("models/m1.pdb"));
+        assert!(entries.contains_key("viewdock.json"));
+
         let _ = std::fs::remove_dir_all(&tmp);
         Ok(())
     }

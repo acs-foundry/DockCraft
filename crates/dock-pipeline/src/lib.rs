@@ -21,7 +21,8 @@ pub use admet::{AdmetProfile, detect_sibling_clis, evaluate_admet};
 pub use biomol_link::{
     BiomolBundleExtras, BiomolDeliveryReport, BiomolLinkError, BiomolSelectionBox, DockPoseInput,
     build_dockcraft_scene_bundle, default_biomolcraft_handoff_dir,
-    grid_box_from_biomolcraft_selection, send_or_launch_biomolcraft, write_biomol_handoff_bundle,
+    export_dockcraft_artcraft_report, grid_box_from_biomolcraft_selection,
+    send_or_launch_biomolcraft, write_biomol_handoff_bundle, write_biomol_session_zip,
 };
 pub use campaign::{
     CampaignError, CampaignReport, EnrichmentMetrics, LigandInputRecord, ScreenedCandidate,

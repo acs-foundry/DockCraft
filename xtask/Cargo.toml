@@ -1,0 +1,10 @@
+[package]
+name = "xtask"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "DockCraft architectural guardrails (`cargo xtask layers`): strict L0->L6 acyclic layering, zero-unsafe, and panic-denial verification"
+
+[lints]
+workspace = true
