@@ -464,21 +464,30 @@ impl MdValidateReport {
     }
 }
 
-/// Resolves the centralized CraftBio data directory (`CRAFT_DATA_DIR` or `/home/acs/Datos/CraftBio`).
+/// Resolves the centralized CraftBio data directory.
+///
+/// `CRAFT_DATA_DIR` if set, otherwise `$XDG_DATA_HOME/CraftBio`, otherwise
+/// `$HOME/.local/share/CraftBio`. Set `CRAFT_DATA_DIR` to keep multi-gigabyte libraries,
+/// models and campaigns off the root partition. No path is hardcoded for any machine.
 #[must_use]
 pub fn craft_data_dir() -> PathBuf {
-    if let Ok(env_dir) = std::env::var("CRAFT_DATA_DIR") {
-        let p = PathBuf::from(env_dir.trim());
-        if !p.as_os_str().is_empty() {
-            return p;
-        }
+    let non_blank = |k: &str| {
+        std::env::var(k)
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
+
+    if let Some(dir) = non_blank("CRAFT_DATA_DIR") {
+        return PathBuf::from(dir);
     }
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/home/acs".to_string());
-    let datos_candidate = PathBuf::from(&home).join("Datos").join("CraftBio");
-    if datos_candidate.exists() {
-        return datos_candidate;
+    if let Some(xdg) = non_blank("XDG_DATA_HOME") {
+        return PathBuf::from(xdg).join("CraftBio");
     }
-    PathBuf::from(&home).join(".local/share/CraftBio")
+    if let Some(home) = non_blank("HOME") {
+        return PathBuf::from(home).join(".local/share/CraftBio");
+    }
+    PathBuf::from("CraftBio")
 }
 
 /// Resolves the isolated OpenMM Python interpreter path (`CRAFT_OPENMM_PYTHON` or

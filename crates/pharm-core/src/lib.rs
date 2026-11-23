@@ -2,7 +2,7 @@
 
 //! Active-site Molecular Interaction Field (MIF) profiling, optimal inter-feature distance
 //! blueprints (`.pharm.json`), ultra-fast 3D pharmacophore screening (`pharm-screen`), and
-//! centralized `CRAFT_DATA_DIR` (`/home/acs/Datos/CraftBio`) layout management.
+//! centralized `CRAFT_DATA_DIR` layout management.
 
 pub mod data_dir;
 pub mod kabsch;
