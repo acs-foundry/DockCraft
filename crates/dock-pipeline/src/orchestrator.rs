@@ -326,7 +326,7 @@ impl CampaignManifest {
     }
 }
 
-/// Builds a ready-to-run CDK2 template `CampaignSpec` pointing at `/home/acs/Datos/CraftBio`.
+/// Builds a ready-to-run CDK2 template `CampaignSpec` rooted at the Craft data directory.
 #[must_use]
 pub fn default_cdk2_campaign_template() -> CampaignSpec {
     let base = craft_data_dir().join("campaigns").join("cdk2_pilot");

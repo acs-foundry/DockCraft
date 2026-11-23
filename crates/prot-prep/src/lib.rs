@@ -545,7 +545,14 @@ END
     #[test]
     fn real_cdk2_1ke6_and_1h1s_prepare_cleanly_if_present() -> Result<(), Box<dyn std::error::Error>>
     {
-        let p_1ke6 = Path::new("/home/acs/Datos/CraftBio/campaigns/cdk2_pilot/raw/1KE6.pdb");
+        // Opt-in fixture: only runs where the campaign data actually lives.
+        let Some(base) = std::env::var("CRAFT_DATA_DIR")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+        else {
+            return Ok(());
+        };
+        let p_1ke6 = &std::path::PathBuf::from(base).join("campaigns/cdk2_pilot/raw/1KE6.pdb");
         if !p_1ke6.exists() {
             return Ok(());
         }

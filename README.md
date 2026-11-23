@@ -13,12 +13,12 @@ DockCraft unifies rigorous receptor preparation & structural auditing (`prot-pre
    - **7-probe Rayon-parallel Molecular Interaction Fields (MIFs):** `HDonor`, `HAcceptor`, `Hydrophobic`, `Aromatic`, `PositiveIonizable`, `NegativeIonizable`, and `MetalChelate` with pH 7.4 protein atom typing, same-sign electrostatic opposition, and 6-connected main-cavity isolation.
    - **PCA Pocket Dimensions & Optimal Ligand Envelope:** Extracts physical pocket dimensions ($L \times W \times D$), accessible volume ($\text{Å}^3$), hydrophobic/polar surface ratio, Mecozzi-Rebek optimal MW & heavy-atom envelope, optimal inter-feature 3D distance matrix with allowed ranges & vector angles, receptor wall exclusion spheres, and crystallographic water classification (`ConservedBridge` vs `Displaceable`).
    - **Hybrid Apo + Holo Consensus & Ultra-Fast Streaming Funnel (`pharm-screen`):** Bounded distance-clique DFS + exact 4×4 Horn unit-quaternion Kabsch 3D superposition ($\det R = +1$) + directional vector alignment + pocket shape containment + continuous steric wall penalty. Streams `.smi` / `.smi.gz` / `.sdf` / `.sdf.gz` / `.chemcraft` libraries at **`~0.09 ms/ligand` (`>10,000 ligands/s` on 24 threads)** and feeds pre-aligned 3D hits + soft `--pharmacophore-file` restraints straight into `dock` / `screen`.
-   - **Centralized Bio Data Store (`CRAFT_DATA_DIR`):** Defaults to `/home/acs/Datos/CraftBio/{libraries,models,building_blocks,envs,campaigns}` (configurable via `CRAFT_DATA_DIR`) so multi-gigabyte libraries, ML models, and campaigns stay off the root partition.
+   - **Centralized Bio Data Store (`CRAFT_DATA_DIR`):** Defaults to `$XDG_DATA_HOME/CraftBio/{libraries,models,building_blocks,envs,campaigns}` (configurable via `CRAFT_DATA_DIR`) so multi-gigabyte libraries, ML models, and campaigns stay off the root partition.
 2. **Mass Virtual Screening & Docking Engine (`pocket-detect` + `dock-engine`):**
    - **Parallel LIGSITE-csc 26-ray / 13-PSP blind pocket detector** (`pocket-detect`) with 1.0 Å occupancy grid, 6-connected subpocket separation, catalytic metal bonus, deep-core burial centroid, 42-point Fibonacci SASA, and SiteMap/DoGSiteScorer-class druggability ranking (`86.4%` Top-1 / `90.9%` Top-3 DCA ≤ 4 Å across 22 RCSB proteins in ~64 ms).
    - **Rayon-parallel 3D trilinear affinity grids** + analytical spatial gradients, rigid-core-anchored SO(3) + root-to-leaf dihedral L-BFGS (`m = 8`), Vina-style single-DOF Metropolis ILS, anchor+conformer-stratified seeding, and WL-refined symmetry-aware heavy-atom RMSD deduplication (`dock-engine`), plus optional external `vina` / `smina` / `gnina` execution when installed.
    - **Commercial docking modes:** AutoDock4Zn-inspired catalytic metal coordination (`Zn/Mg/Fe/Mn/Ca` with Tier-2 warhead typing for sulfonamides, hydroxamates, carboxylates/phosphonates, thiols), structural bridging water detection & retention (`detect-waters`, `--keep-waters`, `--auto-waters`), pharmacophore sphere restraints (`--pharmacophore`, `--pharmacophore-file`), template core tethering, covalent warhead attachment (`--covalent`), flexible receptor sidechain rotamers (`--flex-residues`, `chi1`/`chi2`), and Vina+HYDE consensus reranking (`--rerank-hyde`).
-   - **Pure literature scoring & virtual screening metrics:** Exact `ScoringFunction::Vina` and `ScoringFunction::Vinardo` parity (`r = 0.9875`, MAE `0.288 kcal/mol` vs Official AutoDock Vina 1.2.7), opt-in `ScoringFunction::DockCraftHybrid`, plus 8-descriptor Bickerton `QED`, Wildman-Crippen `cLogP`, `TPSA`, Lipinski/Veber/hERG/BBB, PAINS filters, `MPO`, `ROC AUC`, `BEDROC(α=20)`, `EF1%`, and `EF5%` (`dock-pipeline`).
+   - **Pure literature scoring & virtual screening metrics:** `ScoringFunction::Vina` and `ScoringFunction::Vinardo` with the published weights, matching Official AutoDock Vina 1.2.7 to `r = 0.9875` / MAE `0.288 kcal/mol` (not bit-exact: the hydrophobic and H-bond ramps are C1-smooth rather than piecewise-linear, so the optimiser has a continuous gradient — see `vina.rs`), opt-in `ScoringFunction::DockCraftHybrid`, plus 8-descriptor Bickerton `QED`, Wildman-Crippen `cLogP`, `TPSA`, Lipinski/Veber/hERG/BBB, PAINS filters, `MPO`, `ROC AUC`, `BEDROC(α=20)`, `EF1%`, and `EF5%` (`dock-pipeline`).
 3. **Interactive 3D Pocket & SeeSAR-Style HYDE v2 Workstation (`hyde-scorer` + `dock-viewport` + `dockcraft`):**
    - Hardware-accelerated `wgpu` 24 WGSL 3D viewport (`dock-viewport`) inside `eframe`/`egui` (`dockcraft`) following unified **Craft UI** conventions (`File | Edit | View | Docking | Apps`, visible `v0.3.0`, interactive **Site Blueprint (MIFs & Distances)** panel with live hotspot toggles & 3D directional vectors + exclusion spheres, native Open/Save/Export dialogs, on-demand **ChemCraft**, **AdmetCraft**, and **ChimeraX** handoff).
    - **HYDE v2 empirical scoring & PoseBusters audit:** Pocket-shell SASA desolvation, 100% directional H-bond geometry (`D–H···A` angles), salt bridges, metal coordination, water bridges, $\pi\text{-}\pi$, cation-$\pi$, halogen bonds, honest $K_i$ bracket (`±1.2 kcal/mol`), built-in **PoseBusters 5-check geometric validator** (`validate-pose`), and **SeeSAR-style torsion strain traffic-lights** (`Green / Yellow / Red`).
@@ -41,7 +41,22 @@ DockCraft unifies rigorous receptor preparation & structural auditing (`prot-pre
 
 ---
 
-## Validation Status (Measured Head-to-Head vs Official AutoDock Vina 1.2.7)
+## Validation Status (historical, not reproduced in this version)
+
+> **Read this before the table below.** These figures were measured against **DockCraft v0.2.0**; this
+> repository is at v1.0.0 and they have **not been re-measured since**. The inputs, the comparison against
+> AutoDock Vina 1.2.7 and the DUD-E sets are **not in this repository**: `tests/fixtures/` contains four
+> complexes (3PTB, 1HSG, 3ERT, 1STP), not the twenty-two listed.
+>
+> They were also produced under the **previous re-docking protocol**, which handed the engine the native
+> crystal torsions and only rotated the ligand rigidly - see the header of
+> `crates/dock-pipeline/tests/randomized_conformer_redock.rs`, which documents why that protocol was
+> replaced and what it hid. The current test re-docks from randomized torsions and is the measurement to
+> trust.
+>
+> Kept here as a record rather than deleted. Treat every number below as unverified until the benchmark is
+> re-run and its artefacts published.
+
 
 ### 6-Track Commercial Benchmark (22 Diverse RCSB Complexes + 4 DUD-E Property-Matched Targets, 600 Ligands)
 

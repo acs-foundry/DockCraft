@@ -334,6 +334,41 @@ pub fn extract_protein_sequences_from_mol(mol: &Molecule3D) -> Vec<(String, Stri
         .collect()
 }
 
+/// Reduce a biological sequence to the residue letters, dropping everything else.
+///
+/// Sequences reach these manifests from an MCP client. A protein sequence is an alphabet,
+/// not free text, so anything outside `A-Z` is discarded rather than escaped: that keeps a
+/// newline or a `:` from adding entities to the YAML or records to the FASTA, and leaves a
+/// legitimate sequence untouched. Gap and stop characters (`-`, `*`) are dropped too, since
+/// neither belongs in a folding input.
+#[must_use]
+fn sanitize_sequence(raw: &str) -> String {
+    raw.chars()
+        .filter(char::is_ascii_alphabetic)
+        .map(|c| c.to_ascii_uppercase())
+        .collect()
+}
+
+/// Strip whitespace and control characters from a SMILES string.
+///
+/// In the YAML the SMILES is quoted and its quotes doubled, which is enough. The FASTA has
+/// no quoting at all, so a newline there would start a new record.
+#[must_use]
+fn sanitize_smiles_inline(raw: &str) -> String {
+    raw.chars()
+        .filter(|c| !c.is_whitespace() && !c.is_control())
+        .collect()
+}
+
+/// Reduce a CCD code to the alphanumeric characters it is defined over.
+#[must_use]
+fn sanitize_ccd(raw: &str) -> String {
+    raw.chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|c| c.to_ascii_uppercase())
+        .collect()
+}
+
 /// Renders a native Boltz-2 / Boltz-1 YAML manifest (`version: 1`).
 #[must_use]
 pub fn render_boltz_yaml(entities: &[CoFoldEntity], predict_affinity: bool) -> String {
@@ -344,7 +379,7 @@ pub fn render_boltz_yaml(entities: &[CoFoldEntity], predict_affinity: bool) -> S
             CoFoldEntity::Protein { chain_id, sequence } => {
                 let _ = writeln!(y, "  - protein:");
                 let _ = writeln!(y, "      id: {chain_id}");
-                let _ = writeln!(y, "      sequence: {sequence}");
+                let _ = writeln!(y, "      sequence: {}", sanitize_sequence(sequence));
             }
             CoFoldEntity::LigandSmiles { chain_id, smiles } => {
                 if first_lig_chain.is_none() {
@@ -358,7 +393,7 @@ pub fn render_boltz_yaml(entities: &[CoFoldEntity], predict_affinity: bool) -> S
             CoFoldEntity::IonOrCcd { chain_id, ccd_code } => {
                 let _ = writeln!(y, "  - ligand:");
                 let _ = writeln!(y, "      id: {chain_id}");
-                let _ = writeln!(y, "      ccd: {ccd_code}");
+                let _ = writeln!(y, "      ccd: {}", sanitize_ccd(ccd_code));
             }
         }
     }
@@ -376,13 +411,25 @@ pub fn render_chai_fasta(entities: &[CoFoldEntity]) -> String {
     for ent in entities {
         match ent {
             CoFoldEntity::Protein { chain_id, sequence } => {
-                let _ = writeln!(fa, ">protein|name=chain_{chain_id}\n{sequence}");
+                let _ = writeln!(
+                    fa,
+                    ">protein|name=chain_{chain_id}\n{}",
+                    sanitize_sequence(sequence)
+                );
             }
             CoFoldEntity::LigandSmiles { chain_id, smiles } => {
-                let _ = writeln!(fa, ">ligand|name=lig_{chain_id}\n{smiles}");
+                let _ = writeln!(
+                    fa,
+                    ">ligand|name=lig_{chain_id}\n{}",
+                    sanitize_smiles_inline(smiles)
+                );
             }
             CoFoldEntity::IonOrCcd { chain_id, ccd_code } => {
-                let _ = writeln!(fa, ">ligand|name=ion_{chain_id}\n{ccd_code}");
+                let _ = writeln!(
+                    fa,
+                    ">ligand|name=ion_{chain_id}\n{}",
+                    sanitize_ccd(ccd_code)
+                );
             }
         }
     }
@@ -925,5 +972,94 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&base);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod manifest_injection_tests {
+    use super::*;
+
+    /// Completion of the DockCraft security review (audit D1). The ligand SMILES is quoted
+    /// and escaped, but the protein sequence was interpolated raw into the YAML and into
+    /// the FASTA. It arrives from an MCP client, and `trim().to_ascii_uppercase()` removes
+    /// neither newlines nor `:`, so a sequence could append entities to the manifest that
+    /// the caller never asked to fold — an expensive job, silently altered.
+    #[test]
+    fn a_protein_sequence_cannot_add_entities_to_a_boltz_manifest() {
+        let hostile = "ACDEF\n  - protein:\n      id: Z\n      sequence: INJECTED";
+        let entities = vec![CoFoldEntity::Protein {
+            chain_id: "A".to_string(),
+            sequence: hostile.to_string(),
+        }];
+        let yaml = render_boltz_yaml(&entities, false);
+
+        assert_eq!(
+            yaml.matches("- protein:").count(),
+            1,
+            "exactly one protein entity was requested, manifest was:\n{yaml}"
+        );
+        assert!(
+            !yaml.contains("id: Z"),
+            "an injected entity survived:\n{yaml}"
+        );
+    }
+
+    #[test]
+    fn a_protein_sequence_cannot_add_records_to_a_chai_fasta() {
+        let hostile = "ACDEF\n>protein|name=chain_Z\nINJECTED";
+        let entities = vec![CoFoldEntity::Protein {
+            chain_id: "A".to_string(),
+            sequence: hostile.to_string(),
+        }];
+        let fasta = render_chai_fasta(&entities);
+        assert_eq!(
+            fasta.lines().filter(|l| l.starts_with('>')).count(),
+            1,
+            "exactly one FASTA record was requested, manifest was:\n{fasta}"
+        );
+    }
+
+    /// Honest sequences and SMILES must still round-trip unchanged.
+    #[test]
+    fn ordinary_manifests_are_unchanged() {
+        let entities = vec![
+            CoFoldEntity::Protein {
+                chain_id: "A".to_string(),
+                sequence: "MKTAYIAKQRQISFVK".to_string(),
+            },
+            CoFoldEntity::LigandSmiles {
+                chain_id: "L".to_string(),
+                smiles: "CC(=O)Oc1ccccc1C(=O)O".to_string(),
+            },
+        ];
+        let yaml = render_boltz_yaml(&entities, true);
+        assert!(yaml.contains("MKTAYIAKQRQISFVK"), "{yaml}");
+        assert!(yaml.contains("CC(=O)Oc1ccccc1C(=O)O"), "{yaml}");
+        assert_eq!(yaml.matches("- protein:").count(), 1);
+        assert_eq!(yaml.matches("- ligand:").count(), 1);
+
+        let fasta = render_chai_fasta(&entities);
+        assert!(fasta.contains("MKTAYIAKQRQISFVK"), "{fasta}");
+    }
+}
+
+#[cfg(test)]
+mod fasta_ligand_injection_tests {
+    use super::*;
+
+    /// The FASTA has no quoting, so the ligand SMILES needs the same care as the sequence.
+    #[test]
+    fn a_ligand_smiles_cannot_add_records_to_a_chai_fasta() {
+        let entities = vec![CoFoldEntity::LigandSmiles {
+            chain_id: "L".to_string(),
+            smiles: "CCO\n>protein|name=chain_Z\nINJECTED".to_string(),
+        }];
+        let fasta = render_chai_fasta(&entities);
+        // In FASTA a record starts only at the beginning of a line.
+        assert_eq!(
+            fasta.lines().filter(|l| l.starts_with('>')).count(),
+            1,
+            "exactly one record was requested, manifest was:\n{fasta}"
+        );
     }
 }
