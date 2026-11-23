@@ -41,7 +41,22 @@ DockCraft unifies rigorous receptor preparation & structural auditing (`prot-pre
 
 ---
 
-## Validation Status (Measured Head-to-Head vs Official AutoDock Vina 1.2.7)
+## Validation Status (historical, not reproduced in this version)
+
+> **Read this before the table below.** These figures were measured against **DockCraft v0.2.0**; this
+> repository is at v1.0.0 and they have **not been re-measured since**. The inputs, the comparison against
+> AutoDock Vina 1.2.7 and the DUD-E sets are **not in this repository**: `tests/fixtures/` contains four
+> complexes (3PTB, 1HSG, 3ERT, 1STP), not the twenty-two listed.
+>
+> They were also produced under the **previous re-docking protocol**, which handed the engine the native
+> crystal torsions and only rotated the ligand rigidly - see the header of
+> `crates/dock-pipeline/tests/randomized_conformer_redock.rs`, which documents why that protocol was
+> replaced and what it hid. The current test re-docks from randomized torsions and is the measurement to
+> trust.
+>
+> Kept here as a record rather than deleted. Treat every number below as unverified until the benchmark is
+> re-run and its artefacts published.
+
 
 ### 6-Track Commercial Benchmark (22 Diverse RCSB Complexes + 4 DUD-E Property-Matched Targets, 600 Ligands)
 
