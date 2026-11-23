@@ -137,7 +137,7 @@ dependencies = [
  "objc2-foundation 0.3.2",
  "parking_lot",
  "percent-encoding",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
  "x11rb",
 ]
 
@@ -516,6 +516,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "craftbio-sandbox"
+version = "1.1.2"
+source = "git+https://github.com/acs-foundry/craftbio-libs?tag=v1.1.2#65b1b0fd8be5d0ca429b45a01d00c38b9cf54cec"
+dependencies = [
+ "rustix 1.1.6",
+ "serde",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "craftbio-scene"
 version = "1.1.2"
 source = "git+https://github.com/acs-foundry/craftbio-libs?tag=v1.1.2#65b1b0fd8be5d0ca429b45a01d00c38b9cf54cec"
@@ -668,6 +678,7 @@ name = "dock-pipeline"
 version = "1.0.0"
 dependencies = [
  "craftbio-report",
+ "craftbio-sandbox",
  "craftbio-scene",
  "csv",
  "dock-engine",
@@ -933,7 +944,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e35d6e78f4cebb90e51d543db8fe41528851d6deeef6ef21ebd4bfdc1e784776"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2479,7 +2490,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3393,7 +3404,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
