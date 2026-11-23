@@ -508,8 +508,8 @@ dependencies = [
 
 [[package]]
 name = "craftbio-report"
-version = "1.1.0"
-source = "git+https://github.com/acs-foundry/craftbio-libs?tag=v1.1.0#5ac81242b15578d934c59235ef085f54f73ea1e4"
+version = "1.1.1"
+source = "git+https://github.com/acs-foundry/craftbio-libs?tag=v1.1.1#3395910402dfd859723c4ace71fee67a9c8d2642"
 dependencies = [
  "serde",
  "serde_json",
@@ -517,8 +517,8 @@ dependencies = [
 
 [[package]]
 name = "craftbio-scene"
-version = "1.1.0"
-source = "git+https://github.com/acs-foundry/craftbio-libs?tag=v1.1.0#5ac81242b15578d934c59235ef085f54f73ea1e4"
+version = "1.1.1"
+source = "git+https://github.com/acs-foundry/craftbio-libs?tag=v1.1.1#3395910402dfd859723c4ace71fee67a9c8d2642"
 dependencies = [
  "craft-ipc",
  "crc32fast",

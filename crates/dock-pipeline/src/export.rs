@@ -29,6 +29,36 @@ pub struct InteropSceneBundle {
     pub interactions: Vec<hyde_scorer::Interaction>,
 }
 
+/// Reduce caller-supplied text to something that cannot leave a single-line comment.
+///
+/// The complex name arrives from an MCP client and is written into the first line of the
+/// generated `.cxc` / `.pml`. Both viewers execute their scripts line by line and both can
+/// start external programs, so a line break in the name would hand the client command
+/// execution on the machine of whoever opens the scene. Every Unicode line terminator and
+/// control character becomes a space, and the result is capped.
+#[must_use]
+pub fn comment_safe(raw: &str) -> String {
+    let cleaned: String = raw
+        .chars()
+        .map(|c| {
+            // `char::is_control` covers \n, \r, \t and U+0085; LS/PS are not control chars
+            // but still break a line in some readers.
+            if c.is_control() || c == '\u{2028}' || c == '\u{2029}' {
+                ' '
+            } else {
+                c
+            }
+        })
+        .take(120)
+        .collect();
+    let collapsed = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        "unnamed complex".to_string()
+    } else {
+        collapsed
+    }
+}
+
 #[must_use]
 pub fn build_pymol_export(
     complex_name: &str,
@@ -37,7 +67,10 @@ pub fn build_pymol_export(
     hyde: &HydeReport,
 ) -> (String, InteropSceneBundle) {
     let mut pml = String::new();
-    pml.push_str(&format!("# DockCraft -> PyMOL export ({complex_name})\n"));
+    pml.push_str(&format!(
+        "# DockCraft -> PyMOL export ({})\n",
+        comment_safe(complex_name)
+    ));
     pml.push_str("load receptor.pdb, receptor\n");
     pml.push_str("load ligand.sdf, ligand\n");
     pml.push_str("show cartoon, receptor\n");
@@ -82,7 +115,8 @@ pub fn build_chimerax_export(
 ) -> (String, InteropSceneBundle) {
     let mut cxc = String::new();
     cxc.push_str(&format!(
-        "# DockCraft -> UCSF ChimeraX (.cxc) script ({complex_name})\n"
+        "# DockCraft -> UCSF ChimeraX (.cxc) script ({})\n",
+        comment_safe(complex_name)
     ));
     cxc.push_str("open receptor.pdb\n");
     cxc.push_str("open ligand.sdf\n");
@@ -210,5 +244,88 @@ fn make_bundle(
         estimated_ki_nm: hyde.estimated_ki_nm,
         atom_annotations: annotations,
         interactions: hyde.interactions.clone(),
+    }
+}
+
+#[cfg(test)]
+mod injection_tests {
+    use super::*;
+
+    fn empty_hyde() -> HydeReport {
+        HydeReport {
+            scoring_model: "test".to_string(),
+            total_delta_g_kcal: -8.0,
+            estimated_ki_nm: 1.0,
+            ki_range_nm: (0.5, 2.0),
+            ligand_efficiency: 0.4,
+            atom_scores: Vec::new(),
+            interactions: Vec::new(),
+            torsion_report: None,
+            posebusters: None,
+        }
+    }
+
+    /// Audit finding F3-07: `complex_name` reaches the first line of the generated script
+    /// through `format!`. A newline in that name ends the comment and everything after it
+    /// is a command the molecular viewer will run when the user opens the scene. Both
+    /// ChimeraX and PyMOL can launch external programs from a script, and the name arrives
+    /// from an MCP client.
+    #[test]
+    fn a_complex_name_cannot_append_commands_to_an_exported_script() {
+        let rec = Molecule3D::new("rec");
+        let lig = Molecule3D::new("lig");
+        let hyde = empty_hyde();
+
+        // Payloads: a plain newline, a carriage return (ChimeraX splits on it too), and
+        // the comment-closing trick with surrounding whitespace.
+        let payloads = [
+            "ok\nremotecontrol rest start\nmalicious",
+            "ok\rruncommand bad",
+            "ok\r\nopen /etc/passwd",
+            "ok\u{b}bad",
+            "ok\u{85}bad",
+        ];
+
+        for name in payloads {
+            for (label, script) in [
+                ("chimerax", build_chimerax_export(name, &rec, &lig, &hyde).0),
+                ("pymol", build_pymol_export(name, &rec, &lig, &hyde).0),
+            ] {
+                let header = script.lines().next().unwrap_or_default();
+                assert!(
+                    header.starts_with('#'),
+                    "{label}: header is not a comment: {header:?}"
+                );
+                // Caller text may appear inside the header comment; what it may never do
+                // is form an executable line of its own.
+                for line in script.lines().filter(|l| !l.starts_with('#')) {
+                    for marker in ["malicious", "remotecontrol", "runcommand", "bad", "/etc"] {
+                        assert!(
+                            !line.contains(marker),
+                            "{label}: caller text escaped the comment onto an executable line: {line:?}"
+                        );
+                    }
+                }
+                // The whole header must stay on one line: no extra lines were created.
+                assert_eq!(
+                    script.lines().filter(|l| l.starts_with('#')).count(),
+                    1,
+                    "{label}: the name split the header across lines in {script:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_honest_complex_name_still_appears_in_the_header() {
+        let rec = Molecule3D::new("rec");
+        let lig = Molecule3D::new("lig");
+        let (cxc, _) = build_chimerax_export("EGFR_erlotinib", &rec, &lig, &empty_hyde());
+        assert!(
+            cxc.lines()
+                .next()
+                .unwrap_or_default()
+                .contains("EGFR_erlotinib")
+        );
     }
 }
