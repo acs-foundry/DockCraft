@@ -290,8 +290,17 @@ pub fn rotatable_penalty_divisor(n_rotatable: usize) -> f64 {
 }
 
 /// Evaluates full exact complex affinity (no grid approximation), plus intramolecular clash check.
-/// For `ScoringFunction::Vina` and `Vinardo`, this evaluates the exact literature form (for Vina 1.2.7
-/// parity); `DockCraftHybrid` includes catalytic metal coordination automatically.
+/// For `ScoringFunction::Vina` and `Vinardo` this evaluates the published functional form with the
+/// published weights, with one deliberate difference: the hydrophobic and H-bond terms use the
+/// C1-smooth ramp in `smooth_down` where the papers interpolate linearly, and the 8 A cutoff is
+/// likewise smoothed over 7.92-8.0 A. The search is L-BFGS, which needs a continuous gradient, and a
+/// piecewise-linear term does not have one.
+///
+/// The cost is that scores are close to AutoDock Vina 1.2.7 rather than identical: up to
+/// 0.057 kcal/mol per donor-acceptor pair, which is what the measured 0.288 kcal/mol MAE is made of.
+/// Do not describe this as exact parity.
+///
+/// `DockCraftHybrid` includes catalytic metal coordination automatically.
 #[must_use]
 pub fn score_complex(
     receptor: &Molecule3D,
