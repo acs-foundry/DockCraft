@@ -508,8 +508,8 @@ dependencies = [
 
 [[package]]
 name = "craftbio-report"
-version = "1.1.2"
-source = "git+https://github.com/acs-foundry/craftbio-libs?tag=v1.1.2#65b1b0fd8be5d0ca429b45a01d00c38b9cf54cec"
+version = "1.2.2"
+source = "git+https://github.com/acs-foundry/craftbio-libs?tag=v1.2.2#e4490fecaa23c7ea3370e32142e8edc512780318"
 dependencies = [
  "serde",
  "serde_json",
@@ -517,8 +517,8 @@ dependencies = [
 
 [[package]]
 name = "craftbio-sandbox"
-version = "1.1.2"
-source = "git+https://github.com/acs-foundry/craftbio-libs?tag=v1.1.2#65b1b0fd8be5d0ca429b45a01d00c38b9cf54cec"
+version = "1.2.2"
+source = "git+https://github.com/acs-foundry/craftbio-libs?tag=v1.2.2#e4490fecaa23c7ea3370e32142e8edc512780318"
 dependencies = [
  "rustix 1.1.6",
  "serde",
@@ -527,8 +527,8 @@ dependencies = [
 
 [[package]]
 name = "craftbio-scene"
-version = "1.1.2"
-source = "git+https://github.com/acs-foundry/craftbio-libs?tag=v1.1.2#65b1b0fd8be5d0ca429b45a01d00c38b9cf54cec"
+version = "1.2.2"
+source = "git+https://github.com/acs-foundry/craftbio-libs?tag=v1.2.2#e4490fecaa23c7ea3370e32142e8edc512780318"
 dependencies = [
  "craft-ipc",
  "crc32fast",
@@ -663,7 +663,7 @@ dependencies = [
 
 [[package]]
 name = "dock-engine"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "pocket-detect",
  "rand",
@@ -675,7 +675,7 @@ dependencies = [
 
 [[package]]
 name = "dock-pipeline"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "craftbio-report",
  "craftbio-sandbox",
@@ -696,7 +696,7 @@ dependencies = [
 
 [[package]]
 name = "dock-viewport"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "bytemuck",
  "egui",
@@ -710,7 +710,7 @@ dependencies = [
 
 [[package]]
 name = "dockcraft"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "craftbio-scene",
  "dock-engine",
@@ -729,7 +729,7 @@ dependencies = [
 
 [[package]]
 name = "dockcraft-cli"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "clap",
  "craftbio-scene",
@@ -1291,7 +1291,7 @@ checksum = "dfa686283ad6dd069f105e5ab091b04c62850d3e4cf5d67debad1933f55023df"
 
 [[package]]
 name = "hyde-scorer"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "pocket-detect",
  "serde",
@@ -2148,7 +2148,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "pharm-core"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "dock-engine",
  "pocket-detect",
@@ -2212,7 +2212,7 @@ dependencies = [
 
 [[package]]
 name = "pocket-detect"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "rayon",
  "serde",
@@ -2290,7 +2290,7 @@ checksum = "3d595e54a326bc53c1c197b32d295e14b169e3cfeaa8dc82b529f947fba6bcf5"
 
 [[package]]
 name = "prot-prep"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "dock-engine",
  "dock-pipeline",
@@ -2736,7 +2736,7 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 
 [[package]]
 name = "struct-core"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "serde",
  "thiserror 2.0.21",
@@ -3711,7 +3711,7 @@ checksum = "e450f9b2ed1dff33c94c12589a87338689467b9c4f5d8a5710bd09a847d2c8a7"
 
 [[package]]
 name = "xtask"
-version = "1.0.0"
+version = "1.0.1"
 
 [[package]]
 name = "yoke"
