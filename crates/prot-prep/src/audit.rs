@@ -752,7 +752,7 @@ fn parse_raw_mmcif(input: &str) -> Result<RawStructure, String> {
             rs.r_work = Some(v);
             continue;
         }
-        if t.starts_with("_exptl.method") {
+        if t.split_whitespace().next() == Some("_exptl.method") {
             rs.experimental_method = t
                 .trim_start_matches("_exptl.method")
                 .trim()
