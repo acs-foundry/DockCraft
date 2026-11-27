@@ -235,7 +235,7 @@ struct DockCraftApp {
 }
 
 impl DockCraftApp {
-    fn new(cc: &eframe::CreationContext<'_>, startup_file: Option<PathBuf>) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, startup: StartupDockArgs) -> Self {
         if let Some(rs) = cc.wgpu_render_state.as_ref() {
             DockWgpuResources::ensure_registered(rs);
         }
@@ -301,8 +301,29 @@ impl DockCraftApp {
             scene_dirty: true,
         };
         app.detect_pockets_now();
-        if let Some(path) = startup_file {
+        if let Some(path) = startup.file {
             app.open_startup_path(&path);
+        }
+        if let Some(center) = startup.box_center {
+            app.grid_box.center = center;
+            if let Some(size) = startup.box_size {
+                app.grid_box.size = [
+                    size[0].clamp(8.0, 80.0),
+                    size[1].clamp(8.0, 80.0),
+                    size[2].clamp(8.0, 80.0),
+                ];
+            }
+            app.viewport_opts.show_grid_box = true;
+            app.scene_dirty = true;
+            app.status_line = format!(
+                "Sincronizado desde BiomolCraft — Caja 3D ({:.1}, {:.1}, {:.1} | {:.0}×{:.0}×{:.0} Å) lista para docking.",
+                app.grid_box.center[0],
+                app.grid_box.center[1],
+                app.grid_box.center[2],
+                app.grid_box.size[0],
+                app.grid_box.size[1],
+                app.grid_box.size[2]
+            );
         }
         app
     }
@@ -2461,8 +2482,53 @@ impl eframe::App for DockCraftApp {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+struct StartupDockArgs {
+    file: Option<PathBuf>,
+    box_center: Option<[f64; 3]>,
+    box_size: Option<[f64; 3]>,
+}
+
+fn parse_vec3_csv(s: &str) -> Option<[f64; 3]> {
+    let parts: Vec<f64> = s
+        .split(',')
+        .filter_map(|p| p.trim().parse::<f64>().ok())
+        .collect();
+    if parts.len() == 3 && parts.iter().all(|v| v.is_finite()) {
+        Some([parts[0], parts[1], parts[2]])
+    } else {
+        None
+    }
+}
+
+fn parse_startup_dock_args_from<I>(args: I) -> StartupDockArgs
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut out = StartupDockArgs::default();
+    let mut iter = args.into_iter();
+    while let Some(arg) = iter.next() {
+        if arg == "--box-center" {
+            if let Some(val) = iter.next() {
+                out.box_center = parse_vec3_csv(&val);
+            }
+        } else if arg == "--box-size" {
+            if let Some(val) = iter.next() {
+                out.box_size = parse_vec3_csv(&val);
+            }
+        } else if !arg.starts_with('-') && out.file.is_none() {
+            out.file = Some(PathBuf::from(arg));
+        }
+    }
+    out
+}
+
+fn parse_startup_dock_args() -> StartupDockArgs {
+    parse_startup_dock_args_from(std::env::args().skip(1))
+}
+
 fn main() -> eframe::Result<()> {
-    let startup_file = std::env::args().nth(1).map(PathBuf::from);
+    let startup = parse_startup_dock_args();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1400.0, 880.0])
@@ -2476,7 +2542,7 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "DockCraft",
         options,
-        Box::new(move |cc| Ok(Box::new(DockCraftApp::new(cc, startup_file)))),
+        Box::new(move |cc| Ok(Box::new(DockCraftApp::new(cc, startup)))),
     )
 }
 
@@ -2501,5 +2567,25 @@ mod tests {
         let mut_out = mutate_and_minimize_in_pocket(&rec, &lig, 2, SubstituentPreset::Tetrazole)?;
         assert!(mut_out.mutated_ligand.atoms.len() > lig.atoms.len());
         Ok(())
+    }
+
+    #[test]
+    fn parses_receptor_and_gridbox_cli_flags() {
+        let parsed = parse_startup_dock_args_from(
+            [
+                "/tmp/receptor.pdb",
+                "--box-center",
+                "12.5,-4.25,8.0",
+                "--box-size",
+                "24,20.5,18",
+            ]
+            .into_iter()
+            .map(String::from),
+        );
+        assert_eq!(parsed.file, Some(PathBuf::from("/tmp/receptor.pdb")));
+        assert_eq!(parsed.box_center, Some([12.5, -4.25, 8.0]));
+        assert_eq!(parsed.box_size, Some([24.0, 20.5, 18.0]));
+        assert_eq!(parse_vec3_csv("not,a,vec"), None);
+        assert_eq!(parse_vec3_csv("1.0,2.0"), None);
     }
 }
