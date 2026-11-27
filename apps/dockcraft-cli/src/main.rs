@@ -18,10 +18,11 @@ use dock_pipeline::{
     check_cofold_env, check_fep_env, check_gnina_env, check_openmm_env,
     default_bowes_tier1_catalog, default_cdk2_campaign_template, default_chemcraft_results_dir,
     default_chimerax_export_dir, default_safety_panel_dir, default_safety_panel_manifest_path,
-    export_dockcraft_artcraft_report, extract_protein_sequences_from_mol,
-    grid_box_from_biomolcraft_selection, grid_box_from_chimerax_selection, is_chimerax_available,
-    launch_chimerax_for_scene, load_ligand_library_bytes, run_campaign, run_cofold_prediction,
-    run_fep_network, run_gnina_rescore, run_lead_optimization, run_md_validation, run_safety_panel,
+    emit_cofold_job_bundle, export_dockcraft_artcraft_report, extract_protein_sequences_from_mol,
+    grid_box_from_biomolcraft_selection, grid_box_from_chimerax_selection,
+    ingest_cofold_job_bundle, is_chimerax_available, launch_chimerax_for_scene,
+    load_ligand_library_bytes, run_campaign, run_cofold_prediction, run_fep_network,
+    run_gnina_rescore, run_lead_optimization, run_md_validation, run_safety_panel,
     run_screening_campaign, send_or_launch_biomolcraft, write_biomol_session_zip,
     write_chimerax_session_bundle, write_interactive_html_dossier, write_results_sidecar,
 };
@@ -649,6 +650,7 @@ enum Commands {
     },
     /// Opt-in AI Co-Folding (Boltz-2 / Boltz-1 / Chai-1) for protein + ligand / peptide / multimer
     /// complexes with automatic DockCraft PoseBusters + HYDE v2 + Torsion anti-hallucination gate
+    #[command(alias = "cofold")]
     CoFold {
         /// Probe whether the opt-in Boltz or Chai co-folding engine is installed and exit
         #[arg(long)]
@@ -688,6 +690,21 @@ enum Commands {
         /// Explicit path to `boltz` or `chai-lab` executable
         #[arg(long)]
         bin: Option<PathBuf>,
+        /// Mandatory bounded wall-clock timeout in seconds (`10..=86400`; closes F3-23)
+        #[arg(long, default_value_t = 3600)]
+        timeout_s: u64,
+        /// Optional ResearchFW project reference (e.g. `research/socs1`) for emitted job bundles
+        #[arg(long)]
+        project_ref: Option<String>,
+        /// Intellectual property tier for emitted job bundles (`public` | `confidential`)
+        #[arg(long, default_value = "public")]
+        ip_tier: String,
+        /// Emit an offline `craftbio-compute` job bundle directory for `fw compute submit`
+        #[arg(long)]
+        emit_job_bundle: Option<PathBuf>,
+        /// Ingest a fetched `fw compute fetch` output directory, verify SHA-256 provenance, and run PoseBusters + HYDE v2 + torsions locally
+        #[arg(long)]
+        ingest_job_bundle: Option<PathBuf>,
         /// Emit Boltz YAML / Chai FASTA manifest without launching GPU co-folding
         #[arg(long)]
         dry_run: bool,
@@ -2343,6 +2360,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             use_msa_server,
             samples,
             bin,
+            timeout_s,
+            project_ref,
+            ip_tier,
+            emit_job_bundle,
+            ingest_job_bundle,
             dry_run,
             out_dir,
         } => {
@@ -2353,6 +2375,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if check_env {
                 let st = check_cofold_env(be, bin.as_deref());
                 println!("{}", serde_json::to_string_pretty(&st)?);
+                return Ok(());
+            }
+            if let Some(remote_out) = ingest_job_bundle {
+                let cfg = CoFoldConfig {
+                    job_name: name,
+                    backend: be,
+                    reference_ligand_path: reference_ligand,
+                    timeout_s,
+                    out_dir,
+                    ..Default::default()
+                };
+                let (verified, rep) = ingest_cofold_job_bundle(&remote_out, &cfg)?;
+                eprintln!(
+                    "Verified {} artifact(s) from '{}' (job_id={}) via SHA-256.",
+                    verified.verified_files.len(),
+                    verified.manifest.target,
+                    verified.manifest.job_id
+                );
+                println!("{}", rep.render_markdown());
                 return Ok(());
             }
             let mut entities: Vec<CoFoldEntity> = Vec::new();
@@ -2397,9 +2438,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 diffusion_samples: samples,
                 reference_ligand_path: reference_ligand,
                 bin_override: bin,
+                timeout_s,
                 dry_run,
                 out_dir,
             };
+            if let Some(bundle_dir) = emit_job_bundle {
+                let parsed_ip = match ip_tier.trim().to_ascii_lowercase().as_str() {
+                    "public" => craftbio_compute::IpTier::Public,
+                    "confidential" => craftbio_compute::IpTier::Confidential,
+                    other => {
+                        return Err(format!(
+                            "invalid --ip-tier '{other}' (expected public | confidential)"
+                        )
+                        .into());
+                    }
+                };
+                let (jid, spec_path) = emit_cofold_job_bundle(
+                    &cfg,
+                    &bundle_dir,
+                    None,
+                    project_ref.as_deref(),
+                    parsed_ip,
+                )?;
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "ok": true,
+                        "job_id": jid,
+                        "backend": be.as_str(),
+                        "bundle_dir": bundle_dir.display().to_string(),
+                        "job_spec": spec_path.display().to_string(),
+                    }))?
+                );
+                return Ok(());
+            }
             let rep = run_cofold_prediction(&cfg)?;
             println!("{}", rep.render_markdown());
         }

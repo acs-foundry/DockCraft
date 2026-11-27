@@ -11,8 +11,14 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::Instant;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use craftbio_compute::{
+    ComputeError, DataTier, IpTier, MAX_TIMEOUT_S, MIN_TIMEOUT_S, VerifiedComputeResults,
+    adapters::{CoFoldBundleRequest, CoFoldEntitySpec, build_dockcraft_cofold_bundle},
+    emit_job_bundle, ingest_result_manifest,
+};
 
 use dock_engine::{ScoringFunction, score_complex};
 use hyde_scorer::{
@@ -40,6 +46,10 @@ pub enum CoFoldError {
     EngineNotFound(String),
     #[error("co-folding execution failed (exit {code:?}): {stderr}")]
     ExecutionFailed { code: Option<i32>, stderr: String },
+    #[error("co-folding timed out after {0}s")]
+    TimedOut(u64),
+    #[error("compute bundle error: {0}")]
+    Compute(#[from] ComputeError),
 }
 
 /// Supported open-source AI co-folding predictors.
@@ -96,8 +106,15 @@ pub struct CoFoldConfig {
     pub reference_ligand_path: Option<PathBuf>,
     /// Optional explicit executable path (`boltz` or `chai-lab` / python wrapper).
     pub bin_override: Option<PathBuf>,
+    /// Mandatory bounded wall-clock timeout in seconds (`10..=86400`; closes audit finding F3-23).
+    #[serde(default = "default_cofold_timeout_s")]
+    pub timeout_s: u64,
     pub dry_run: bool,
     pub out_dir: PathBuf,
+}
+
+const fn default_cofold_timeout_s() -> u64 {
+    3600
 }
 
 impl Default for CoFoldConfig {
@@ -111,6 +128,7 @@ impl Default for CoFoldConfig {
             diffusion_samples: 1,
             reference_ligand_path: None,
             bin_override: None,
+            timeout_s: default_cofold_timeout_s(),
             dry_run: false,
             out_dir: PathBuf::from("./cofold_run"),
         }
@@ -712,6 +730,11 @@ pub fn audit_cofold_prediction(
 /// Runs (or dry-run stages) an opt-in Boltz-2 / Chai-1 co-folding job and audits outputs.
 pub fn run_cofold_prediction(cfg: &CoFoldConfig) -> Result<CoFoldAuditReport, CoFoldError> {
     let t0 = Instant::now();
+    if cfg.timeout_s < MIN_TIMEOUT_S || cfg.timeout_s > MAX_TIMEOUT_S {
+        return Err(CoFoldError::Compute(ComputeError::InvalidTimeout(
+            cfg.timeout_s,
+        )));
+    }
     if cfg.entities.is_empty() {
         return Err(CoFoldError::Setup(
             "co-folding requires at least one protein or ligand entity".to_string(),
@@ -784,10 +807,24 @@ pub fn run_cofold_prediction(cfg: &CoFoldConfig) -> Result<CoFoldAuditReport, Co
             cmd.arg("fold").arg(&manifest_path).arg(&pred_out_dir);
         }
     }
-    let out = cmd.output()?;
-    if !out.status.success() {
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd.spawn()?;
+    let deadline = Instant::now() + Duration::from_secs(cfg.timeout_s);
+    let status = loop {
+        if let Some(st) = child.try_wait()? {
+            break st;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(CoFoldError::TimedOut(cfg.timeout_s));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let out = child.wait_with_output()?;
+    if !status.success() {
         return Err(CoFoldError::ExecutionFailed {
-            code: out.status.code(),
+            code: status.code(),
             stderr: format!(
                 "{}\n{}",
                 String::from_utf8_lossy(&out.stdout),
@@ -831,6 +868,113 @@ pub fn run_cofold_prediction(cfg: &CoFoldConfig) -> Result<CoFoldAuditReport, Co
     )?;
     std::fs::write(cfg.out_dir.join("cofold_report.md"), rep.render_markdown())?;
     Ok(rep)
+}
+
+/// Emits a validated `craftbio-compute` job bundle (`job_spec.json` + inputs + runner script)
+/// for remote dispatch via `fw compute submit` (Colab L4/T4 or institutional HPC).
+pub fn emit_cofold_job_bundle(
+    cfg: &CoFoldConfig,
+    bundle_dir: &Path,
+    job_id: Option<&str>,
+    project_ref: Option<&str>,
+    ip_tier: IpTier,
+) -> Result<(String, PathBuf), CoFoldError> {
+    if cfg.entities.is_empty() {
+        return Err(CoFoldError::Setup(
+            "co-folding bundle requires at least one protein or ligand entity".to_string(),
+        ));
+    }
+    let mut binder_chain: Option<String> = None;
+    let entities: Vec<CoFoldEntitySpec> = cfg
+        .entities
+        .iter()
+        .map(|ent| match ent {
+            CoFoldEntity::Protein { chain_id, sequence } => CoFoldEntitySpec::Protein {
+                chain_id: chain_id.clone(),
+                sequence: sequence.clone(),
+            },
+            CoFoldEntity::LigandSmiles { chain_id, smiles } => {
+                if cfg.predict_affinity && binder_chain.is_none() {
+                    binder_chain = Some(chain_id.clone());
+                }
+                CoFoldEntitySpec::LigandSmiles {
+                    chain_id: chain_id.clone(),
+                    smiles: smiles.clone(),
+                }
+            }
+            CoFoldEntity::IonOrCcd { chain_id, ccd_code } => CoFoldEntitySpec::IonOrCcd {
+                chain_id: chain_id.clone(),
+                ccd_code: ccd_code.clone(),
+            },
+        })
+        .collect();
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let resolved_id = job_id
+        .filter(|s| !s.trim().is_empty())
+        .map_or_else(|| format!("J-cofold-{stamp}"), str::to_string);
+    let req = CoFoldBundleRequest {
+        job_id: resolved_id.clone(),
+        name: cfg.job_name.clone(),
+        project_ref: project_ref.map(str::to_string),
+        backend: cfg.backend.as_str().to_string(),
+        entities,
+        predict_affinity_binder: binder_chain,
+        use_msa_server: cfg.use_msa_server,
+        diffusion_samples: cfg.diffusion_samples,
+        timeout_s: cfg.timeout_s,
+        data_tier: DataTier::PublicOnly,
+        ip_tier,
+    };
+    let (spec, files) = build_dockcraft_cofold_bundle(&req)?;
+    let spec_path = emit_job_bundle(bundle_dir, spec, &files)?;
+    Ok((resolved_id, spec_path))
+}
+
+/// Ingests a remote `fw compute fetch` result directory: verifies SHA-256 of every artifact via
+/// `craftbio-compute::ingest_result_manifest`, then runs DockCraft's local anti-hallucination
+/// audit (**PoseBusters + HYDE v2 + torsions + Vina + optional reference RMSD**).
+pub fn ingest_cofold_job_bundle(
+    remote_out_dir: &Path,
+    cfg: &CoFoldConfig,
+) -> Result<(VerifiedComputeResults, CoFoldAuditReport), CoFoldError> {
+    let t0 = Instant::now();
+    let verified = ingest_result_manifest(remote_out_dir)?;
+    std::fs::create_dir_all(&cfg.out_dir)?;
+    let (cif_path, conf_path, aff_path) = discover_cofold_outputs(remote_out_dir)?;
+    let conf_raw = conf_path
+        .as_ref()
+        .and_then(|p| std::fs::read_to_string(p).ok());
+    let aff_raw = aff_path
+        .as_ref()
+        .and_then(|p| std::fs::read_to_string(p).ok());
+    let ref_lig = cfg.reference_ligand_path.as_ref().and_then(|p| {
+        let txt = std::fs::read_to_string(p).ok()?;
+        let mut v = struct_core::parse_sdf_3d_with_limit(&txt, 1);
+        let mut m = v.pop()?.ok()?;
+        perceive_all(&mut m);
+        Some(m)
+    });
+    let rep = audit_cofold_prediction(
+        &verified.manifest.name,
+        cfg.backend,
+        verified.manifest.inputs.len().max(1),
+        &remote_out_dir.join("provenance.json"),
+        &cif_path,
+        conf_raw.as_deref(),
+        aff_raw.as_deref(),
+        ref_lig.as_ref(),
+        &cfg.out_dir,
+        t0.elapsed().as_millis(),
+    )?;
+    std::fs::write(
+        cfg.out_dir.join("cofold_report.json"),
+        serde_json::to_string_pretty(&rep)?,
+    )?;
+    std::fs::write(cfg.out_dir.join("cofold_report.md"), rep.render_markdown())?;
+    Ok((verified, rep))
 }
 
 fn discover_cofold_outputs(
@@ -969,6 +1113,120 @@ mod tests {
         ));
         let md = audit.render_markdown();
         assert!(md.contains("Anti-Hallucination") && md.contains("Boltz-2 Predicted ΔG"));
+
+        let _ = std::fs::remove_dir_all(&base);
+        Ok(())
+    }
+
+    #[test]
+    fn cofold_bundle_emit_ingest_and_timeout_gate() -> Result<(), Box<dyn std::error::Error>> {
+        let base = std::env::temp_dir().join(format!(
+            "dockcraft_cofold_bundle_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base)?;
+
+        let entities = vec![
+            CoFoldEntity::Protein {
+                chain_id: "A".to_string(),
+                sequence: "AHDK".to_string(),
+            },
+            CoFoldEntity::LigandSmiles {
+                chain_id: "L".to_string(),
+                smiles: "CCO".to_string(),
+            },
+        ];
+
+        // 1. F3-23 timeout gate rejects out-of-bounds timeout_s
+        let bad_cfg = CoFoldConfig {
+            entities: entities.clone(),
+            timeout_s: 5,
+            dry_run: true,
+            out_dir: base.join("bad"),
+            ..Default::default()
+        };
+        assert!(matches!(
+            run_cofold_prediction(&bad_cfg),
+            Err(CoFoldError::Compute(ComputeError::InvalidTimeout(5)))
+        ));
+
+        // 2. Emit portable craftbio-compute bundle
+        let cfg = CoFoldConfig {
+            job_name: "cdk2_remote".to_string(),
+            backend: CoFoldBackend::Boltz,
+            entities,
+            timeout_s: 1800,
+            out_dir: base.join("ingested_audit"),
+            ..Default::default()
+        };
+        let bdir = base.join("bundle");
+        let (jid, spec_path) = emit_cofold_job_bundle(
+            &cfg,
+            &bdir,
+            Some("J-dock-test-01"),
+            Some("research/demo"),
+            IpTier::Public,
+        )?;
+        assert_eq!(jid, "J-dock-test-01");
+        assert!(spec_path.is_file());
+        let loaded = craftbio_compute::load_and_verify_bundle(&bdir)?;
+        assert_eq!(loaded.runbook.as_deref(), Some("boltz2"));
+
+        // 3. Simulate fw-compute fetched output directory + provenance.json and ingest
+        let remote_out = base.join("remote_out");
+        std::fs::create_dir_all(&remote_out)?;
+        let pdb_txt = concat!(
+            "ATOM      1  CA  ALA A   1       0.000   0.000   0.000  1.00 20.00           C\n",
+            "ATOM      2  CA  HIE A   2       3.800   0.000   0.000  1.00 20.00           C\n",
+            "ATOM      3  CA  ASP A   3       7.600   0.000   0.000  1.00 20.00           C\n",
+            "ATOM      4  CA  LYS A   4      11.400   0.000   0.000  1.00 20.00           C\n",
+            "HETATM    5  C1  LIG L   1       4.000   4.500   0.000  1.00 20.00           C\n",
+            "HETATM    6  C2  LIG L   1       5.500   4.500   0.000  1.00 20.00           C\n",
+            "HETATM    7  O1  LIG L   1       6.200   5.600   0.000  1.00 20.00           O\n",
+            "END\n"
+        );
+        let model_path = remote_out.join("model_0.pdb");
+        std::fs::write(&model_path, pdb_txt)?;
+        let (digest, size) = craftbio_compute::sha256::sha256_file(&model_path)?;
+        let manifest = craftbio_compute::ComputeResultManifest {
+            schema_version: craftbio_compute::SPEC_SCHEMA_VERSION.to_string(),
+            job_id: jid,
+            name: "cdk2_remote".to_string(),
+            project_ref: Some("research/demo".to_string()),
+            producer: "dockcraft".to_string(),
+            target: "colab-l4".to_string(),
+            backend: "colab-cli".to_string(),
+            remote_job_id: Some("colab-01".to_string()),
+            status: "fetched".to_string(),
+            fingerprint: "deadbeef".to_string(),
+            data_tier: DataTier::PublicOnly,
+            ip_tier: IpTier::Public,
+            inputs: loaded.inputs,
+            outputs: vec![craftbio_compute::OutputArtifact {
+                path: model_path.display().to_string(),
+                name: "model_0.pdb".to_string(),
+                sha256: digest,
+                size_bytes: size,
+            }],
+            recorded_at: "2026-11-27T11:00:00+00:00".to_string(),
+            bco_path: None,
+        };
+        std::fs::write(
+            remote_out.join("provenance.json"),
+            serde_json::to_string_pretty(&manifest)?,
+        )?;
+        let (verified, rep) = ingest_cofold_job_bundle(&remote_out, &cfg)?;
+        assert_eq!(verified.verified_files.len(), 1);
+        assert!(rep.extracted_receptor_pdb.is_some());
+        assert!(rep.extracted_ligand_sdf.is_some());
+
+        // 4. Tamper 1 byte -> ingest MUST fail with ChecksumMismatch
+        std::fs::write(&model_path, pdb_txt.replace("11.400", "11.401"))?;
+        assert!(matches!(
+            ingest_cofold_job_bundle(&remote_out, &cfg),
+            Err(CoFoldError::Compute(ComputeError::ChecksumMismatch { .. }))
+        ));
 
         let _ = std::fs::remove_dir_all(&base);
         Ok(())

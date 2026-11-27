@@ -45,9 +45,9 @@ pub use cnn_rescore::{
 pub use cofold_bridge::{
     CoFoldAuditReport, CoFoldBackend, CoFoldConfidence, CoFoldConfig, CoFoldEntity,
     CoFoldEnvStatus, CoFoldError, CoFoldVerdict, audit_cofold_prediction, check_cofold_env,
-    extract_protein_sequences_from_mol, parse_cofold_confidence, render_boltz_yaml,
-    render_chai_fasta, res3_to_aa1, resolve_cofold_binary, run_cofold_prediction,
-    split_complex_receptor_and_ligand,
+    emit_cofold_job_bundle, extract_protein_sequences_from_mol, ingest_cofold_job_bundle,
+    parse_cofold_confidence, render_boltz_yaml, render_chai_fasta, res3_to_aa1,
+    resolve_cofold_binary, run_cofold_prediction, split_complex_receptor_and_ligand,
 };
 pub use export::{
     InteropSceneBundle, SceneExportRequest, build_chimerax_export, build_pymol_export,

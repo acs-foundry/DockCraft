@@ -17,6 +17,7 @@ pharm-core = { path = "../../crates/pharm-core" }
 prot-prep = { path = "../../crates/prot-prep" }
 dock-pipeline = { path = "../../crates/dock-pipeline" }
 craftbio-scene = { workspace = true }
+craftbio-compute = { workspace = true }
 clap = { workspace = true }
 flate2 = { workspace = true }
 serde = { workspace = true }

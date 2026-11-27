@@ -17,6 +17,7 @@ pharm-core = { path = "../pharm-core" }
 craftbio-sandbox = { workspace = true }
 craftbio-scene = { workspace = true }
 craftbio-report = { workspace = true }
+craftbio-compute = { workspace = true }
 rustix = { workspace = true }
 flate2 = { workspace = true }
 csv = { workspace = true }

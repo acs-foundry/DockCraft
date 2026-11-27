@@ -507,6 +507,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "craftbio-compute"
+version = "1.5.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "craftbio-report"
 version = "1.2.2"
 source = "git+https://github.com/acs-foundry/craftbio-libs?tag=v1.2.2#e4490fecaa23c7ea3370e32142e8edc512780318"
@@ -677,6 +686,7 @@ dependencies = [
 name = "dock-pipeline"
 version = "1.0.1"
 dependencies = [
+ "craftbio-compute",
  "craftbio-report",
  "craftbio-sandbox",
  "craftbio-scene",
@@ -732,6 +742,7 @@ name = "dockcraft-cli"
 version = "1.0.1"
 dependencies = [
  "clap",
+ "craftbio-compute",
  "craftbio-scene",
  "dock-engine",
  "dock-pipeline",

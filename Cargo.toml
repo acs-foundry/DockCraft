@@ -45,6 +45,7 @@ eframe = { version = "0.31", default-features = false, features = ["default_font
 craftbio-sandbox = { git = "https://github.com/acs-foundry/craftbio-libs", tag = "v1.2.2" }
 craftbio-scene = { git = "https://github.com/acs-foundry/craftbio-libs", tag = "v1.2.2" }
 craftbio-report = { git = "https://github.com/acs-foundry/craftbio-libs", tag = "v1.2.2" }
+craftbio-compute = { path = "../craftbio-libs/crates/compute" }
 
 [profile.release]
 overflow-checks = true
