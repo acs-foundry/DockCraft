@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
 
 mod dialogs;
+mod miniapps;
+mod tutorials;
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -10,6 +12,10 @@ use dialogs::{
     DockCraftProject, launch_admetcraft_handoff, launch_chemcraft_with_path, pick_open_file,
     pick_save_file,
 };
+use miniapps::{
+    ALL_MINI_APPS, MiniAppId, WorkspaceWindows, mini_app_meta, render_mini_app_header,
+};
+use tutorials::{TutorialAction, TutorialState, built_in_tutorials};
 use dock_engine::{
     DockingConfig, DockingConstraint, DockingPose, PharmacophoreKind, ScoringFunction, dock_ligand,
     score_complex,
@@ -232,6 +238,8 @@ struct DockCraftApp {
     camera: Camera3D,
     shared_payload: Arc<RwLock<SharedViewportPayload>>,
     scene_dirty: bool,
+    workspace: WorkspaceWindows,
+    tutorial_state: TutorialState,
 }
 
 impl DockCraftApp {
@@ -299,6 +307,8 @@ impl DockCraftApp {
             camera: cam,
             shared_payload: Arc::new(RwLock::new(SharedViewportPayload::default())),
             scene_dirty: true,
+            workspace: WorkspaceWindows::default(),
+            tutorial_state: TutorialState::default(),
         };
         app.detect_pockets_now();
         if let Some(path) = startup.file {
@@ -314,6 +324,7 @@ impl DockCraftApp {
                 ];
             }
             app.viewport_opts.show_grid_box = true;
+            app.workspace.open(MiniAppId::DockingGridBox);
             app.scene_dirty = true;
             app.status_line = format!(
                 "Sincronizado desde BiomolCraft — Caja 3D ({:.1}, {:.1}, {:.1} | {:.0}×{:.0}×{:.0} Å) lista para docking.",
@@ -1407,6 +1418,1013 @@ impl DockCraftApp {
             guard.background = self.viewport_opts.background_rgba;
         }
     }
+
+    fn run_tutorial_action(&mut self, track_idx: usize, step_idx: usize, action: TutorialAction) {
+        match action {
+            TutorialAction::DetectPocketsAndShowBox => {
+                self.workspace.open(MiniAppId::DockingGridBox);
+                self.detect_pockets_now();
+                self.viewport_opts.show_grid_box = true;
+                self.viewport_opts.show_pocket_cloud = true;
+                let c = self.grid_box.center;
+                self.camera
+                    .focus_on([c[0] as f32, c[1] as f32, c[2] as f32], 15.0);
+                self.scene_dirty = true;
+                self.tutorial_state.mark_completed(
+                    track_idx,
+                    step_idx,
+                    format!(
+                        "Detectados {} bolsillos y activada la Caja GridBox 3D en la mini-app 'Bolsillos & Docking'.",
+                        self.pockets.len()
+                    ),
+                );
+            }
+            TutorialAction::RunLiveDocking => {
+                self.workspace.open(MiniAppId::DockingGridBox);
+                self.run_docking_now();
+                self.tutorial_state.mark_completed(
+                    track_idx,
+                    step_idx,
+                    format!(
+                        "Docking completado ({} poses). Selecciona distintos modos en 'Docked Modes' para compararlos en 3D.",
+                        self.dock_poses.len()
+                    ),
+                );
+            }
+            TutorialAction::InspectHydeAndTorsions => {
+                self.workspace.open(MiniAppId::HydeAudit);
+                self.viewport_opts.show_hyde_coronas = true;
+                self.viewport_opts.show_torsion_lights = true;
+                self.viewport_opts.show_interactions = true;
+                self.rescore_active_complex();
+                self.scene_dirty = true;
+                self.tutorial_state.mark_completed(
+                    track_idx,
+                    step_idx,
+                    "Activadas Coronas HYDE v2, semáforo de torsiones e interacciones 3D en la mini-app 'HYDE & PoseBusters'.".to_string(),
+                );
+            }
+            TutorialAction::RunProtPrepAudit => {
+                self.workspace.open(MiniAppId::ReceptorPrepWaters);
+                self.run_prot_prep_now();
+                self.tutorial_state.mark_completed(
+                    track_idx,
+                    step_idx,
+                    "ProtPrep ejecutado: revisa el grado de calidad, flips de puentes de H y protonación en 'ProtPrep & Aguas'.".to_string(),
+                );
+            }
+            TutorialAction::ScanBridgingWaters => {
+                self.workspace.open(MiniAppId::ReceptorPrepWaters);
+                self.viewport_opts.show_waters_metals = true;
+                self.metal_coordination = true;
+                self.detect_waters_now();
+                self.scene_dirty = true;
+                self.tutorial_state.mark_completed(
+                    track_idx,
+                    step_idx,
+                    format!(
+                        "Escaneo completado: {} agua(s) puente estructurales encontradas dentro de la GridBox.",
+                        self.bridging_waters.len()
+                    ),
+                );
+            }
+            TutorialAction::AnalyzeMifBlueprint => {
+                self.workspace.open(MiniAppId::PharmacophoreSite);
+                self.analyze_active_site_now();
+                self.tutorial_state.mark_completed(
+                    track_idx,
+                    step_idx,
+                    "Plano del Sitio Activo (MIFs) calculado y proyectado en 3D con hotspots y matriz de distancias.".to_string(),
+                );
+            }
+            TutorialAction::ApplyBlueprintRestraints => {
+                self.workspace.open(MiniAppId::PharmacophoreSite);
+                if self.site_blueprint.is_none() {
+                    self.analyze_active_site_now();
+                }
+                self.apply_blueprint_to_docking();
+                self.tutorial_state.mark_completed(
+                    track_idx,
+                    step_idx,
+                    format!(
+                        "Aplicadas {} restricciones farmacofóricas suaves listas para guiar el próximo docking.",
+                        self.constraints.len()
+                    ),
+                );
+            }
+            TutorialAction::RunInPocketMutationDemo => {
+                self.workspace.open(MiniAppId::InspiratorAdmet);
+                if self.selected_atom_idx.is_none() {
+                    self.selected_atom_idx = Some(2);
+                }
+                self.apply_mutation(SubstituentPreset::F);
+                self.tutorial_state.mark_completed(
+                    track_idx,
+                    step_idx,
+                    "Aplicada mutación in-pocket (-F) con minimización HYDE instantánea. Pulsa Undo (Ctrl+Z) si deseas revertirla.".to_string(),
+                );
+            }
+            TutorialAction::PreviewAdmetAndLinks => {
+                self.workspace.open(MiniAppId::InspiratorAdmet);
+                if let Some(lig) = &self.ligand {
+                    self.admet_preview = Some(evaluate_admet(lig));
+                }
+                self.tutorial_state.mark_completed(
+                    track_idx,
+                    step_idx,
+                    "Calculado perfil ADMET rápido (MW, cLogP, TPSA, QED, Lipinski) y listos los accesos a AdmetCraft/ChemCraft.".to_string(),
+                );
+            }
+            TutorialAction::RunScreeningCampaignDemo => {
+                self.workspace.open(MiniAppId::CampaignSuite);
+                self.run_campaign_now();
+                self.tutorial_state.mark_completed(
+                    track_idx,
+                    step_idx,
+                    "Campaña ejecutada: revisa la Tabla MPO en 'Cribado & Suite' (puedes ampliarla con '🗖 Ampliar ventana').".to_string(),
+                );
+            }
+            TutorialAction::OpenMiniApp(app_id) => {
+                self.workspace.open(app_id);
+                self.tutorial_state.mark_completed(
+                    track_idx,
+                    step_idx,
+                    format!(
+                        "Abierta la mini-app '{}' (puedes arrastrarla, estirarla o ampliarla libremente).",
+                        mini_app_meta(app_id).short_label
+                    ),
+                );
+            }
+        }
+    }
+
+    fn ui_tutorials_miniapp(&mut self, ui: &mut egui::Ui) {
+        let tracks = built_in_tutorials();
+        if tracks.is_empty() {
+            return;
+        }
+        if self.tutorial_state.active_track_idx >= tracks.len() {
+            self.tutorial_state.active_track_idx = 0;
+        }
+        let t_idx = self.tutorial_state.active_track_idx;
+
+        ui.strong("Elige un recorrido interactivo de DockCraft:");
+        ui.horizontal_wrapped(|ui| {
+            for (idx, tr) in tracks.iter().enumerate() {
+                let done = self.tutorial_state.completed_in_track(idx, tr.steps.len());
+                let lbl = format!("{} ({}/{})", tr.title, done, tr.steps.len());
+                if ui
+                    .selectable_label(idx == t_idx, lbl)
+                    .on_hover_text(format!("Tutorial [{}]: {}", tr.id, tr.summary))
+                    .clicked()
+                {
+                    self.tutorial_state.active_track_idx = idx;
+                    self.tutorial_state.active_step_idx = 0;
+                }
+            }
+        });
+
+        let track = &tracks[self.tutorial_state.active_track_idx];
+        let total_steps = track.steps.len();
+        if self.tutorial_state.active_step_idx >= total_steps {
+            self.tutorial_state.active_step_idx = 0;
+        }
+        let s_idx = self.tutorial_state.active_step_idx;
+        let done_count = self
+            .tutorial_state
+            .completed_in_track(self.tutorial_state.active_track_idx, total_steps);
+        let progress = (done_count as f32) / (total_steps.max(1) as f32);
+
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.strong(track.title);
+            ui.small(format!("(~{} min)", track.duration_min));
+        });
+        ui.small(track.summary);
+        ui.add(
+            egui::ProgressBar::new(progress)
+                .text(format!("Progreso: {done_count} / {total_steps} pasos")),
+        );
+
+        ui.add_space(6.0);
+        ui.horizontal_wrapped(|ui| {
+            for (idx, st) in track.steps.iter().enumerate() {
+                let is_done = self
+                    .tutorial_state
+                    .completed_steps
+                    .contains(&(self.tutorial_state.active_track_idx, idx));
+                let tag = if is_done { "✓" } else { "•" };
+                if ui
+                    .selectable_label(idx == s_idx, format!("{tag} Paso {}: {}", idx + 1, st.title))
+                    .clicked()
+                {
+                    self.tutorial_state.active_step_idx = idx;
+                }
+            }
+        });
+
+        let step = track.steps[s_idx].clone();
+        ui.add_space(6.0);
+        egui::Frame::group(ui.style())
+            .corner_radius(egui::CornerRadius::same(8))
+            .inner_margin(egui::Margin::symmetric(12, 10))
+            .show(ui, |ui| {
+                ui.heading(format!(
+                    "Paso {} de {}: {}",
+                    s_idx + 1,
+                    total_steps,
+                    step.title
+                ));
+                ui.add_space(4.0);
+                ui.label(RichText::new("Objetivo:").strong());
+                ui.label(step.objective);
+                ui.add_space(4.0);
+                ui.label(RichText::new("Qué observar en pantalla:").strong());
+                ui.label(step.what_to_look_at);
+                ui.add_space(8.0);
+                ui.horizontal_wrapped(|ui| {
+                    let run_btn = egui::Button::new(
+                        RichText::new(step.action_label)
+                            .strong()
+                            .color(Color32::WHITE),
+                    )
+                    .fill(Color32::from_rgb(4, 120, 87));
+                    if ui.add(run_btn).clicked() {
+                        self.run_tutorial_action(
+                            self.tutorial_state.active_track_idx,
+                            s_idx,
+                            step.action,
+                        );
+                    }
+                    if let Some(app_id) = step.related_app
+                        && ui
+                            .button(format!("Abrir {}", mini_app_meta(app_id).short_label))
+                            .clicked()
+                    {
+                        self.workspace.open(app_id);
+                    }
+                });
+            });
+
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(s_idx > 0, egui::Button::new("← Paso anterior"))
+                .clicked()
+            {
+                self.tutorial_state.active_step_idx = s_idx.saturating_sub(1);
+            }
+            if ui
+                .add_enabled(
+                    s_idx + 1 < total_steps,
+                    egui::Button::new("Siguiente paso →"),
+                )
+                .clicked()
+            {
+                self.tutorial_state.active_step_idx = (s_idx + 1).min(total_steps - 1);
+            }
+        });
+        ui.add_space(4.0);
+        ui.colored_label(
+            Color32::from_rgb(52, 211, 153),
+            &self.tutorial_state.last_feedback,
+        );
+    }
+
+    fn ui_docking_gridbox_miniapp(&mut self, ui: &mut egui::Ui) {
+        ui.strong("Cargar ligando rápido (SMILES o ruta SDF/MOL2/PDBQT):");
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.ligand_path_input)
+                    .desired_width(240.0)
+                    .hint_text("SMILES o ruta del ligando..."),
+            );
+            if ui.button("Cargar").clicked() {
+                self.load_ligand_from_input();
+            }
+            if ui.button("Explorar...").clicked() {
+                self.open_ligand_dialog();
+            }
+        });
+        ui.separator();
+
+        ui.horizontal(|ui| {
+            ui.heading("Bolsillos detectados");
+            if ui.small_button("Detectar bolsillos").clicked() {
+                self.detect_pockets_now();
+            }
+            if ui.small_button("Caja ← BiomolCraft").clicked() {
+                self.grab_box_from_biomolcraft();
+            }
+        });
+        let mut clicked_pocket: Option<usize> = None;
+        for (idx, p) in self.pockets.iter().take(6).enumerate() {
+            let sel = self.selected_pocket_idx == Some(idx);
+            if ui
+                .selectable_label(
+                    sel,
+                    format!(
+                        "#{} Druggability {:.2} | {:.0} Å³ | SASA {:.0} Å²",
+                        p.rank, p.druggability_score, p.volume_a3, p.sasa_a2
+                    ),
+                )
+                .clicked()
+            {
+                clicked_pocket = Some(idx);
+            }
+        }
+        if let Some(idx) = clicked_pocket
+            && let Some(p) = self.pockets.get(idx).cloned()
+        {
+            self.selected_pocket_idx = Some(idx);
+            self.grid_box = p.grid_box;
+            self.viewport_opts.show_grid_box = true;
+            self.camera.focus_on(
+                [p.center[0] as f32, p.center[1] as f32, p.center[2] as f32],
+                14.0,
+            );
+            self.detect_waters_now();
+            self.scene_dirty = true;
+        }
+
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.heading("Caja de Docking 3D (GridBox Å)");
+            if ui
+                .checkbox(&mut self.viewport_opts.show_grid_box, "Visible en 3D")
+                .changed()
+            {
+                self.scene_dirty = true;
+            }
+        });
+        let mut box_changed = false;
+        for (axis, lbl) in ["X", "Y", "Z"].iter().enumerate() {
+            ui.horizontal(|ui| {
+                ui.label(format!("Centro {lbl}:"));
+                box_changed |= ui
+                    .add(egui::DragValue::new(&mut self.grid_box.center[axis]).speed(0.2))
+                    .changed();
+                ui.label(format!("Tamaño {lbl}:"));
+                box_changed |= ui
+                    .add(
+                        egui::DragValue::new(&mut self.grid_box.size[axis])
+                            .speed(0.2)
+                            .range(8.0..=80.0),
+                    )
+                    .changed();
+            });
+        }
+        if box_changed {
+            self.scene_dirty = true;
+        }
+        ui.horizontal_wrapped(|ui| {
+            if ui.small_button("Centrar en ligando").clicked()
+                && let Some(lig) = &self.ligand
+                && let Ok(gb) = GridBox::from_ligand(lig, 6.0)
+            {
+                self.grid_box = gb;
+                self.viewport_opts.show_grid_box = true;
+                self.scene_dirty = true;
+            }
+            if ui.small_button("Enfocar cámara en Caja").clicked() {
+                let c = self.grid_box.center;
+                self.camera
+                    .focus_on([c[0] as f32, c[1] as f32, c[2] as f32], 15.0);
+            }
+        });
+
+        ui.separator();
+        ui.horizontal_wrapped(|ui| {
+            let dock_btn = egui::Button::new(
+                RichText::new("🚀 Ejecutar Docking (Ctrl+D)")
+                    .strong()
+                    .color(Color32::WHITE),
+            )
+            .fill(Color32::from_rgb(14, 116, 144));
+            if ui.add(dock_btn).clicked() {
+                self.run_docking_now();
+            }
+            if ui.button("Cribado Virtual").clicked() {
+                self.run_campaign_now();
+                self.workspace.open(MiniAppId::CampaignSuite);
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Motor:");
+            ui.selectable_value(&mut self.scoring, ScoringFunction::Vina, "Vina");
+            ui.selectable_value(&mut self.scoring, ScoringFunction::Vinardo, "Vinardo");
+            ui.selectable_value(&mut self.scoring, ScoringFunction::DockCraftHybrid, "Hybrid");
+            ui.checkbox(&mut self.hyde_rerank, "Consenso HYDE");
+        });
+        ui.add(egui::Slider::new(&mut self.exhaustiveness, 1..=16).text("Exhaustiveness"));
+
+        ui.separator();
+        ui.heading("Poses acopladas (Docked Modes)");
+        if self.dock_poses.is_empty() {
+            ui.small("Pulsa 'Ejecutar Docking' para generar y rankear poses 3D.");
+        }
+        for (i, pose) in self.dock_poses.iter().enumerate() {
+            let sel = self.selected_pose_idx == i;
+            if ui
+                .selectable_label(
+                    sel,
+                    format!(
+                        "Mode {} | {:.2} kcal/mol | RMSD {:.2} Å",
+                        pose.mode, pose.affinity_kcal_mol, pose.terms.rmsd_to_best
+                    ),
+                )
+                .clicked()
+            {
+                self.selected_pose_idx = i;
+                self.ligand = Some(pose.molecule.clone());
+                self.vina_score_kcal = Some(pose.affinity_kcal_mol);
+                if let Some(rec) = &self.receptor {
+                    self.hyde_report = score_pose_hyde(rec, &pose.molecule).ok();
+                }
+                self.scene_dirty = true;
+            }
+        }
+    }
+
+    fn ui_receptor_prep_waters_miniapp(&mut self, ui: &mut egui::Ui) {
+        ui.heading("ProtPrep: Auditoría, pKa y Flips Asn/Gln/His");
+        ui.horizontal(|ui| {
+            ui.label("pH fisiológico:");
+            ui.add(
+                egui::DragValue::new(&mut self.prep_ph)
+                    .speed(0.1)
+                    .range(4.0..=10.0),
+            );
+            ui.label("Cadenas:");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.prep_chains_input)
+                    .desired_width(80.0)
+                    .hint_text("Todas"),
+            );
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.checkbox(&mut self.prep_keep_metals, "Conservar metales");
+            ui.checkbox(&mut self.prep_keep_cofactors, "Conservar cofactores");
+            ui.checkbox(&mut self.prep_optimize_hbonds, "Optimizar flips H-Bond");
+            ui.checkbox(&mut self.prep_keep_bridging_waters, "Retener aguas puente");
+        });
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("▶ Preparar y Auditar Receptor").clicked() {
+                self.run_prot_prep_now();
+            }
+            if self.prep_result.is_some()
+                && ui.button("Exportar Auditoría (.md)").clicked()
+            {
+                self.export_prep_audit_dialog();
+            }
+            if ui.small_button("Exportar Receptor (.pdb)").clicked() {
+                self.export_receptor_pdb();
+            }
+        });
+        if let Some(prep) = &self.prep_result {
+            ui.separator();
+            let a = &prep.audit;
+            let g_col = if a.quality_grade.starts_with('A') {
+                Color32::from_rgb(46, 204, 113)
+            } else if a.quality_grade.starts_with('B') {
+                Color32::from_rgb(241, 196, 15)
+            } else {
+                Color32::from_rgb(235, 77, 75)
+            };
+            ui.colored_label(g_col, RichText::new(&a.quality_grade).strong());
+            if let Some(res) = a.resolution_a {
+                ui.small(format!(
+                    "Resolución: {res:.2} Å | R-free: {} | Carga neta: {:+}",
+                    a.r_free.map_or_else(|| "n/a".to_string(), |v| format!("{v:.3}")),
+                    prep.protonation.total_protein_charge
+                ));
+            } else if a.is_alphafold {
+                ui.small(format!(
+                    "AlphaFold pLDDT medio: {:.1} | Carga neta: {:+}",
+                    a.mean_b_factor_or_plddt, prep.protonation.total_protein_charge
+                ));
+            }
+            ui.small(format!(
+                "Altlocs resueltos: {} | Átomos faltantes: {} | Flips: {} | Rotores OH: {}",
+                a.altlocs_resolved.len(),
+                a.missing_heavy_atoms.len(),
+                prep.hbond_opt.flips_applied.len(),
+                prep.hbond_opt.polar_h_rotors_optimized
+            ));
+            for iss in a.issues.iter().take(6) {
+                let c = match iss.severity {
+                    AuditSeverity::Critical => Color32::from_rgb(235, 77, 75),
+                    AuditSeverity::Warning => Color32::from_rgb(241, 196, 15),
+                    AuditSeverity::Info => Color32::from_rgb(130, 180, 240),
+                };
+                ui.colored_label(
+                    c,
+                    RichText::new(format!("• {}: {}", iss.category, iss.message)).small(),
+                );
+            }
+        }
+
+        ui.separator();
+        ui.heading("Aguas Puente Estructurales y Metales");
+        ui.horizontal_wrapped(|ui| {
+            ui.checkbox(&mut self.metal_coordination, "Coordinación metálica AutoDock4Zn");
+            if ui.button("Escanear aguas puente").clicked() {
+                self.detect_waters_now();
+            }
+        });
+        let mut changed = false;
+        if self.bridging_waters.is_empty() {
+            ui.small("No hay aguas puente detectadas dentro de la GridBox actual.");
+        }
+        for bw in &self.bridging_waters {
+            let mut kept = self.kept_water_resseqs.contains(&bw.res_seq);
+            let lbl = format!(
+                "HOH {} ({} H-bonds: {})",
+                bw.res_seq,
+                bw.receptor_hbonds,
+                bw.lining_residues
+                    .iter()
+                    .take(3)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            if ui.checkbox(&mut kept, lbl).changed() {
+                if kept {
+                    self.kept_water_resseqs.insert(bw.res_seq);
+                } else {
+                    self.kept_water_resseqs.remove(&bw.res_seq);
+                }
+                changed = true;
+            }
+        }
+        if changed {
+            self.rebuild_receptor_with_kept_waters();
+        }
+    }
+
+    fn ui_pharmacophore_site_miniapp(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Site Blueprint (MIFs 7 Sondas y Distancias)");
+        ui.checkbox(
+            &mut self.blueprint_use_holo,
+            "Incluir ligando cargado (consenso Holo + Apo)",
+        );
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("▶ Analizar Sitio Activo (MIFs)").clicked() {
+                self.analyze_active_site_now();
+            }
+            if ui.button("Aplicar → Restricciones").clicked() {
+                self.apply_blueprint_to_docking();
+            }
+            if ui.small_button("Cargar .pharm.json").clicked() {
+                self.load_blueprint_dialog();
+            }
+            if ui.small_button("Exportar .pharm.json / .md").clicked() {
+                self.export_blueprint_dialog();
+            }
+        });
+        let mut bp_changed = false;
+        if let Some(bp) = &mut self.site_blueprint {
+            let g = &bp.geometry;
+            ui.small(format!(
+                "Volumen: {:.0} Å³ | Dimensiones: {:.1}×{:.1}×{:.1} Å",
+                g.accessible_volume_a3,
+                g.principal_dims_a[0],
+                g.principal_dims_a[1],
+                g.principal_dims_a[2]
+            ));
+            ui.small(format!(
+                "Hidrofóbico {:.0}% / Polar {:.0}% | MW recomendado {:.0}–{:.0} Da",
+                g.hydrophobic_fraction * 100.0,
+                g.polar_fraction * 100.0,
+                g.recommended_mw_range[0],
+                g.recommended_mw_range[1]
+            ));
+            ui.separator();
+            ui.strong("Hotspots (activa/desactiva para recalcular matriz):");
+            for f in &mut bp.features {
+                let src_tag = match f.source {
+                    FeatureSource::ApoMif => "Apo",
+                    FeatureSource::HybridApoHolo => "Hyb",
+                    FeatureSource::HoloValidated => "Holo",
+                    FeatureSource::UserDefined => "User",
+                };
+                ui.horizontal(|ui| {
+                    if ui
+                        .checkbox(
+                            &mut f.enabled,
+                            format!("{} {:?} [{}]", f.id, f.kind, src_tag),
+                        )
+                        .changed()
+                    {
+                        bp_changed = true;
+                    }
+                    ui.small(format!("{} ({:.1} kcal)", f.key_residue, f.energy_kcal));
+                });
+            }
+            if bp_changed {
+                bp.rebuild_distance_matrix();
+            }
+            if !bp.distance_matrix.is_empty() {
+                ui.separator();
+                ui.strong(format!(
+                    "Distancias óptimas ({} pares):",
+                    bp.distance_matrix.len()
+                ));
+                for d in bp.distance_matrix.iter().take(12) {
+                    ui.small(format!(
+                        "{} ↔ {}: {:.2} Å (rango {:.1}–{:.1})",
+                        d.from_id, d.to_id, d.ideal_distance_a, d.min_distance_a, d.max_distance_a
+                    ));
+                }
+            }
+        }
+        if bp_changed {
+            self.sync_pharmacophore_visuals();
+        }
+
+        ui.separator();
+        ui.heading("Restricciones manuales y Cadenas Flexibles");
+        ui.label("Residuos flexibles (p. ej. A:ASP189,A:TRP79):");
+        ui.text_edit_singleline(&mut self.flex_residues_input);
+        ui.horizontal_wrapped(|ui| {
+            egui::ComboBox::from_id_salt("pharm_kind_miniapp")
+                .selected_text(format!("{:?}", self.new_pharm_kind))
+                .width(120.0)
+                .show_ui(ui, |ui| {
+                    for k in [
+                        PharmacophoreKind::HDonor,
+                        PharmacophoreKind::HAcceptor,
+                        PharmacophoreKind::Aromatic,
+                        PharmacophoreKind::Hydrophobic,
+                        PharmacophoreKind::PositiveIonizable,
+                        PharmacophoreKind::NegativeIonizable,
+                        PharmacophoreKind::MetalChelate,
+                    ] {
+                        ui.selectable_value(&mut self.new_pharm_kind, k, format!("{k:?}"));
+                    }
+                });
+            ui.add(
+                egui::DragValue::new(&mut self.new_pharm_radius)
+                    .speed(0.1)
+                    .range(0.5..=5.0)
+                    .prefix("R="),
+            );
+            if ui.button("+ Esfera en Átomo/Centro").clicked() {
+                let ctr = self
+                    .selected_atom_idx
+                    .and_then(|i| self.ligand.as_ref().and_then(|l| l.atoms.get(i)))
+                    .map_or(self.grid_box.center, |a| a.coords);
+                self.constraints
+                    .push(DockingConstraint::PharmacophoreSphere {
+                        center: ctr,
+                        radius: self.new_pharm_radius,
+                        kind: self.new_pharm_kind,
+                        weight: 4.0,
+                    });
+                self.sync_pharmacophore_visuals();
+            }
+            if !self.constraints.is_empty() && ui.button("Limpiar").clicked() {
+                self.constraints.clear();
+                self.sync_pharmacophore_visuals();
+            }
+        });
+        ui.small(format!("Restricciones activas: {}", self.constraints.len()));
+    }
+
+    fn ui_hyde_audit_miniapp(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            let mut chg = false;
+            chg |= ui
+                .checkbox(&mut self.viewport_opts.show_hyde_coronas, "Coronas HYDE")
+                .changed();
+            chg |= ui
+                .checkbox(&mut self.viewport_opts.show_torsion_lights, "Torsiones")
+                .changed();
+            chg |= ui
+                .checkbox(&mut self.viewport_opts.show_interactions, "Interacciones 3D")
+                .changed();
+            if chg {
+                self.scene_dirty = true;
+            }
+        });
+        ui.separator();
+
+        if let Some(rep) = &self.hyde_report {
+            if let Some(pb) = &rep.posebusters {
+                let (col, badge) = if pb.valid {
+                    (Color32::from_rgb(46, 204, 113), "PASS PoseBusters (5/5)")
+                } else {
+                    (Color32::from_rgb(235, 77, 75), "WARN PoseBusters")
+                };
+                ui.colored_label(col, RichText::new(badge).strong())
+                    .on_hover_text(&pb.summary);
+            }
+            let vina_v = self.vina_score_kcal.unwrap_or(rep.total_delta_g_kcal);
+            let cons = consensus_affinity_kcal(vina_v, vina_v, rep.total_delta_g_kcal);
+            ui.label(format!(
+                "Vina: {:.2} | HYDE: {:.2} | Consenso: {:.2} kcal/mol",
+                vina_v, rep.total_delta_g_kcal, cons
+            ));
+            ui.label(format!(
+                "Ki estimada: {} [{} – {}] | LE: {:.3}",
+                format_ki_nm(rep.estimated_ki_nm),
+                format_ki_nm(rep.ki_range_nm.0),
+                format_ki_nm(rep.ki_range_nm.1),
+                rep.ligand_efficiency
+            ));
+
+            if let Some(tr) = &rep.torsion_report {
+                ui.horizontal(|ui| {
+                    ui.strong("Semáforo Torsiones:");
+                    ui.colored_label(
+                        Color32::from_rgb(46, 204, 113),
+                        format!("{} Verdes", tr.green_count),
+                    );
+                    ui.colored_label(
+                        Color32::from_rgb(241, 196, 15),
+                        format!("{} Amarillas", tr.yellow_count),
+                    );
+                    ui.colored_label(
+                        Color32::from_rgb(235, 77, 75),
+                        format!("{} Rojas", tr.red_count),
+                    );
+                    ui.small(format!("(+{:.2} kcal tensión)", tr.total_strain_kcal));
+                });
+                if !tr.torsions.is_empty() {
+                    egui::CollapsingHeader::new("Diedros rotables")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            for t in &tr.torsions {
+                                let c = match t.status {
+                                    TorsionStatus::Green => Color32::from_rgb(46, 204, 113),
+                                    TorsionStatus::Yellow => Color32::from_rgb(241, 196, 15),
+                                    TorsionStatus::Red => Color32::from_rgb(235, 77, 75),
+                                };
+                                ui.horizontal(|ui| {
+                                    ui.colored_label(c, "●");
+                                    ui.small(format!(
+                                        "{}-{} | {} | {:.0}° (+{:.2})",
+                                        t.atom_u, t.atom_v, t.pattern, t.dihedral_deg, t.strain_kcal
+                                    ));
+                                });
+                            }
+                        });
+                }
+            }
+        } else {
+            ui.small("Carga o acopla un ligando para ver el análisis HYDE v2 y PoseBusters.");
+        }
+
+        ui.separator();
+        ui.heading("Desglose HYDE por átomo (clic para seleccionar en 3D)");
+        egui::ScrollArea::vertical()
+            .id_salt("atom_hyde_mini_scroll")
+            .max_height(200.0)
+            .show(ui, |ui| {
+                if let Some(rep) = &self.hyde_report {
+                    for sc in &rep.atom_scores {
+                        let col = Color32::from_rgb(
+                            (sc.corona_color[0] * 255.0) as u8,
+                            (sc.corona_color[1] * 255.0) as u8,
+                            (sc.corona_color[2] * 255.0) as u8,
+                        );
+                        ui.horizontal(|ui| {
+                            ui.colored_label(col, "●");
+                            let sel = self.selected_atom_idx == Some(sc.atom_index);
+                            if ui
+                                .selectable_label(
+                                    sel,
+                                    format!(
+                                        "#{} {} ({:+.2})",
+                                        sc.atom_index, sc.element, sc.delta_g_kcal
+                                    ),
+                                )
+                                .clicked()
+                            {
+                                self.selected_atom_idx = Some(sc.atom_index);
+                                self.scene_dirty = true;
+                            }
+                            ui.small(&sc.diagnostic);
+                        });
+                    }
+                }
+            });
+
+        ui.separator();
+        ui.heading("Interacciones 3D direccionales");
+        egui::ScrollArea::vertical()
+            .id_salt("inter_mini_scroll")
+            .max_height(150.0)
+            .show(ui, |ui| {
+                if let Some(rep) = &self.hyde_report {
+                    for inter in &rep.interactions {
+                        let ang_str = inter
+                            .angle_deg
+                            .map_or_else(String::new, |a| format!(" | {a:.0}°"));
+                        ui.small(format!(
+                            "{:?} | {} | {:.2} Å{ang_str} ({:+.2} kcal)",
+                            inter.kind, inter.rec_residue, inter.distance_a, inter.energy_kcal
+                        ));
+                    }
+                }
+            });
+    }
+
+    fn ui_inspirator_admet_miniapp(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Inspirator In-Pocket (32 Sustituyentes)");
+        ui.small("Haz clic en un átomo del ligando en el visor 3D (o en HYDE) y elige un grupo funcional para mutar y minimizar al instante.");
+        ui.horizontal(|ui| {
+            ui.label(format!(
+                "Átomo ancla seleccionado: {}",
+                self.selected_atom_idx
+                    .map_or_else(|| "Ninguno".to_string(), |i| format!("#{i}"))
+            ));
+            if !self.pose_history.is_empty()
+                && ui.button("↩ Deshacer (Ctrl+Z)").clicked()
+                && let Some(prev) = self.pose_history.pop()
+            {
+                self.ligand = Some(prev);
+                self.rescore_active_complex();
+                self.scene_dirty = true;
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
+            for cat in [
+                InspiratorCategory::HalogensSmall,
+                InspiratorCategory::AlkylFluoro,
+                InspiratorCategory::PolarHBond,
+                InspiratorCategory::RingsBioisosteres,
+            ] {
+                ui.selectable_value(&mut self.inspirator_cat, cat, cat.label());
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
+            for &preset in self.inspirator_cat.presets() {
+                if ui.button(preset.label()).clicked() {
+                    self.apply_mutation(preset);
+                }
+            }
+        });
+        if let Some((lbl, ddg)) = &self.last_mutation_delta {
+            let col = if *ddg <= 0.0 {
+                Color32::LIGHT_GREEN
+            } else {
+                Color32::LIGHT_RED
+            };
+            ui.colored_label(col, format!("Última mutación {lbl}: ΔΔG = {ddg:+.2} kcal/mol"));
+        }
+
+        ui.separator();
+        ui.heading("Vista previa ADMET y envío a Suite");
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("Calcular ADMET rápido").clicked()
+                && let Some(lig) = &self.ligand
+            {
+                self.admet_preview = Some(evaluate_admet(lig));
+            }
+            if ui.button("Abrir en AdmetCraft (ADMET/PBPK)").clicked() {
+                self.open_in_admetcraft();
+            }
+            if ui.button("Enviar a ChemCraft (SAR 2D/3D)").clicked() {
+                self.open_in_chemcraft();
+            }
+        });
+        if let Some(adm) = &self.admet_preview {
+            ui.label(format!(
+                "MW {:.1} Da | cLogP {:.2} | TPSA {:.1} Å² | QED {:.2} | Violaciones Lipinski: {}",
+                adm.mw, adm.clogp, adm.tpsa, adm.qed_score, adm.lipinski_violations
+            ));
+        }
+    }
+
+    fn ui_campaign_suite_miniapp(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("▶ Ejecutar Cribado Virtual").clicked() {
+                self.run_campaign_now();
+            }
+            if ui.button("Exportar CSV").clicked() {
+                self.export_campaign_csv();
+            }
+            if ui.button("Exportar Poses (.sdf)").clicked() {
+                self.export_poses_sdf();
+            }
+            if ui.button("Abrir en BiomolCraft (ViewDockX)").clicked() {
+                self.send_to_biomolcraft_now();
+            }
+            if ui.button("Enviar a ChemCraft").clicked() {
+                self.open_in_chemcraft();
+            }
+            if ui.button("Abrir en AdmetCraft").clicked() {
+                self.open_in_admetcraft();
+            }
+        });
+        if let Some(rep) = &self.campaign_report
+            && let Some(enr) = &rep.enrichment
+        {
+            ui.colored_label(
+                Color32::from_rgb(56, 189, 248),
+                format!(
+                    "Enriquecimiento — ROC AUC: {:.3} | BEDROC20: {:.3} | EF1%: {:.2} | EF5%: {:.2}",
+                    enr.roc_auc, enr.bedroc_20, enr.ef_1_percent, enr.ef_5_percent
+                ),
+            );
+        }
+        ui.separator();
+        ui.strong("Ranking Multiparamétrico (haz clic en #Rank para cargar esa pose en el 3D):");
+        egui::ScrollArea::vertical()
+            .id_salt("campaign_table_mini_scroll")
+            .max_height(260.0)
+            .show(ui, |ui| {
+                egui::Grid::new("mpo_table_mini")
+                    .striped(true)
+                    .show(ui, |ui| {
+                        for h in [
+                            "Rank", "Compuesto", "Vina ΔG", "HYDE ΔG", "Ki (nM)", "LE", "MPO",
+                        ] {
+                            ui.strong(h);
+                        }
+                        ui.end_row();
+                        if let Some(rep) = &self.campaign_report {
+                            for cand in &rep.results {
+                                if ui
+                                    .selectable_label(false, format!("#{}", cand.rank))
+                                    .clicked()
+                                {
+                                    self.ligand = Some(cand.best_pose.molecule.clone());
+                                    self.vina_score_kcal = Some(cand.best_affinity_kcal);
+                                    self.hyde_report = Some(cand.hyde_report.clone());
+                                    self.scene_dirty = true;
+                                }
+                                ui.label(&cand.name);
+                                ui.label(format!("{:.2}", cand.best_affinity_kcal));
+                                ui.label(format!("{:.2}", cand.hyde_delta_g_kcal));
+                                ui.label(format_ki_nm(cand.estimated_ki_nm));
+                                ui.label(format!("{:.3}", cand.ligand_efficiency));
+                                ui.label(format!("{:.3}", cand.mpo_score));
+                                ui.end_row();
+                            }
+                        }
+                    });
+            });
+    }
+
+    fn render_floating_mini_apps(&mut self, ctx: &egui::Context) {
+        let open_list: Vec<MiniAppId> = self.workspace.open_apps.iter().copied().collect();
+        let screen = ctx.screen_rect();
+
+        for id in open_list {
+            let meta = mini_app_meta(id);
+            let mut is_open = true;
+            let is_expanded = self.workspace.expanded_apps.contains(&id);
+            let mut toggle_expand = false;
+
+            let default_x = (screen.left() + meta.default_offset[0])
+                .clamp(screen.left() + 24.0, (screen.right() - 420.0).max(screen.left() + 24.0));
+            let default_y = (screen.top() + meta.default_offset[1])
+                .clamp(screen.top() + 86.0, (screen.bottom() - 340.0).max(screen.top() + 86.0));
+            let mut win = egui::Window::new(meta.window_title)
+                .id(egui::Id::new(("dockcraft_miniapp", id)))
+                .open(&mut is_open)
+                .movable(true)
+                .resizable(true)
+                .collapsible(true)
+                .min_size(egui::vec2(380.0, 300.0))
+                .default_pos(egui::pos2(default_x, default_y))
+                .default_size(egui::vec2(meta.default_size[0], meta.default_size[1]));
+
+            if is_expanded {
+                win = win.fixed_size(egui::vec2(
+                    (screen.width() * 0.84).max(640.0),
+                    (screen.height() * 0.78).max(500.0),
+                ));
+            }
+
+            win.show(ctx, |ui| {
+                if render_mini_app_header(ui, meta, is_expanded) {
+                    toggle_expand = true;
+                }
+                egui::ScrollArea::vertical()
+                    .id_salt(("dockcraft_miniapp_scroll", id))
+                    .show(ui, |ui| match id {
+                        MiniAppId::Tutorials => self.ui_tutorials_miniapp(ui),
+                        MiniAppId::DockingGridBox => self.ui_docking_gridbox_miniapp(ui),
+                        MiniAppId::ReceptorPrepWaters => self.ui_receptor_prep_waters_miniapp(ui),
+                        MiniAppId::PharmacophoreSite => self.ui_pharmacophore_site_miniapp(ui),
+                        MiniAppId::HydeAudit => self.ui_hyde_audit_miniapp(ui),
+                        MiniAppId::InspiratorAdmet => self.ui_inspirator_admet_miniapp(ui),
+                        MiniAppId::CampaignSuite => self.ui_campaign_suite_miniapp(ui),
+                    });
+            });
+
+            if toggle_expand {
+                self.workspace.toggle_expand(id);
+            }
+            if !is_open {
+                self.workspace.close(id);
+            }
+        }
+    }
 }
 
 impl eframe::App for DockCraftApp {
@@ -1713,12 +2731,21 @@ impl eframe::App for DockCraftApp {
                 ui.separator();
                 if ui.button("Pockets").clicked() {
                     self.detect_pockets_now();
+                    if !self.workspace.show_classic_side_panels {
+                        self.workspace.open(MiniAppId::DockingGridBox);
+                    }
                 }
                 if ui.button(RichText::new("Dock").strong()).clicked() {
                     self.run_docking_now();
+                    if !self.workspace.show_classic_side_panels {
+                        self.workspace.open(MiniAppId::HydeAudit);
+                    }
                 }
                 if ui.button("Screen").clicked() {
                     self.run_campaign_now();
+                    if !self.workspace.show_classic_side_panels {
+                        self.workspace.open(MiniAppId::CampaignSuite);
+                    }
                 }
                 egui::ComboBox::from_id_salt("sf_combo")
                     .selected_text(match self.scoring {
@@ -1754,622 +2781,90 @@ impl eframe::App for DockCraftApp {
             });
         });
 
-        // 3. Bottom Screening Table + Status Bar with Version
-        egui::TopBottomPanel::bottom("bottom_campaign")
-            .resizable(true)
-            .default_height(150.0)
-            .show(ctx, |ui| {
+        // 2b. Floating Mini-Apps Launcher Bar (movable, resizable & 1-click expandable windows)
+        egui::TopBottomPanel::top("dockcraft_miniapp_bar").show(ctx, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.strong("Mini-Apps:");
+                for meta in ALL_MINI_APPS {
+                    let is_open = self.workspace.open_apps.contains(&meta.id);
+                    let resp = ui
+                        .selectable_label(is_open, meta.short_label)
+                        .on_hover_text(format!("{}\n\nCuándo usarla: {}", meta.what_it_does, meta.when_to_use));
+                    if resp.clicked() {
+                        self.workspace.toggle(meta.id);
+                    }
+                }
+                ui.separator();
+                ui.checkbox(&mut self.workspace.show_classic_side_panels, "Paneles clásicos")
+                    .on_hover_text("Muestra/oculta los paneles laterales clásicos fijos junto al visor 3D");
+                if !self.workspace.open_apps.is_empty() && ui.small_button("Cerrar ventanas").clicked() {
+                    self.workspace.open_apps.clear();
+                    self.workspace.expanded_apps.clear();
+                }
+            });
+        });
+
+        // 3. Compact Status Bar (or full classic screening bottom panel when classic mode is enabled)
+        if self.workspace.show_classic_side_panels {
+            egui::TopBottomPanel::bottom("bottom_campaign")
+                .resizable(true)
+                .default_height(155.0)
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.strong(format!("DockCraft v{APP_VERSION}"));
+                        ui.separator();
+                        ui.label(&self.status_line);
+                    });
+                    ui.separator();
+                    self.ui_campaign_suite_miniapp(ui);
+                });
+        } else {
+            egui::TopBottomPanel::bottom("bottom_status_bar").show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.strong(format!("DockCraft v{APP_VERSION}"));
                     ui.separator();
                     ui.label(&self.status_line);
-                    if let Some(rep) = &self.campaign_report
-                        && let Some(enr) = &rep.enrichment
-                    {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("📊 Tabla Cribado & Suite").clicked() {
+                            self.workspace.open(MiniAppId::CampaignSuite);
+                        }
+                        if ui.small_button("📚 Tutoriales").clicked() {
+                            self.workspace.open(MiniAppId::Tutorials);
+                        }
+                    });
+                });
+            });
+        }
+
+        // 4 & 5. Optional Classic Docked Side Panels (off by default so the 3D viewport is huge)
+        if self.workspace.show_classic_side_panels {
+            egui::SidePanel::left("left_pyrx")
+                .resizable(true)
+                .default_width(280.0)
+                .show(ctx, |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        self.ui_docking_gridbox_miniapp(ui);
                         ui.separator();
-                        ui.label(format!(
-                            "ROC AUC: {:.3} | BEDROC20: {:.3} | EF1%: {:.2} | EF5%: {:.2}",
-                            enr.roc_auc, enr.bedroc_20, enr.ef_1_percent, enr.ef_5_percent
-                        ));
-                    }
-                });
-                ui.separator();
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    egui::Grid::new("mpo_table").striped(true).show(ui, |ui| {
-                        for h in [
-                            "Rank", "Compound", "Vina dG", "HYDE dG", "Ki (nM)", "LE", "MPO",
-                        ] {
-                            ui.strong(h);
-                        }
-                        ui.end_row();
-                        if let Some(rep) = &self.campaign_report {
-                            for cand in &rep.results {
-                                if ui
-                                    .selectable_label(false, format!("#{}", cand.rank))
-                                    .clicked()
-                                {
-                                    self.ligand = Some(cand.best_pose.molecule.clone());
-                                    self.vina_score_kcal = Some(cand.best_affinity_kcal);
-                                    self.hyde_report = Some(cand.hyde_report.clone());
-                                    self.scene_dirty = true;
-                                }
-                                ui.label(&cand.name);
-                                ui.label(format!("{:.2}", cand.best_affinity_kcal));
-                                ui.label(format!("{:.2}", cand.hyde_delta_g_kcal));
-                                ui.label(format_ki_nm(cand.estimated_ki_nm));
-                                ui.label(format!("{:.3}", cand.ligand_efficiency));
-                                ui.label(format!("{:.3}", cand.mpo_score));
-                                ui.end_row();
-                            }
-                        }
+                        egui::CollapsingHeader::new("Receptor Prep & Audit (pKa / Flips)")
+                            .default_open(false)
+                            .show(ui, |ui| self.ui_receptor_prep_waters_miniapp(ui));
+                        egui::CollapsingHeader::new("Site Blueprint (MIFs) & Farmacóforo")
+                            .default_open(false)
+                            .show(ui, |ui| self.ui_pharmacophore_site_miniapp(ui));
                     });
                 });
-            });
 
-        // 4. Left Panel: Pockets, Waters, Advanced Modes, GridBox, Docked Modes
-        egui::SidePanel::left("left_pyrx")
-            .resizable(true)
-            .default_width(265.0)
-            .show(ctx, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    // Quick SMILES / Path input
-                    ui.horizontal(|ui| {
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.ligand_path_input)
-                                .desired_width(175.0)
-                                .hint_text("SMILES or ligand path..."),
-                        );
-                        if ui.button("Load").clicked() {
-                            self.load_ligand_from_input();
-                        }
+            egui::SidePanel::right("right_hyde")
+                .resizable(true)
+                .default_width(335.0)
+                .show(ctx, |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        self.ui_hyde_audit_miniapp(ui);
+                        ui.separator();
+                        self.ui_inspirator_admet_miniapp(ui);
                     });
-                    ui.separator();
-
-                    ui.heading("Binding Pockets");
-                    let mut clicked_pocket: Option<usize> = None;
-                    for (idx, p) in self.pockets.iter().take(6).enumerate() {
-                        let sel = self.selected_pocket_idx == Some(idx);
-                        if ui
-                            .selectable_label(
-                                sel,
-                                format!(
-                                    "#{} Drug {:.2} | {:.0} A3 | {:.0} A2",
-                                    p.rank, p.druggability_score, p.volume_a3, p.sasa_a2
-                                ),
-                            )
-                            .clicked()
-                        {
-                            clicked_pocket = Some(idx);
-                        }
-                    }
-                    if let Some(idx) = clicked_pocket
-                        && let Some(p) = self.pockets.get(idx).cloned()
-                    {
-                        self.selected_pocket_idx = Some(idx);
-                        self.grid_box = p.grid_box;
-                        self.camera.focus_on(
-                            [p.center[0] as f32, p.center[1] as f32, p.center[2] as f32],
-                            14.0,
-                        );
-                        self.detect_waters_now();
-                        self.scene_dirty = true;
-                    }
-
-                    ui.separator();
-                    egui::CollapsingHeader::new("Receptor Prep & Audit (pKa / Flips)")
-                        .default_open(false)
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.label("pH:");
-                                ui.add(
-                                    egui::DragValue::new(&mut self.prep_ph)
-                                        .speed(0.1)
-                                        .range(4.0..=10.0),
-                                );
-                                ui.label("Chains:");
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut self.prep_chains_input)
-                                        .desired_width(52.0)
-                                        .hint_text("All"),
-                                );
-                            });
-                            ui.horizontal_wrapped(|ui| {
-                                ui.checkbox(&mut self.prep_keep_metals, "Metals");
-                                ui.checkbox(&mut self.prep_keep_cofactors, "Cofactors");
-                                ui.checkbox(&mut self.prep_optimize_hbonds, "H-Bond Flips");
-                                ui.checkbox(&mut self.prep_keep_bridging_waters, "Bridge HOH");
-                            });
-                            ui.horizontal(|ui| {
-                                if ui.button("Prepare & Audit").clicked() {
-                                    self.run_prot_prep_now();
-                                }
-                                if self.prep_result.is_some()
-                                    && ui.small_button("Export Audit (.md)").clicked()
-                                {
-                                    self.export_prep_audit_dialog();
-                                }
-                            });
-                            if let Some(prep) = &self.prep_result {
-                                let a = &prep.audit;
-                                let g_col = if a.quality_grade.starts_with('A') {
-                                    Color32::from_rgb(46, 204, 113)
-                                } else if a.quality_grade.starts_with('B') {
-                                    Color32::from_rgb(241, 196, 15)
-                                } else {
-                                    Color32::from_rgb(235, 77, 75)
-                                };
-                                ui.colored_label(g_col, RichText::new(&a.quality_grade).strong());
-                                if let Some(res) = a.resolution_a {
-                                    ui.small(format!(
-                                        "Res: {res:.2} A | R-free: {} | Net q: {:+}",
-                                        a.r_free.map_or_else(
-                                            || "n/a".to_string(),
-                                            |v| format!("{v:.3}")
-                                        ),
-                                        prep.protonation.total_protein_charge
-                                    ));
-                                } else if a.is_alphafold {
-                                    ui.small(format!(
-                                        "AlphaFold mean pLDDT: {:.1} | Net q: {:+}",
-                                        a.mean_b_factor_or_plddt,
-                                        prep.protonation.total_protein_charge
-                                    ));
-                                }
-                                ui.small(format!(
-                                    "Altlocs: {} | Missing atoms: {} | Flips: {} | OH rotors: {}",
-                                    a.altlocs_resolved.len(),
-                                    a.missing_heavy_atoms.len(),
-                                    prep.hbond_opt.flips_applied.len(),
-                                    prep.hbond_opt.polar_h_rotors_optimized
-                                ));
-                                for iss in a.issues.iter().take(4) {
-                                    let c = match iss.severity {
-                                        AuditSeverity::Critical => Color32::from_rgb(235, 77, 75),
-                                        AuditSeverity::Warning => Color32::from_rgb(241, 196, 15),
-                                        AuditSeverity::Info => Color32::from_rgb(130, 180, 240),
-                                    };
-                                    ui.colored_label(
-                                        c,
-                                        RichText::new(format!(
-                                            "• {}: {}",
-                                            iss.category, iss.message
-                                        ))
-                                        .small(),
-                                    );
-                                }
-                            }
-                        });
-
-                    egui::CollapsingHeader::new("Site Blueprint (MIFs & Distances)")
-                        .default_open(false)
-                        .show(ui, |ui| {
-                            ui.checkbox(
-                                &mut self.blueprint_use_holo,
-                                "Use loaded ligand (Holo consensus)",
-                            );
-                            ui.horizontal(|ui| {
-                                if ui.button("Analyze Site").clicked() {
-                                    self.analyze_active_site_now();
-                                }
-                                if ui.button("Apply -> Restraints").clicked() {
-                                    self.apply_blueprint_to_docking();
-                                }
-                            });
-                            let mut bp_changed = false;
-                            if let Some(bp) = &mut self.site_blueprint {
-                                let g = &bp.geometry;
-                                ui.small(format!(
-                                    "Vol: {:.0} A3 | LxWxD: {:.1}x{:.1}x{:.1} A",
-                                    g.accessible_volume_a3,
-                                    g.principal_dims_a[0],
-                                    g.principal_dims_a[1],
-                                    g.principal_dims_a[2]
-                                ));
-                                ui.small(format!(
-                                    "Hyd {:.0}% / Pol {:.0}% | Opt MW {:.0}-{:.0} Da",
-                                    g.hydrophobic_fraction * 100.0,
-                                    g.polar_fraction * 100.0,
-                                    g.recommended_mw_range[0],
-                                    g.recommended_mw_range[1]
-                                ));
-                                ui.separator();
-                                ui.strong("Hotspots (toggle to edit matrix):");
-                                for f in &mut bp.features {
-                                    let src_tag = match f.source {
-                                        FeatureSource::ApoMif => "Apo",
-                                        FeatureSource::HybridApoHolo => "Hyb",
-                                        FeatureSource::HoloValidated => "Holo",
-                                        FeatureSource::UserDefined => "User",
-                                    };
-                                    ui.horizontal(|ui| {
-                                        if ui
-                                            .checkbox(
-                                                &mut f.enabled,
-                                                format!("{} {:?} [{}]", f.id, f.kind, src_tag),
-                                            )
-                                            .changed()
-                                        {
-                                            bp_changed = true;
-                                        }
-                                        ui.small(format!(
-                                            "{} ({:.1})",
-                                            f.key_residue, f.energy_kcal
-                                        ));
-                                    });
-                                }
-                                if bp_changed {
-                                    bp.rebuild_distance_matrix();
-                                }
-                                if !bp.distance_matrix.is_empty() {
-                                    ui.separator();
-                                    ui.strong(format!(
-                                        "Optimal Distances ({} pairs):",
-                                        bp.distance_matrix.len()
-                                    ));
-                                    for d in bp.distance_matrix.iter().take(10) {
-                                        ui.small(format!(
-                                            "{}<->{}: {:.2} A ({:.1}-{:.1})",
-                                            d.from_id,
-                                            d.to_id,
-                                            d.ideal_distance_a,
-                                            d.min_distance_a,
-                                            d.max_distance_a
-                                        ));
-                                    }
-                                }
-                            }
-                            if bp_changed {
-                                self.sync_pharmacophore_visuals();
-                            }
-                        });
-
-                    egui::CollapsingHeader::new("Bridging Waters & Metals")
-                        .default_open(false)
-                        .show(ui, |ui| {
-                            ui.checkbox(&mut self.metal_coordination, "AutoDock4Zn Metal Coord");
-                            if ui.button("Scan Bridging Waters").clicked() {
-                                self.detect_waters_now();
-                            }
-                            let mut changed = false;
-                            for bw in &self.bridging_waters {
-                                let mut kept = self.kept_water_resseqs.contains(&bw.res_seq);
-                                let lbl = format!(
-                                    "HOH {} ({} HB: {})",
-                                    bw.res_seq,
-                                    bw.receptor_hbonds,
-                                    bw.lining_residues
-                                        .iter()
-                                        .take(2)
-                                        .cloned()
-                                        .collect::<Vec<_>>()
-                                        .join(",")
-                                );
-                                if ui.checkbox(&mut kept, lbl).changed() {
-                                    if kept {
-                                        self.kept_water_resseqs.insert(bw.res_seq);
-                                    } else {
-                                        self.kept_water_resseqs.remove(&bw.res_seq);
-                                    }
-                                    changed = true;
-                                }
-                            }
-                            if changed {
-                                self.rebuild_receptor_with_kept_waters();
-                            }
-                        });
-
-                    egui::CollapsingHeader::new("Constraints & Flex Sidechains")
-                        .default_open(false)
-                        .show(ui, |ui| {
-                            ui.label("Flexible Residues (e.g. A:ASP189,A:TRP79):");
-                            ui.text_edit_singleline(&mut self.flex_residues_input);
-                            ui.separator();
-                            ui.horizontal(|ui| {
-                                egui::ComboBox::from_id_salt("pharm_kind")
-                                    .selected_text(format!("{:?}", self.new_pharm_kind))
-                                    .width(96.0)
-                                    .show_ui(ui, |ui| {
-                                        for k in [
-                                            PharmacophoreKind::HDonor,
-                                            PharmacophoreKind::HAcceptor,
-                                            PharmacophoreKind::Aromatic,
-                                            PharmacophoreKind::Hydrophobic,
-                                            PharmacophoreKind::PositiveIonizable,
-                                            PharmacophoreKind::NegativeIonizable,
-                                            PharmacophoreKind::MetalChelate,
-                                        ] {
-                                            ui.selectable_value(
-                                                &mut self.new_pharm_kind,
-                                                k,
-                                                format!("{k:?}"),
-                                            );
-                                        }
-                                    });
-                                ui.add(
-                                    egui::DragValue::new(&mut self.new_pharm_radius)
-                                        .speed(0.1)
-                                        .range(0.5..=5.0)
-                                        .prefix("R="),
-                                );
-                            });
-                            ui.horizontal(|ui| {
-                                if ui.button("+ Sphere at Atom/Center").clicked() {
-                                    let ctr = self
-                                        .selected_atom_idx
-                                        .and_then(|i| {
-                                            self.ligand.as_ref().and_then(|l| l.atoms.get(i))
-                                        })
-                                        .map_or(self.grid_box.center, |a| a.coords);
-                                    self.constraints
-                                        .push(DockingConstraint::PharmacophoreSphere {
-                                            center: ctr,
-                                            radius: self.new_pharm_radius,
-                                            kind: self.new_pharm_kind,
-                                            weight: 4.0,
-                                        });
-                                    self.sync_pharmacophore_visuals();
-                                }
-                                if !self.constraints.is_empty() && ui.button("Clear").clicked() {
-                                    self.constraints.clear();
-                                    self.sync_pharmacophore_visuals();
-                                }
-                            });
-                            ui.small(format!("Active constraints: {}", self.constraints.len()));
-                        });
-
-                    ui.separator();
-                    ui.heading("Grid Box (A)");
-                    let mut box_changed = false;
-                    for (axis, lbl) in ["X", "Y", "Z"].iter().enumerate() {
-                        ui.horizontal(|ui| {
-                            ui.label(format!("C{lbl}"));
-                            box_changed |= ui
-                                .add(
-                                    egui::DragValue::new(&mut self.grid_box.center[axis])
-                                        .speed(0.2),
-                                )
-                                .changed();
-                            ui.label(format!("S{lbl}"));
-                            box_changed |= ui
-                                .add(
-                                    egui::DragValue::new(&mut self.grid_box.size[axis])
-                                        .speed(0.2)
-                                        .range(8.0..=60.0),
-                                )
-                                .changed();
-                        });
-                    }
-                    if box_changed {
-                        self.scene_dirty = true;
-                    }
-
-                    ui.separator();
-                    ui.heading("Docked Modes");
-                    for (i, pose) in self.dock_poses.iter().enumerate() {
-                        let sel = self.selected_pose_idx == i;
-                        if ui
-                            .selectable_label(
-                                sel,
-                                format!(
-                                    "Mode {} | {:.2} kcal/mol | RMSD {:.2}",
-                                    pose.mode, pose.affinity_kcal_mol, pose.terms.rmsd_to_best
-                                ),
-                            )
-                            .clicked()
-                        {
-                            self.selected_pose_idx = i;
-                            self.ligand = Some(pose.molecule.clone());
-                            self.vina_score_kcal = Some(pose.affinity_kcal_mol);
-                            if let Some(rec) = &self.receptor {
-                                self.hyde_report = score_pose_hyde(rec, &pose.molecule).ok();
-                            }
-                            self.scene_dirty = true;
-                        }
-                    }
                 });
-            });
-
-        // 5. Right Panel: SeeSAR HYDE v2, PoseBusters, Torsion Traffic-Lights, 32-Group Inspirator, On-Demand ADMET
-        egui::SidePanel::right("right_hyde")
-            .resizable(true)
-            .default_width(325.0)
-            .show(ctx, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    ui.heading("SeeSAR HYDE v2 & Pose Audit");
-                    if let Some(rep) = &self.hyde_report {
-                        if let Some(pb) = &rep.posebusters {
-                            let (col, badge) = if pb.valid {
-                                (Color32::from_rgb(46, 204, 113), "PASS PoseBusters (5/5)")
-                            } else {
-                                (Color32::from_rgb(235, 77, 75), "WARN PoseBusters")
-                            };
-                            ui.colored_label(col, RichText::new(badge).strong())
-                                .on_hover_text(&pb.summary);
-                        }
-                        let vina_v = self.vina_score_kcal.unwrap_or(rep.total_delta_g_kcal);
-                        let cons = consensus_affinity_kcal(vina_v, vina_v, rep.total_delta_g_kcal);
-                        ui.label(format!(
-                            "Vina: {:.2} | HYDE: {:.2} | Consensus: {:.2} kcal/mol",
-                            vina_v, rep.total_delta_g_kcal, cons
-                        ));
-                        ui.label(format!(
-                            "Est. Ki: {} [{} – {}] | LE: {:.3}",
-                            format_ki_nm(rep.estimated_ki_nm),
-                            format_ki_nm(rep.ki_range_nm.0),
-                            format_ki_nm(rep.ki_range_nm.1),
-                            rep.ligand_efficiency
-                        ));
-
-                        if let Some(tr) = &rep.torsion_report {
-                            ui.horizontal(|ui| {
-                                ui.strong("Torsions:");
-                                ui.colored_label(
-                                    Color32::from_rgb(46, 204, 113),
-                                    format!("{} G", tr.green_count),
-                                );
-                                ui.colored_label(
-                                    Color32::from_rgb(241, 196, 15),
-                                    format!("{} Y", tr.yellow_count),
-                                );
-                                ui.colored_label(
-                                    Color32::from_rgb(235, 77, 75),
-                                    format!("{} R", tr.red_count),
-                                );
-                                ui.small(format!("(+{:.2} kcal)", tr.total_strain_kcal));
-                            });
-                            if !tr.torsions.is_empty() {
-                                egui::CollapsingHeader::new("Rotatable Dihedrals")
-                                    .default_open(false)
-                                    .show(ui, |ui| {
-                                        for t in &tr.torsions {
-                                            let c = match t.status {
-                                                TorsionStatus::Green => {
-                                                    Color32::from_rgb(46, 204, 113)
-                                                }
-                                                TorsionStatus::Yellow => {
-                                                    Color32::from_rgb(241, 196, 15)
-                                                }
-                                                TorsionStatus::Red => {
-                                                    Color32::from_rgb(235, 77, 75)
-                                                }
-                                            };
-                                            ui.horizontal(|ui| {
-                                                ui.colored_label(c, "●");
-                                                ui.small(format!(
-                                                    "{}-{} | {} | {:.0}° (+{:.2})",
-                                                    t.atom_u,
-                                                    t.atom_v,
-                                                    t.pattern,
-                                                    t.dihedral_deg,
-                                                    t.strain_kcal
-                                                ));
-                                            });
-                                        }
-                                    });
-                            }
-                        }
-                    }
-
-                    ui.separator();
-                    ui.horizontal(|ui| {
-                        ui.strong("ADMET (On-Demand):");
-                        if ui.button("Abrir en AdmetCraft").clicked() {
-                            self.open_in_admetcraft();
-                        }
-                        if ui.small_button("Preview").clicked()
-                            && let Some(lig) = &self.ligand
-                        {
-                            self.admet_preview = Some(evaluate_admet(lig));
-                        }
-                    });
-                    if let Some(adm) = &self.admet_preview {
-                        ui.small(format!(
-                            "MW {:.1} | cLogP {:.2} | TPSA {:.1} | QED {:.2} | Lipinski {}",
-                            adm.mw, adm.clogp, adm.tpsa, adm.qed_score, adm.lipinski_violations
-                        ));
-                    }
-
-                    ui.separator();
-                    ui.heading("In-Pocket Inspirator (32 Groups)");
-                    ui.horizontal(|ui| {
-                        ui.label(format!(
-                            "Atom: {}",
-                            self.selected_atom_idx
-                                .map_or_else(|| "None".to_string(), |i| format!("#{i}"))
-                        ));
-                        if !self.pose_history.is_empty()
-                            && ui.button("Undo").clicked()
-                            && let Some(prev) = self.pose_history.pop()
-                        {
-                            self.ligand = Some(prev);
-                            self.rescore_active_complex();
-                            self.scene_dirty = true;
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        for cat in [
-                            InspiratorCategory::HalogensSmall,
-                            InspiratorCategory::AlkylFluoro,
-                            InspiratorCategory::PolarHBond,
-                            InspiratorCategory::RingsBioisosteres,
-                        ] {
-                            ui.selectable_value(&mut self.inspirator_cat, cat, cat.label());
-                        }
-                    });
-                    ui.horizontal_wrapped(|ui| {
-                        for &preset in self.inspirator_cat.presets() {
-                            if ui.button(preset.label()).clicked() {
-                                self.apply_mutation(preset);
-                            }
-                        }
-                    });
-                    if let Some((lbl, ddg)) = &self.last_mutation_delta {
-                        let col = if *ddg <= 0.0 {
-                            Color32::LIGHT_GREEN
-                        } else {
-                            Color32::LIGHT_RED
-                        };
-                        ui.colored_label(col, format!("Last {lbl}: ddG = {ddg:+.2} kcal/mol"));
-                    }
-
-                    ui.separator();
-                    ui.heading("Per-Atom HYDE Breakdown");
-                    egui::ScrollArea::vertical()
-                        .id_salt("atom_hyde_scroll")
-                        .max_height(180.0)
-                        .show(ui, |ui| {
-                            if let Some(rep) = &self.hyde_report {
-                                for sc in &rep.atom_scores {
-                                    let col = Color32::from_rgb(
-                                        (sc.corona_color[0] * 255.0) as u8,
-                                        (sc.corona_color[1] * 255.0) as u8,
-                                        (sc.corona_color[2] * 255.0) as u8,
-                                    );
-                                    ui.horizontal(|ui| {
-                                        ui.colored_label(col, "●");
-                                        let sel = self.selected_atom_idx == Some(sc.atom_index);
-                                        if ui
-                                            .selectable_label(
-                                                sel,
-                                                format!(
-                                                    "#{} {} ({:+.2})",
-                                                    sc.atom_index, sc.element, sc.delta_g_kcal
-                                                ),
-                                            )
-                                            .clicked()
-                                        {
-                                            self.selected_atom_idx = Some(sc.atom_index);
-                                            self.scene_dirty = true;
-                                        }
-                                        ui.small(&sc.diagnostic);
-                                    });
-                                }
-                            }
-                        });
-
-                    ui.separator();
-                    ui.heading("3D Directional Interactions");
-                    egui::ScrollArea::vertical()
-                        .id_salt("inter_scroll")
-                        .max_height(130.0)
-                        .show(ui, |ui| {
-                            if let Some(rep) = &self.hyde_report {
-                                for inter in &rep.interactions {
-                                    let ang_str = inter
-                                        .angle_deg
-                                        .map_or_else(String::new, |a| format!(" | {a:.0}°"));
-                                    ui.small(format!(
-                                        "{:?} | {} | {:.2} A{ang_str} ({:+.2})",
-                                        inter.kind,
-                                        inter.rec_residue,
-                                        inter.distance_a,
-                                        inter.energy_kcal
-                                    ));
-                                }
-                            }
-                        });
-                });
-            });
+        }
 
         // 6. Central 3D wgpu Viewport
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -2418,6 +2913,9 @@ impl eframe::App for DockCraftApp {
             );
             ui.painter().add(cb);
         });
+
+        // 6b. Floating, movable, resizable & expandable Mini-Applications
+        self.render_floating_mini_apps(ctx);
 
         // 7. Command Palette (Ctrl+K) — clean PyMOL / ChimeraX / Craft Suite actions
         if self.palette_open {
