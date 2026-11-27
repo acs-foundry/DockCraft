@@ -508,8 +508,8 @@ dependencies = [
 
 [[package]]
 name = "craftbio-compute"
-version = "1.5.0"
-source = "git+https://github.com/acs-foundry/craftbio-libs?tag=v1.5.0#c40d015b3b74bf748d76846bf01129ebafa659c6"
+version = "1.5.1"
+source = "git+https://github.com/acs-foundry/craftbio-libs?tag=v1.5.1#c7c525003c7bac3aa21787c0357abf4b8d30d39e"
 dependencies = [
  "serde",
  "serde_json",
