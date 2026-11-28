@@ -175,11 +175,7 @@ impl WorkspaceWindows {
 }
 
 /// Paint a crisp, plain-Spanish educational header inside every floating mini-application.
-pub fn render_mini_app_header(
-    ui: &mut egui::Ui,
-    meta: &MiniAppMeta,
-    is_expanded: bool,
-) -> bool {
+pub fn render_mini_app_header(ui: &mut egui::Ui, meta: &MiniAppMeta, is_expanded: bool) -> bool {
     let mut toggle_expand_clicked = false;
     let [r, g, b] = meta.accent_rgb;
     let accent = egui::Color32::from_rgb(r, g, b);

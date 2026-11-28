@@ -7,15 +7,16 @@ mod tutorials;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
+use std::time::Instant;
 
-use dialogs::{
-    DockCraftProject, launch_admetcraft_handoff, launch_chemcraft_with_path, pick_open_file,
-    pick_save_file,
+use craftbio_ui::craft_dialogs::{Answer, Dialogs, FileDialog};
+use craftbio_ui::craft_settings::{Settings, SettingsStore};
+use craftbio_ui::{
+    AppAccent, CommonUiPrefs, CraftBioTheme, ThemeMode, WindowConfig, build_viewport,
+    dialogs_for_egui, open_settings, open_structure_file, save_file, status_bar,
+    theme_toggle_button, titlebar_pref,
 };
-use miniapps::{
-    ALL_MINI_APPS, MiniAppId, WorkspaceWindows, mini_app_meta, render_mini_app_header,
-};
-use tutorials::{TutorialAction, TutorialState, built_in_tutorials};
+use dialogs::{DockCraftProject, launch_admetcraft_handoff, launch_chemcraft_with_path};
 use dock_engine::{
     DockingConfig, DockingConstraint, DockingPose, PharmacophoreKind, ScoringFunction, dock_ligand,
     score_complex,
@@ -37,15 +38,18 @@ use hyde_scorer::{
     HydeReport, SubstituentPreset, TorsionStatus, consensus_affinity_kcal,
     mutate_and_minimize_in_pocket, score_pose_hyde,
 };
+use miniapps::{ALL_MINI_APPS, MiniAppId, WorkspaceWindows, mini_app_meta, render_mini_app_header};
 use pharm_core::{FeatureSource, SiteAnalysisConfig, SiteBlueprint, analyze_binding_site};
 use pocket_detect::{BindingPocket, GridBox, PocketDetectConfig, detect_pockets};
 use prot_prep::{AuditSeverity, PrepConfig, PreparedReceptor, prepare_protein_from_str};
+use serde::{Deserialize, Serialize};
 use struct_core::{
     Atom3D, BondOrder, BridgingWater, Molecule3D, assign_ad4_types_and_flags,
     detect_bridging_waters, parse_mmcif, parse_mol2, parse_pdb, parse_pdbqt,
     parse_sdf_3d_with_limit, parse_smiles_to_3d, perceive_all, prepare_receptor,
     prepare_receptor_keeping_waters, write_pdb, write_sdf_3d,
 };
+use tutorials::{TutorialAction, TutorialState, built_in_tutorials};
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -191,7 +195,58 @@ fn format_ki_nm(ki: f64) -> String {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+struct DockPrefs {
+    ui: CommonUiPrefs,
+    exhaustiveness: usize,
+    metal_coordination: bool,
+    hyde_rerank: bool,
+    last_dir: String,
+}
+
+impl Default for DockPrefs {
+    fn default() -> Self {
+        Self {
+            ui: CommonUiPrefs {
+                dark_mode: true,
+                ..CommonUiPrefs::default()
+            },
+            exhaustiveness: 8,
+            metal_coordination: true,
+            hyde_rerank: true,
+            last_dir: String::new(),
+        }
+    }
+}
+
+impl Settings for DockPrefs {
+    const APP_ID: &'static str = "dockcraft";
+    const SCHEMA_VERSION: u32 = 1;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DockDialogAction {
+    OpenReceptor,
+    OpenLigand,
+    OpenProject,
+    LoadBlueprint,
+    SaveProjectAs,
+    SaveBlueprint,
+    SavePrepAudit,
+    SavePosesSdf,
+    SaveReceptorPdb,
+    SaveCampaignCsv,
+    SaveInterop { pymol: bool },
+}
+
 struct DockCraftApp {
+    settings: SettingsStore<DockPrefs>,
+    dialogs: Dialogs<DockDialogAction>,
+    dark_mode: bool,
+    use_system_titlebar: bool,
+    applied_theme: Option<ThemeMode>,
+    last_dir: String,
     current_project_path: Option<PathBuf>,
     receptor_path_input: String,
     ligand_path_input: String,
@@ -243,7 +298,15 @@ struct DockCraftApp {
 }
 
 impl DockCraftApp {
-    fn new(cc: &eframe::CreationContext<'_>, startup: StartupDockArgs) -> Self {
+    fn new(
+        cc: &eframe::CreationContext<'_>,
+        settings: SettingsStore<DockPrefs>,
+        startup: StartupDockArgs,
+    ) -> Self {
+        let saved = settings.get().clone();
+        let initial_mode = ThemeMode::from_dark(saved.ui.dark_mode);
+        CraftBioTheme::new(initial_mode, AppAccent::DOCK_VIOLET).apply(&cc.egui_ctx);
+
         if let Some(rs) = cc.wgpu_render_state.as_ref() {
             DockWgpuResources::ensure_registered(rs);
         }
@@ -259,6 +322,12 @@ impl DockCraftApp {
         cam.focus_on([1.5, 0.0, 0.0], 12.0);
 
         let mut app = Self {
+            settings,
+            dialogs: dialogs_for_egui(&cc.egui_ctx),
+            dark_mode: saved.ui.dark_mode,
+            use_system_titlebar: saved.ui.use_system_titlebar,
+            applied_theme: Some(initial_mode),
+            last_dir: saved.last_dir,
             current_project_path: None,
             receptor_path_input: String::new(),
             ligand_path_input: String::new(),
@@ -280,9 +349,9 @@ impl DockCraftApp {
             kept_water_resseqs: BTreeSet::new(),
             grid_box: gbox,
             scoring: ScoringFunction::Vina,
-            exhaustiveness: 8,
-            metal_coordination: true,
-            hyde_rerank: true,
+            exhaustiveness: saved.exhaustiveness.clamp(1, 16),
+            metal_coordination: saved.metal_coordination,
+            hyde_rerank: saved.hyde_rerank,
             constraints: Vec::new(),
             site_blueprint: None,
             blueprint_use_holo: true,
@@ -537,16 +606,30 @@ impl DockCraftApp {
         );
     }
 
+    fn start_dir(&self) -> Option<&Path> {
+        let trimmed = self.last_dir.trim();
+        (!trimmed.is_empty()).then(|| Path::new(trimmed))
+    }
+
+    fn remember_parent(&mut self, path: &Path) {
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            self.last_dir = parent.display().to_string();
+        }
+    }
+
     fn load_blueprint_dialog(&mut self) {
-        let Some(path) = pick_open_file(
-            "Load Active-Site Blueprint (.pharm.json)",
-            "Site Blueprints",
-            "*.pharm.json *.json",
-        ) else {
-            return;
-        };
-        let Ok(raw) = std::fs::read_to_string(&path) else {
-            self.status_line = format!("Cannot read blueprint '{path}'");
+        let mut dlg = FileDialog::open()
+            .title("Load Active-Site Blueprint (.pharm.json)")
+            .filter("Site Blueprints", &["json"]);
+        if let Some(dir) = self.start_dir().filter(|p| p.is_dir()) {
+            dlg = dlg.directory(dir);
+        }
+        self.dialogs.ask(dlg, DockDialogAction::LoadBlueprint);
+    }
+
+    fn load_blueprint_from_path(&mut self, path: &Path) {
+        let Ok(raw) = std::fs::read_to_string(path) else {
+            self.status_line = format!("Cannot read blueprint '{}'", path.display());
             return;
         };
         match SiteBlueprint::from_json_str(&raw) {
@@ -566,27 +649,34 @@ impl DockCraftApp {
     }
 
     fn export_blueprint_dialog(&mut self) {
-        let Some(bp) = &self.site_blueprint else {
+        if self.site_blueprint.is_none() {
             self.status_line = "Run 'Analyze Active Site (MIFs)' before exporting.".to_string();
             return;
-        };
-        let Some(path_str) = pick_save_file(
-            "Export Active-Site Blueprint",
-            "site_blueprint.pharm.json",
-            "Site Blueprint (.pharm.json / .md)",
-            "*.pharm.json *.md",
-        ) else {
+        }
+        self.dialogs.ask(
+            save_file(
+                "Export Active-Site Blueprint",
+                "site_blueprint.pharm.json",
+                "Site Blueprint (.pharm.json / .md)",
+                &["json", "md"],
+                self.start_dir(),
+            ),
+            DockDialogAction::SaveBlueprint,
+        );
+    }
+
+    fn write_blueprint_to_path(&mut self, path: &Path) {
+        let Some(bp) = &self.site_blueprint else {
             return;
         };
-        let path = PathBuf::from(&path_str);
-        let write_res = if path_str.ends_with(".md") {
-            std::fs::write(&path, bp.render_markdown())
+        let write_res = if path.extension().and_then(|s| s.to_str()) == Some("md") {
+            std::fs::write(path, bp.render_markdown())
         } else {
             match bp.to_json_pretty() {
                 Ok(js) => {
                     let md_path = path.with_extension("md");
                     let _ = std::fs::write(&md_path, bp.render_markdown());
-                    std::fs::write(&path, js)
+                    std::fs::write(path, js)
                 }
                 Err(e) => {
                     self.status_line = format!("Blueprint serialize error: {e}");
@@ -733,25 +823,40 @@ impl DockCraftApp {
     }
 
     fn open_receptor_dialog(&mut self) {
-        if let Some(path) = pick_open_file(
-            "Open Protein Receptor",
-            "Receptors",
-            "*.pdb *.cif *.mmcif *.pdbqt *.mol2",
-        ) {
-            self.receptor_path_input = path;
-            self.load_receptor_from_path();
-        }
+        self.dialogs.ask(
+            open_structure_file(self.start_dir()).title("Open Protein Receptor"),
+            DockDialogAction::OpenReceptor,
+        );
     }
 
     fn open_ligand_dialog(&mut self) {
-        if let Some(path) = pick_open_file(
-            "Open Ligand or Library",
+        let mut dlg = FileDialog::open().title("Open Ligand or Library").filter(
             "Ligands & Libraries",
-            "*.sdf *.mol2 *.pdbqt *.smi *.ism *.csv *.chemcraft *.pdb",
-        ) {
-            self.ligand_path_input = path;
-            self.load_ligand_from_input();
+            &[
+                "sdf",
+                "mol2",
+                "pdbqt",
+                "smi",
+                "ism",
+                "csv",
+                "chemcraft",
+                "pdb",
+            ],
+        );
+        if let Some(dir) = self.start_dir().filter(|p| p.is_dir()) {
+            dlg = dlg.directory(dir);
         }
+        self.dialogs.ask(dlg, DockDialogAction::OpenLigand);
+    }
+
+    fn open_project_dialog(&mut self) {
+        let mut dlg = FileDialog::open()
+            .title("Open DockCraft Project")
+            .filter("DockCraft Project", &["dockcraft"]);
+        if let Some(dir) = self.start_dir().filter(|p| p.is_dir()) {
+            dlg = dlg.directory(dir);
+        }
+        self.dialogs.ask(dlg, DockDialogAction::OpenProject);
     }
 
     fn load_receptor_from_path(&mut self) {
@@ -851,20 +956,28 @@ impl DockCraftApp {
     }
 
     fn export_prep_audit_dialog(&mut self) {
-        let Some(prep) = &self.prep_result else {
+        if self.prep_result.is_none() {
             self.status_line = "Run ProtPrep before exporting the audit report.".to_string();
             return;
-        };
-        let Some(path) = pick_save_file(
-            "Export Structural Audit Report (Markdown)",
-            "receptor_audit.md",
-            "Markdown Report",
-            "*.md",
-        ) else {
+        }
+        self.dialogs.ask(
+            save_file(
+                "Export Structural Audit Report (Markdown)",
+                "receptor_audit.md",
+                "Markdown Report",
+                &["md"],
+                self.start_dir(),
+            ),
+            DockDialogAction::SavePrepAudit,
+        );
+    }
+
+    fn write_prep_audit_to_path(&mut self, path: &Path) {
+        let Some(prep) = &self.prep_result else {
             return;
         };
-        match std::fs::write(&path, prep.render_markdown()) {
-            Ok(()) => self.status_line = format!("Exported receptor audit -> {path}"),
+        match std::fs::write(path, prep.render_markdown()) {
+            Ok(()) => self.status_line = format!("Exported receptor audit -> {}", path.display()),
             Err(e) => self.status_line = format!("Audit export failed: {e}"),
         }
     }
@@ -934,20 +1047,23 @@ impl DockCraftApp {
     }
 
     fn save_project(&mut self, force_dialog: bool) {
-        let target = if force_dialog || self.current_project_path.is_none() {
-            pick_save_file(
-                "Save DockCraft Project",
-                "workspace.dockcraft",
-                "DockCraft Project",
-                "*.dockcraft",
-            )
-            .map(PathBuf::from)
-        } else {
-            self.current_project_path.clone()
-        };
-        let Some(path) = target else {
-            return;
-        };
+        if force_dialog || self.current_project_path.is_none() {
+            self.dialogs.ask(
+                save_file(
+                    "Save DockCraft Project",
+                    "workspace.dockcraft",
+                    "DockCraft Project",
+                    &["dockcraft"],
+                    self.start_dir(),
+                ),
+                DockDialogAction::SaveProjectAs,
+            );
+        } else if let Some(path) = self.current_project_path.clone() {
+            self.write_project_to_path(&path);
+        }
+    }
+
+    fn write_project_to_path(&mut self, path: &Path) {
         let proj = DockCraftProject {
             format: "dockcraft-project".to_string(),
             version: APP_VERSION.to_string(),
@@ -963,10 +1079,10 @@ impl DockCraftApp {
             kept_water_resseqs: self.kept_water_resseqs.iter().copied().collect(),
         };
         match serde_json::to_string_pretty(&proj)
-            .and_then(|s| std::fs::write(&path, s).map_err(serde_json::Error::io))
+            .and_then(|s| std::fs::write(path, s).map_err(serde_json::Error::io))
         {
             Ok(()) => {
-                self.current_project_path = Some(path.clone());
+                self.current_project_path = Some(path.to_path_buf());
                 self.status_line = format!("Saved project -> {}", path.display());
             }
             Err(e) => self.status_line = format!("Save failed: {e}"),
@@ -1001,62 +1117,88 @@ impl DockCraftApp {
     }
 
     fn export_poses_sdf(&mut self) {
-        let Some(path) = pick_save_file(
-            "Export Docked Poses (SDF)",
-            "docked_poses.sdf",
-            "SDF 3D Structures",
-            "*.sdf",
-        ) else {
+        if self.dock_poses.is_empty() && self.ligand.is_none() {
+            self.status_line = "No ligand or docked poses to export.".to_string();
             return;
-        };
+        }
+        self.dialogs.ask(
+            save_file(
+                "Export Docked Poses (SDF)",
+                "docked_poses.sdf",
+                "SDF 3D Structures",
+                &["sdf"],
+                self.start_dir(),
+            ),
+            DockDialogAction::SavePosesSdf,
+        );
+    }
+
+    fn write_poses_sdf_to_path(&mut self, path: &Path) {
         let refs: Vec<&Molecule3D> = if !self.dock_poses.is_empty() {
             self.dock_poses.iter().map(|p| &p.molecule).collect()
         } else if let Some(lig) = &self.ligand {
             vec![lig]
         } else {
-            self.status_line = "No ligand or docked poses to export.".to_string();
             return;
         };
-        match std::fs::write(&path, write_sdf_3d(&refs)) {
-            Ok(()) => self.status_line = format!("Exported {} pose(s) -> {path}", refs.len()),
+        match std::fs::write(path, write_sdf_3d(&refs)) {
+            Ok(()) => {
+                self.status_line = format!("Exported {} pose(s) -> {}", refs.len(), path.display());
+            }
             Err(e) => self.status_line = format!("SDF export failed: {e}"),
         }
     }
 
     fn export_receptor_pdb(&mut self) {
-        let Some(rec) = &self.receptor else {
+        if self.receptor.is_none() {
             self.status_line = "No receptor loaded.".to_string();
             return;
-        };
-        let Some(path) = pick_save_file(
-            "Export Prepared Receptor (PDB)",
-            "receptor_prepared.pdb",
-            "PDB Structure",
-            "*.pdb",
-        ) else {
+        }
+        self.dialogs.ask(
+            save_file(
+                "Export Prepared Receptor (PDB)",
+                "receptor_prepared.pdb",
+                "PDB Structure",
+                &["pdb"],
+                self.start_dir(),
+            ),
+            DockDialogAction::SaveReceptorPdb,
+        );
+    }
+
+    fn write_receptor_pdb_to_path(&mut self, path: &Path) {
+        let Some(rec) = &self.receptor else {
             return;
         };
-        match std::fs::write(&path, write_pdb(rec)) {
-            Ok(()) => self.status_line = format!("Exported receptor -> {path}"),
+        match std::fs::write(path, write_pdb(rec)) {
+            Ok(()) => self.status_line = format!("Exported receptor -> {}", path.display()),
             Err(e) => self.status_line = format!("PDB export failed: {e}"),
         }
     }
 
     fn export_campaign_csv(&mut self) {
-        let Some(rep) = &self.campaign_report else {
+        if self.campaign_report.is_none() {
             self.status_line = "Run a virtual screening campaign first.".to_string();
             return;
-        };
-        let Some(path) = pick_save_file(
-            "Export Screening Results (CSV)",
-            "screening_results.csv",
-            "CSV Table",
-            "*.csv",
-        ) else {
+        }
+        self.dialogs.ask(
+            save_file(
+                "Export Screening Results (CSV)",
+                "screening_results.csv",
+                "CSV Table",
+                &["csv"],
+                self.start_dir(),
+            ),
+            DockDialogAction::SaveCampaignCsv,
+        );
+    }
+
+    fn write_campaign_csv_to_path(&mut self, path: &Path) {
+        let Some(rep) = &self.campaign_report else {
             return;
         };
-        match std::fs::write(&path, campaign_report_to_csv(rep)) {
-            Ok(()) => self.status_line = format!("Exported campaign CSV -> {path}"),
+        match std::fs::write(path, campaign_report_to_csv(rep)) {
+            Ok(()) => self.status_line = format!("Exported campaign CSV -> {}", path.display()),
             Err(e) => self.status_line = format!("CSV export failed: {e}"),
         }
     }
@@ -1346,30 +1488,38 @@ impl DockCraftApp {
     }
 
     fn export_interop_dialog(&mut self, target_pymol: bool) {
-        let (Some(rec), Some(lig), Some(hyde)) = (&self.receptor, &self.ligand, &self.hyde_report)
-        else {
+        if self.receptor.is_none() || self.ligand.is_none() || self.hyde_report.is_none() {
             self.status_line = "Score a complex before exporting.".to_string();
             return;
-        };
-        let (title, def, label, glob) = if target_pymol {
+        }
+        let (title, def, label, ext) = if target_pymol {
             (
                 "Export PyMOL Scene",
                 "dockcraft_scene.pml",
                 "PyMOL Script",
-                "*.pml",
+                "pml",
             )
         } else {
             (
                 "Export ChimeraX Scene",
                 "dockcraft_scene.cxc",
                 "ChimeraX Script",
-                "*.cxc",
+                "cxc",
             )
         };
-        let Some(script_str) = pick_save_file(title, def, label, glob) else {
+        self.dialogs.ask(
+            save_file(title, def, label, &[ext], self.start_dir()),
+            DockDialogAction::SaveInterop {
+                pymol: target_pymol,
+            },
+        );
+    }
+
+    fn write_interop_to_path(&mut self, script_path: &Path, target_pymol: bool) {
+        let (Some(rec), Some(lig), Some(hyde)) = (&self.receptor, &self.ligand, &self.hyde_report)
+        else {
             return;
         };
-        let script_path = PathBuf::from(&script_str);
         let dir = script_path.parent().unwrap_or_else(|| Path::new("."));
         let (script_txt, bundle, json_ext) = if target_pymol {
             let (s, b) = build_pymol_export(&lig.name, rec, lig, hyde);
@@ -1383,7 +1533,7 @@ impl DockCraftApp {
         let p_json = dir.join(format!("dockcraft_scene.{json_ext}"));
         let ok = std::fs::write(&p_rec, &bundle.receptor_pdb).is_ok()
             && std::fs::write(&p_lig, &bundle.ligand_sdf).is_ok()
-            && std::fs::write(&script_path, script_txt).is_ok()
+            && std::fs::write(script_path, script_txt).is_ok()
             && serde_json::to_string_pretty(&bundle)
                 .map(|js| std::fs::write(&p_json, js).is_ok())
                 .unwrap_or(false);
@@ -1392,6 +1542,109 @@ impl DockCraftApp {
         } else {
             "Scene export failed.".to_string()
         };
+    }
+
+    fn process_dialog_answers(&mut self) {
+        for (action, answer) in self.dialogs.take_answers() {
+            match (action, answer) {
+                (DockDialogAction::OpenReceptor, Answer::Paths(paths)) => {
+                    if let Some(p) = paths.into_iter().next() {
+                        self.remember_parent(&p);
+                        self.receptor_path_input = p.display().to_string();
+                        self.load_receptor_from_path();
+                    }
+                }
+                (DockDialogAction::OpenLigand, Answer::Paths(paths)) => {
+                    if let Some(p) = paths.into_iter().next() {
+                        self.remember_parent(&p);
+                        self.ligand_path_input = p.display().to_string();
+                        self.load_ligand_from_input();
+                    }
+                }
+                (DockDialogAction::OpenProject, Answer::Paths(paths)) => {
+                    if let Some(p) = paths.into_iter().next() {
+                        self.remember_parent(&p);
+                        self.load_project_file(&p);
+                    }
+                }
+                (DockDialogAction::LoadBlueprint, Answer::Paths(paths)) => {
+                    if let Some(p) = paths.into_iter().next() {
+                        self.remember_parent(&p);
+                        self.load_blueprint_from_path(&p);
+                    }
+                }
+                (DockDialogAction::SaveProjectAs, Answer::Paths(paths)) => {
+                    if let Some(p) = paths.into_iter().next() {
+                        self.remember_parent(&p);
+                        self.write_project_to_path(&p);
+                    }
+                }
+                (DockDialogAction::SaveBlueprint, Answer::Paths(paths)) => {
+                    if let Some(p) = paths.into_iter().next() {
+                        self.remember_parent(&p);
+                        self.write_blueprint_to_path(&p);
+                    }
+                }
+                (DockDialogAction::SavePrepAudit, Answer::Paths(paths)) => {
+                    if let Some(p) = paths.into_iter().next() {
+                        self.remember_parent(&p);
+                        self.write_prep_audit_to_path(&p);
+                    }
+                }
+                (DockDialogAction::SavePosesSdf, Answer::Paths(paths)) => {
+                    if let Some(p) = paths.into_iter().next() {
+                        self.remember_parent(&p);
+                        self.write_poses_sdf_to_path(&p);
+                    }
+                }
+                (DockDialogAction::SaveReceptorPdb, Answer::Paths(paths)) => {
+                    if let Some(p) = paths.into_iter().next() {
+                        self.remember_parent(&p);
+                        self.write_receptor_pdb_to_path(&p);
+                    }
+                }
+                (DockDialogAction::SaveCampaignCsv, Answer::Paths(paths)) => {
+                    if let Some(p) = paths.into_iter().next() {
+                        self.remember_parent(&p);
+                        self.write_campaign_csv_to_path(&p);
+                    }
+                }
+                (DockDialogAction::SaveInterop { pymol }, Answer::Paths(paths)) => {
+                    if let Some(p) = paths.into_iter().next() {
+                        self.remember_parent(&p);
+                        self.write_interop_to_path(&p, pymol);
+                    }
+                }
+                (_, Answer::Cancelled) => {
+                    self.status_line = "Dialog cancelled.".to_string();
+                }
+                (_, Answer::Unavailable(why)) => {
+                    self.status_line = format!("Native dialog unavailable: {why}");
+                }
+                (_, Answer::Message(_)) => {}
+            }
+        }
+    }
+
+    fn sync_theme_and_prefs(&mut self, ctx: &egui::Context) {
+        let mode = ThemeMode::from_dark(self.dark_mode);
+        if self.applied_theme != Some(mode) {
+            CraftBioTheme::new(mode, AppAccent::DOCK_VIOLET).apply(ctx);
+            self.applied_theme = Some(mode);
+        }
+        self.settings.update(|prefs| {
+            prefs.ui.dark_mode = self.dark_mode;
+            prefs.ui.use_system_titlebar = self.use_system_titlebar;
+            prefs.exhaustiveness = self.exhaustiveness;
+            prefs.metal_coordination = self.metal_coordination;
+            prefs.hyde_rerank = self.hyde_rerank;
+            prefs.last_dir.clone_from(&self.last_dir);
+        });
+        let now = Instant::now();
+        let tick = self.settings.tick(now);
+        if let Some(due) = tick.next_deadline {
+            ctx.request_repaint_after(due.saturating_duration_since(now));
+        }
     }
 
     fn sync_viewport_payload(&mut self) {
@@ -1615,7 +1868,10 @@ impl DockCraftApp {
                     .contains(&(self.tutorial_state.active_track_idx, idx));
                 let tag = if is_done { "✓" } else { "•" };
                 if ui
-                    .selectable_label(idx == s_idx, format!("{tag} Paso {}: {}", idx + 1, st.title))
+                    .selectable_label(
+                        idx == s_idx,
+                        format!("{tag} Paso {}: {}", idx + 1, st.title),
+                    )
                     .clicked()
                 {
                     self.tutorial_state.active_step_idx = idx;
@@ -1813,7 +2069,11 @@ impl DockCraftApp {
             ui.label("Motor:");
             ui.selectable_value(&mut self.scoring, ScoringFunction::Vina, "Vina");
             ui.selectable_value(&mut self.scoring, ScoringFunction::Vinardo, "Vinardo");
-            ui.selectable_value(&mut self.scoring, ScoringFunction::DockCraftHybrid, "Hybrid");
+            ui.selectable_value(
+                &mut self.scoring,
+                ScoringFunction::DockCraftHybrid,
+                "Hybrid",
+            );
             ui.checkbox(&mut self.hyde_rerank, "Consenso HYDE");
         });
         ui.add(egui::Slider::new(&mut self.exhaustiveness, 1..=16).text("Exhaustiveness"));
@@ -1872,9 +2132,7 @@ impl DockCraftApp {
             if ui.button("▶ Preparar y Auditar Receptor").clicked() {
                 self.run_prot_prep_now();
             }
-            if self.prep_result.is_some()
-                && ui.button("Exportar Auditoría (.md)").clicked()
-            {
+            if self.prep_result.is_some() && ui.button("Exportar Auditoría (.md)").clicked() {
                 self.export_prep_audit_dialog();
             }
             if ui.small_button("Exportar Receptor (.pdb)").clicked() {
@@ -1895,7 +2153,8 @@ impl DockCraftApp {
             if let Some(res) = a.resolution_a {
                 ui.small(format!(
                     "Resolución: {res:.2} Å | R-free: {} | Carga neta: {:+}",
-                    a.r_free.map_or_else(|| "n/a".to_string(), |v| format!("{v:.3}")),
+                    a.r_free
+                        .map_or_else(|| "n/a".to_string(), |v| format!("{v:.3}")),
                     prep.protonation.total_protein_charge
                 ));
             } else if a.is_alphafold {
@@ -1927,7 +2186,10 @@ impl DockCraftApp {
         ui.separator();
         ui.heading("Aguas Puente Estructurales y Metales");
         ui.horizontal_wrapped(|ui| {
-            ui.checkbox(&mut self.metal_coordination, "Coordinación metálica AutoDock4Zn");
+            ui.checkbox(
+                &mut self.metal_coordination,
+                "Coordinación metálica AutoDock4Zn",
+            );
             if ui.button("Escanear aguas puente").clicked() {
                 self.detect_waters_now();
             }
@@ -2102,7 +2364,10 @@ impl DockCraftApp {
                 .checkbox(&mut self.viewport_opts.show_torsion_lights, "Torsiones")
                 .changed();
             chg |= ui
-                .checkbox(&mut self.viewport_opts.show_interactions, "Interacciones 3D")
+                .checkbox(
+                    &mut self.viewport_opts.show_interactions,
+                    "Interacciones 3D",
+                )
                 .changed();
             if chg {
                 self.scene_dirty = true;
@@ -2165,7 +2430,11 @@ impl DockCraftApp {
                                     ui.colored_label(c, "●");
                                     ui.small(format!(
                                         "{}-{} | {} | {:.0}° (+{:.2})",
-                                        t.atom_u, t.atom_v, t.pattern, t.dihedral_deg, t.strain_kcal
+                                        t.atom_u,
+                                        t.atom_v,
+                                        t.pattern,
+                                        t.dihedral_deg,
+                                        t.strain_kcal
                                     ));
                                 });
                             }
@@ -2272,7 +2541,10 @@ impl DockCraftApp {
             } else {
                 Color32::LIGHT_RED
             };
-            ui.colored_label(col, format!("Última mutación {lbl}: ΔΔG = {ddg:+.2} kcal/mol"));
+            ui.colored_label(
+                col,
+                format!("Última mutación {lbl}: ΔΔG = {ddg:+.2} kcal/mol"),
+            );
         }
 
         ui.separator();
@@ -2340,7 +2612,13 @@ impl DockCraftApp {
                     .striped(true)
                     .show(ui, |ui| {
                         for h in [
-                            "Rank", "Compuesto", "Vina ΔG", "HYDE ΔG", "Ki (nM)", "LE", "MPO",
+                            "Rank",
+                            "Compuesto",
+                            "Vina ΔG",
+                            "HYDE ΔG",
+                            "Ki (nM)",
+                            "LE",
+                            "MPO",
                         ] {
                             ui.strong(h);
                         }
@@ -2371,7 +2649,7 @@ impl DockCraftApp {
 
     fn render_floating_mini_apps(&mut self, ctx: &egui::Context) {
         let open_list: Vec<MiniAppId> = self.workspace.open_apps.iter().copied().collect();
-        let screen = ctx.screen_rect();
+        let screen = ctx.content_rect();
 
         for id in open_list {
             let meta = mini_app_meta(id);
@@ -2379,12 +2657,16 @@ impl DockCraftApp {
             let is_expanded = self.workspace.expanded_apps.contains(&id);
             let mut toggle_expand = false;
 
-            let default_x = (screen.left() + meta.default_offset[0])
-                .clamp(screen.left() + 24.0, (screen.right() - 420.0).max(screen.left() + 24.0));
-            let default_y = (screen.top() + meta.default_offset[1])
-                .clamp(screen.top() + 86.0, (screen.bottom() - 340.0).max(screen.top() + 86.0));
+            let default_x = (screen.left() + meta.default_offset[0]).clamp(
+                screen.left() + 24.0,
+                (screen.right() - 420.0).max(screen.left() + 24.0),
+            );
+            let default_y = (screen.top() + meta.default_offset[1]).clamp(
+                screen.top() + 86.0,
+                (screen.bottom() - 340.0).max(screen.top() + 86.0),
+            );
             let mut win = egui::Window::new(meta.window_title)
-                .id(egui::Id::new(("dockcraft_miniapp", id)))
+                .id(egui::Id::unique(("dockcraft_miniapp", id)))
                 .open(&mut is_open)
                 .movable(true)
                 .resizable(true)
@@ -2428,8 +2710,13 @@ impl DockCraftApp {
 }
 
 impl eframe::App for DockCraftApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        self.process_dialog_answers();
+        self.sync_theme_and_prefs(&ctx);
+
         // Craft keyboard shortcuts
+        let typing = ctx.egui_wants_keyboard_input();
         if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::K)) {
             self.palette_open = !self.palette_open;
         }
@@ -2440,10 +2727,11 @@ impl eframe::App for DockCraftApp {
             let shift = ctx.input(|i| i.modifiers.shift);
             self.save_project(shift);
         }
-        if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::D)) {
+        if !typing && ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::D)) {
             self.run_docking_now();
         }
-        if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Z))
+        if !typing
+            && ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Z))
             && let Some(prev) = self.pose_history.pop()
         {
             self.ligand = Some(prev);
@@ -2453,66 +2741,64 @@ impl eframe::App for DockCraftApp {
 
         self.sync_viewport_payload();
 
-        // 1. Unified Craft Menu Bar (matches ChemCraft v0.2.1 & AdmetCraft v0.3.1)
-        egui::TopBottomPanel::top("craft_menu_bar").show(ctx, |ui| {
-            egui::menu::bar(ui, |ui| {
-                ui.strong("DockCraft");
+        // 1. Unified Craft Menu Bar
+        egui::Panel::top("craft_menu_bar").show(ui, |ui| {
+            egui::MenuBar::new().ui(ui, |ui| {
+                ui.label(
+                    RichText::new("DockCraft")
+                        .strong()
+                        .color(AppAccent::DOCK_VIOLET.color32()),
+                );
                 ui.label(RichText::new(format!("v{APP_VERSION}")).small().weak());
                 ui.separator();
 
                 ui.menu_button("File", |ui| {
                     if ui.button("Open Receptor (.pdb/.cif)... (Ctrl+O)").clicked() {
                         self.open_receptor_dialog();
-                        ui.close_menu();
+                        ui.close();
                     }
                     if ui
                         .button("Open Ligand / Library (.sdf/.smi/.chemcraft)...")
                         .clicked()
                     {
                         self.open_ligand_dialog();
-                        ui.close_menu();
+                        ui.close();
                     }
                     if ui.button("Open Project (.dockcraft)...").clicked() {
-                        if let Some(p) = pick_open_file(
-                            "Open DockCraft Project",
-                            "DockCraft Project",
-                            "*.dockcraft",
-                        ) {
-                            self.load_project_file(Path::new(&p));
-                        }
-                        ui.close_menu();
+                        self.open_project_dialog();
+                        ui.close();
                     }
                     ui.separator();
                     if ui.button("Save Project (Ctrl+S)").clicked() {
                         self.save_project(false);
-                        ui.close_menu();
+                        ui.close();
                     }
                     if ui.button("Save Project As... (Ctrl+Shift+S)").clicked() {
                         self.save_project(true);
-                        ui.close_menu();
+                        ui.close();
                     }
                     ui.separator();
                     ui.menu_button("Export Structures / Data", |ui| {
                         if ui.button("Docked Poses (.sdf)...").clicked() {
                             self.export_poses_sdf();
-                            ui.close_menu();
+                            ui.close();
                         }
                         if ui.button("Prepared Receptor (.pdb)...").clicked() {
                             self.export_receptor_pdb();
-                            ui.close_menu();
+                            ui.close();
                         }
                         if ui.button("Screening Results (.csv)...").clicked() {
                             self.export_campaign_csv();
-                            ui.close_menu();
+                            ui.close();
                         }
                         ui.separator();
                         if ui.button("PyMOL Scene (.pml)...").clicked() {
                             self.export_interop_dialog(true);
-                            ui.close_menu();
+                            ui.close();
                         }
                         if ui.button("ChimeraX Scene (.cxc)...").clicked() {
                             self.export_interop_dialog(false);
-                            ui.close_menu();
+                            ui.close();
                         }
                     });
                     ui.separator();
@@ -2526,7 +2812,7 @@ impl eframe::App for DockCraftApp {
                         self.detect_pockets_now();
                         self.rescore_active_complex();
                         self.scene_dirty = true;
-                        ui.close_menu();
+                        ui.close();
                     }
                 });
 
@@ -2543,7 +2829,7 @@ impl eframe::App for DockCraftApp {
                             self.rescore_active_complex();
                             self.scene_dirty = true;
                         }
-                        ui.close_menu();
+                        ui.close();
                     }
                     if ui.button("Center GridBox on Ligand").clicked() {
                         if let Some(lig) = &self.ligand
@@ -2552,17 +2838,17 @@ impl eframe::App for DockCraftApp {
                             self.grid_box = gb;
                             self.scene_dirty = true;
                         }
-                        ui.close_menu();
+                        ui.close();
                     }
                     if ui.button("Clear Pharmacophore Constraints").clicked() {
                         self.constraints.clear();
                         self.sync_pharmacophore_visuals();
-                        ui.close_menu();
+                        ui.close();
                     }
                     ui.separator();
                     if ui.button("Command Palette (Ctrl+K)").clicked() {
                         self.palette_open = true;
-                        ui.close_menu();
+                        ui.close();
                     }
                 });
 
@@ -2614,12 +2900,24 @@ impl eframe::App for DockCraftApp {
                         self.scene_dirty = true;
                     }
                     ui.separator();
+                    ui.checkbox(&mut self.dark_mode, "Dark Theme");
+                    if ui
+                        .checkbox(
+                            &mut self.use_system_titlebar,
+                            "Use System Titlebar (restart)",
+                        )
+                        .changed()
+                    {
+                        self.status_line =
+                            "Window frame preference saved (restart to apply).".to_string();
+                    }
+                    ui.separator();
                     if ui.button("Reset 3D Camera").clicked() {
                         self.camera = Camera3D::default();
                         let c = self.grid_box.center;
                         self.camera
                             .focus_on([c[0] as f32, c[1] as f32, c[2] as f32], 16.0);
-                        ui.close_menu();
+                        ui.close();
                     }
                 });
 
@@ -2629,42 +2927,42 @@ impl eframe::App for DockCraftApp {
                         .clicked()
                     {
                         self.run_prot_prep_now();
-                        ui.close_menu();
+                        ui.close();
                     }
                     if ui.button("Detect Binding Pockets").clicked() {
                         self.detect_pockets_now();
-                        ui.close_menu();
+                        ui.close();
                     }
                     if ui
                         .button("Analyze Active Site (MIFs & Distances)")
                         .clicked()
                     {
                         self.analyze_active_site_now();
-                        ui.close_menu();
+                        ui.close();
                     }
                     if ui.button("Load Site Blueprint (.pharm.json)...").clicked() {
                         self.load_blueprint_dialog();
-                        ui.close_menu();
+                        ui.close();
                     }
                     if ui
                         .button("Export Site Blueprint (.pharm.json / .md)...")
                         .clicked()
                     {
                         self.export_blueprint_dialog();
-                        ui.close_menu();
+                        ui.close();
                     }
                     ui.separator();
                     if ui.button("Detect Bridging Waters").clicked() {
                         self.detect_waters_now();
-                        ui.close_menu();
+                        ui.close();
                     }
                     if ui.button("Run Docking (Ctrl+D)").clicked() {
                         self.run_docking_now();
-                        ui.close_menu();
+                        ui.close();
                     }
                     if ui.button("Run Virtual Screening").clicked() {
                         self.run_campaign_now();
-                        ui.close_menu();
+                        ui.close();
                     }
                     ui.separator();
                     ui.checkbox(
@@ -2683,41 +2981,51 @@ impl eframe::App for DockCraftApp {
                         .clicked()
                     {
                         self.send_to_biomolcraft_now();
-                        ui.close_menu();
+                        ui.close();
                     }
                     if ui
                         .button("Tomar GridBox desde BiomolCraft (Craft Link)")
                         .clicked()
                     {
                         self.grab_box_from_biomolcraft();
-                        ui.close_menu();
+                        ui.close();
                     }
                     ui.separator();
                     if ui.button("Abrir en AdmetCraft (ADMET & PK)").clicked() {
                         self.open_in_admetcraft();
-                        ui.close_menu();
+                        ui.close();
                     }
                     if ui.button("Enviar a ChemCraft (2D/3D SAR)").clicked() {
                         self.open_in_chemcraft();
-                        ui.close_menu();
+                        ui.close();
                     }
                     ui.separator();
                     ui.menu_button("ChimeraX (fallback)", |ui| {
                         if ui.button("Visualizar en ChimeraX").clicked() {
                             self.launch_chimerax_now();
-                            ui.close_menu();
+                            ui.close();
                         }
                         if ui.button("Tomar caja desde ChimeraX").clicked() {
                             self.grab_box_from_chimerax();
-                            ui.close_menu();
+                            ui.close();
                         }
                     });
+                });
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("Ctrl+K").clicked() {
+                        self.palette_open = !self.palette_open;
+                    }
+                    let mut mode = ThemeMode::from_dark(self.dark_mode);
+                    if theme_toggle_button(ui, &mut mode) {
+                        self.dark_mode = mode.is_dark();
+                    }
                 });
             });
         });
 
         // 2. Single-Row Quick Toolbar
-        egui::TopBottomPanel::top("quick_toolbar").show(ctx, |ui| {
+        egui::Panel::top("quick_toolbar").show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 if ui.button("Open Rec").clicked() {
                     self.open_receptor_dialog();
@@ -2782,22 +3090,32 @@ impl eframe::App for DockCraftApp {
         });
 
         // 2b. Floating Mini-Apps Launcher Bar (movable, resizable & 1-click expandable windows)
-        egui::TopBottomPanel::top("dockcraft_miniapp_bar").show(ctx, |ui| {
+        egui::Panel::top("dockcraft_miniapp_bar").show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.strong("Mini-Apps:");
                 for meta in ALL_MINI_APPS {
                     let is_open = self.workspace.open_apps.contains(&meta.id);
                     let resp = ui
                         .selectable_label(is_open, meta.short_label)
-                        .on_hover_text(format!("{}\n\nCuándo usarla: {}", meta.what_it_does, meta.when_to_use));
+                        .on_hover_text(format!(
+                            "{}\n\nCuándo usarla: {}",
+                            meta.what_it_does, meta.when_to_use
+                        ));
                     if resp.clicked() {
                         self.workspace.toggle(meta.id);
                     }
                 }
                 ui.separator();
-                ui.checkbox(&mut self.workspace.show_classic_side_panels, "Paneles clásicos")
-                    .on_hover_text("Muestra/oculta los paneles laterales clásicos fijos junto al visor 3D");
-                if !self.workspace.open_apps.is_empty() && ui.small_button("Cerrar ventanas").clicked() {
+                ui.checkbox(
+                    &mut self.workspace.show_classic_side_panels,
+                    "Paneles clásicos",
+                )
+                .on_hover_text(
+                    "Muestra/oculta los paneles laterales clásicos fijos junto al visor 3D",
+                );
+                if !self.workspace.open_apps.is_empty()
+                    && ui.small_button("Cerrar ventanas").clicked()
+                {
                     self.workspace.open_apps.clear();
                     self.workspace.expanded_apps.clear();
                 }
@@ -2806,10 +3124,10 @@ impl eframe::App for DockCraftApp {
 
         // 3. Compact Status Bar (or full classic screening bottom panel when classic mode is enabled)
         if self.workspace.show_classic_side_panels {
-            egui::TopBottomPanel::bottom("bottom_campaign")
+            egui::Panel::bottom("bottom_campaign")
                 .resizable(true)
-                .default_height(155.0)
-                .show(ctx, |ui| {
+                .default_size(155.0)
+                .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.strong(format!("DockCraft v{APP_VERSION}"));
                         ui.separator();
@@ -2819,29 +3137,31 @@ impl eframe::App for DockCraftApp {
                     self.ui_campaign_suite_miniapp(ui);
                 });
         } else {
-            egui::TopBottomPanel::bottom("bottom_status_bar").show(ctx, |ui| {
-                ui.horizontal(|ui| {
+            status_bar(
+                ui,
+                "bottom_status_bar",
+                |ui| {
                     ui.strong(format!("DockCraft v{APP_VERSION}"));
                     ui.separator();
                     ui.label(&self.status_line);
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.small_button("📊 Tabla Cribado & Suite").clicked() {
-                            self.workspace.open(MiniAppId::CampaignSuite);
-                        }
-                        if ui.small_button("📚 Tutoriales").clicked() {
-                            self.workspace.open(MiniAppId::Tutorials);
-                        }
-                    });
-                });
-            });
+                },
+                |ui| {
+                    if ui.small_button("📊 Tabla Cribado & Suite").clicked() {
+                        self.workspace.open(MiniAppId::CampaignSuite);
+                    }
+                    if ui.small_button("📚 Tutoriales").clicked() {
+                        self.workspace.open(MiniAppId::Tutorials);
+                    }
+                },
+            );
         }
 
         // 4 & 5. Optional Classic Docked Side Panels (off by default so the 3D viewport is huge)
         if self.workspace.show_classic_side_panels {
-            egui::SidePanel::left("left_pyrx")
+            egui::Panel::left("left_pyrx")
                 .resizable(true)
-                .default_width(280.0)
-                .show(ctx, |ui| {
+                .default_size(280.0)
+                .show(ui, |ui| {
                     egui::ScrollArea::vertical().show(ui, |ui| {
                         self.ui_docking_gridbox_miniapp(ui);
                         ui.separator();
@@ -2854,10 +3174,10 @@ impl eframe::App for DockCraftApp {
                     });
                 });
 
-            egui::SidePanel::right("right_hyde")
+            egui::Panel::right("right_hyde")
                 .resizable(true)
-                .default_width(335.0)
-                .show(ctx, |ui| {
+                .default_size(335.0)
+                .show(ui, |ui| {
                     egui::ScrollArea::vertical().show(ui, |ui| {
                         self.ui_hyde_audit_miniapp(ui);
                         ui.separator();
@@ -2867,7 +3187,7 @@ impl eframe::App for DockCraftApp {
         }
 
         // 6. Central 3D wgpu Viewport
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             let avail = ui.available_size();
             let (rect, resp) = ui.allocate_exact_size(avail, egui::Sense::click_and_drag());
 
@@ -2915,14 +3235,14 @@ impl eframe::App for DockCraftApp {
         });
 
         // 6b. Floating, movable, resizable & expandable Mini-Applications
-        self.render_floating_mini_apps(ctx);
+        self.render_floating_mini_apps(&ctx);
 
         // 7. Command Palette (Ctrl+K) — clean PyMOL / ChimeraX / Craft Suite actions
         if self.palette_open {
             egui::Window::new("Command Palette (Ctrl+K)")
                 .collapsible(false)
                 .anchor(egui::Align2::CENTER_TOP, [0.0, 48.0])
-                .show(ctx, |ui| {
+                .show(&ctx, |ui| {
                     ui.text_edit_singleline(&mut self.palette_query);
                     let q = self.palette_query.to_ascii_lowercase();
                     let cmds = [
@@ -2977,6 +3297,12 @@ impl eframe::App for DockCraftApp {
                     }
                 });
         }
+
+        self.dialogs.show_pending(Some(frame));
+    }
+
+    fn on_exit(&mut self) {
+        let _ = self.settings.flush();
     }
 }
 
@@ -3027,12 +3353,15 @@ fn parse_startup_dock_args() -> StartupDockArgs {
 
 fn main() -> eframe::Result<()> {
     let startup = parse_startup_dock_args();
+    let (settings, _load_report) = open_settings::<DockPrefs>();
+    let use_system_titlebar = settings.get().ui.use_system_titlebar;
+    let title = format!("DockCraft v{APP_VERSION} — Virtual Screening & SeeSAR HYDE SBDD");
+    let win_cfg = WindowConfig::new(&title, "DockCraft", "DOCKCRAFT")
+        .with_size([1400.0, 880.0], [1000.0, 660.0])
+        .with_titlebar_pref(titlebar_pref(use_system_titlebar));
+    let (viewport, _decision) = build_viewport(&win_cfg);
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1400.0, 880.0])
-            .with_title(format!(
-                "DockCraft v{APP_VERSION} — Virtual Screening & SeeSAR HYDE SBDD"
-            )),
+        viewport,
         renderer: eframe::Renderer::Wgpu,
         depth_buffer: 0,
         ..Default::default()
@@ -3040,7 +3369,7 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "DockCraft",
         options,
-        Box::new(move |cc| Ok(Box::new(DockCraftApp::new(cc, startup)))),
+        Box::new(move |cc| Ok(Box::new(DockCraftApp::new(cc, settings, startup)))),
     )
 }
 

@@ -777,15 +777,15 @@ impl DockWgpuResources {
 
         let pipe_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("dock_3d_pl"),
-            bind_group_layouts: &[&cam_bgl],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&cam_bgl)],
+            immediate_size: 0,
         });
 
         let offscreen_fmt = wgpu::TextureFormat::Rgba8Unorm;
         let depth_fmt = wgpu::TextureFormat::Depth32Float;
 
         let sphere_vbl = [
-            wgpu::VertexBufferLayout {
+            Some(wgpu::VertexBufferLayout {
                 array_stride: std::mem::size_of::<SphereVertex>() as u64,
                 step_mode: wgpu::VertexStepMode::Vertex,
                 attributes: &[wgpu::VertexAttribute {
@@ -793,8 +793,8 @@ impl DockWgpuResources {
                     offset: 0,
                     shader_location: 0,
                 }],
-            },
-            wgpu::VertexBufferLayout {
+            }),
+            Some(wgpu::VertexBufferLayout {
                 array_stride: std::mem::size_of::<SphereInstance>() as u64,
                 step_mode: wgpu::VertexStepMode::Instance,
                 attributes: &[
@@ -809,7 +809,7 @@ impl DockWgpuResources {
                         shader_location: 2,
                     },
                 ],
-            },
+            }),
         ];
 
         let opaque_sphere_pipe = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -834,13 +834,13 @@ impl DockWgpuResources {
             primitive: wgpu::PrimitiveState::default(),
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: depth_fmt,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::Less,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Less),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
@@ -866,18 +866,18 @@ impl DockWgpuResources {
             primitive: wgpu::PrimitiveState::default(),
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: depth_fmt,
-                depth_write_enabled: false,
-                depth_compare: wgpu::CompareFunction::Less,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::Less),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
         let cyl_vbl = [
-            wgpu::VertexBufferLayout {
+            Some(wgpu::VertexBufferLayout {
                 array_stride: std::mem::size_of::<SphereVertex>() as u64,
                 step_mode: wgpu::VertexStepMode::Vertex,
                 attributes: &[wgpu::VertexAttribute {
@@ -885,8 +885,8 @@ impl DockWgpuResources {
                     offset: 0,
                     shader_location: 0,
                 }],
-            },
-            wgpu::VertexBufferLayout {
+            }),
+            Some(wgpu::VertexBufferLayout {
                 array_stride: std::mem::size_of::<CylinderInstance>() as u64,
                 step_mode: wgpu::VertexStepMode::Instance,
                 attributes: &[
@@ -906,7 +906,7 @@ impl DockWgpuResources {
                         shader_location: 3,
                     },
                 ],
-            },
+            }),
         ];
 
         let cylinder_pipe = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -931,17 +931,17 @@ impl DockWgpuResources {
             primitive: wgpu::PrimitiveState::default(),
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: depth_fmt,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::Less,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Less),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
-        let line_vbl = [wgpu::VertexBufferLayout {
+        let line_vbl = [Some(wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<LineVertex>() as u64,
             step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &[
@@ -956,7 +956,7 @@ impl DockWgpuResources {
                     shader_location: 1,
                 },
             ],
-        }];
+        })];
 
         let line_pipe = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("dock_lines"),
@@ -983,13 +983,13 @@ impl DockWgpuResources {
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: depth_fmt,
-                depth_write_enabled: false,
-                depth_compare: wgpu::CompareFunction::LessEqual,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
@@ -1017,8 +1017,8 @@ impl DockWgpuResources {
 
         let quad_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("dock_quad_pl"),
-            bind_group_layouts: &[&quad_bgl],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&quad_bgl)],
+            immediate_size: 0,
         });
 
         let quad_pipe = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -1043,7 +1043,7 @@ impl DockWgpuResources {
             primitive: wgpu::PrimitiveState::default(),
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
@@ -1257,6 +1257,7 @@ impl CallbackTrait for DockPaintCallback {
             label: Some("dock_offscreen_pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: cview,
+                depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {
                     load: wgpu::LoadOp::Clear(wgpu::Color {
@@ -1278,6 +1279,7 @@ impl CallbackTrait for DockPaintCallback {
             }),
             occlusion_query_set: None,
             timestamp_writes: None,
+            multiview_mask: None,
         });
 
         rpass.set_bind_group(0, &res.cam_bg, &[]);

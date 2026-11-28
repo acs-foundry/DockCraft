@@ -3,7 +3,7 @@ name = "dockcraft"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "DockCraft native desktop GUI fusing PyRx virtual screening and SeeSAR HYDE 3D in-pocket ligand optimization over wgpu 24"
+description = "DockCraft native desktop GUI fusing PyRx virtual screening and SeeSAR HYDE 3D in-pocket ligand optimization over wgpu 30"
 
 [lints]
 workspace = true
@@ -18,6 +18,7 @@ prot-prep = { path = "../../crates/prot-prep" }
 dock-viewport = { path = "../../crates/dock-viewport" }
 dock-pipeline = { path = "../../crates/dock-pipeline" }
 craftbio-scene = { workspace = true }
+craftbio-ui = { workspace = true }
 egui = { workspace = true }
 eframe = { workspace = true }
 serde = { workspace = true }

@@ -3,7 +3,7 @@ name = "dock-viewport"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Pure-Rust wgpu 24 + WGSL instanced 3D molecular viewport with HYDE green/red Fresnel coronas, pocket clouds, GridBox gizmo, and ray picking"
+description = "Pure-Rust wgpu 30 + WGSL instanced 3D molecular viewport with HYDE green/red Fresnel coronas, pocket clouds, GridBox gizmo, and ray picking"
 
 [lints]
 workspace = true
